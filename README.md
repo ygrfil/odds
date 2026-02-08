@@ -1,6 +1,6 @@
 # Poker Odds Lab (Browser-only)
 
-Desktop-first web app for Monte Carlo poker equity calculations:
+Desktop-first web app for poker equity calculations:
 - Hold'em
 - PLO4
 - PLO5
@@ -13,7 +13,9 @@ Desktop-first web app for Monte Carlo poker equity calculations:
 - Preflop / flop / turn / river (board input 0-5 cards)
 - Stop button for manual run control
 - Always uses maximum available browser workers automatically
-- Method selector: Monte Carlo or Exhaustive (exact-hands mode)
+- Automatic mode selection:
+  - Exhaustive (exact) when all players are exact suited hands
+  - Monte Carlo for any real range input
 - Adaptive candidate-pool sampling for restrictive postflop filters (e.g. `@flush`, `@fd`, `@set`)
 - Outputs: equity, win/tie/loss, combo counts, hand class breakdown
 - Local persistence (`localStorage`)
@@ -46,7 +48,7 @@ Notes:
 - This is a practical compatibility engine for PPT-like workflows, not a byte-for-byte PPT parser clone yet.
 - Percentile ranges are heuristic in v1 (not PPT exact percentile tables).
 - Stud-specific syntax (`|` streets) is not included because this app targets Hold'em/PLO only.
-- Exhaustive mode requires exact suited hands for all players (e.g. `AsKdQsTd`). It is mathematically exact for those inputs.
+- Exhaustive auto-mode requires exact suited hands for all players (e.g. `AsKdQsTd`). It is mathematically exact for those inputs.
 
 ## Performance notes
 - Engine optimized for lower allocation and faster evaluation loops.

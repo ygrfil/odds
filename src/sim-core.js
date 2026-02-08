@@ -311,6 +311,7 @@ export function rawToResult(raw, config) {
     iterations: it,
     elapsedMs,
     aborted: !!raw.aborted,
+    method: raw.method || config.method || "monte",
     variant: config.variant,
     players: rows,
     input: {

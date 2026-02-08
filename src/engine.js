@@ -1,4 +1,29 @@
 import { runExhaustiveRaw, runSimulationRaw, rawToResult } from "./sim-core.js";
+import { parseCards } from "./cards.js";
+
+function variantHandSize(variant) {
+  if (variant === "holdem") return 2;
+  if (variant === "plo4") return 4;
+  if (variant === "plo5") return 5;
+  if (variant === "plo6") return 6;
+  return 0;
+}
+
+function canUseExhaustive(config) {
+  const need = variantHandSize(config.variant);
+  if (!need) return false;
+  for (const p of config.players || []) {
+    const txt = (p.range || "").trim();
+    if (!txt) return false;
+    try {
+      const cards = parseCards(txt);
+      if (cards.length !== need) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
 
 function chooseWorkerCount() {
   const hw = typeof navigator !== "undefined" && navigator.hardwareConcurrency ? navigator.hardwareConcurrency : 2;
@@ -146,29 +171,30 @@ async function runWorkerGroup(config, workerCount, mode, onProgress, signal) {
 }
 
 export async function runSimulation(config, onProgress, signal) {
-  const method = config.method === "exact" ? "exact" : "monte";
+  const method = canUseExhaustive(config) ? "exact" : "monte";
+  const effectiveConfig = { ...config, method };
   const workersAvailable = typeof Worker !== "undefined";
   const workerCount = chooseWorkerCount();
 
   let raw;
   if (workersAvailable && workerCount > 1) {
-    raw = await runWorkerGroup(config, workerCount, method, onProgress, signal);
+    raw = await runWorkerGroup(effectiveConfig, workerCount, method, onProgress, signal);
     if (!raw) {
       raw = {
         iterations: 0,
         elapsedMs: 0,
-        wins: config.players.map(() => 0),
-        ties: config.players.map(() => 0),
-        losses: config.players.map(() => 0),
-        equityShares: config.players.map(() => 0),
-        classCounts: config.players.map(() => new Array(9).fill(0)),
-        comboLists: config.players.map(() => new Set())
+        wins: effectiveConfig.players.map(() => 0),
+        ties: effectiveConfig.players.map(() => 0),
+        losses: effectiveConfig.players.map(() => 0),
+        equityShares: effectiveConfig.players.map(() => 0),
+        classCounts: effectiveConfig.players.map(() => new Array(9).fill(0)),
+        comboLists: effectiveConfig.players.map(() => new Set())
       };
     }
   } else {
     const runner = method === "exact" ? runExhaustiveRaw : runSimulationRaw;
-    raw = await runner(config, { onProgress, signal });
+    raw = await runner(effectiveConfig, { onProgress, signal });
   }
-
-  return rawToResult(raw, config);
+  raw.method = method;
+  return rawToResult(raw, effectiveConfig);
 }
