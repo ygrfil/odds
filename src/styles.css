@@ -206,12 +206,49 @@ button.primary {
 
 .player-live-note {
   font-size: 11px;
-  color: #98b0cf;
-  line-height: 1.25;
+  line-height: 1.2;
   margin: 0 0 4px 30px;
-  white-space: nowrap;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
   overflow: hidden;
+}
+
+.live-chip {
+  display: inline-block;
+  border: 1px solid #2a3f5f;
+  border-radius: 999px;
+  padding: 1px 7px;
+  white-space: nowrap;
+  max-width: 100%;
   text-overflow: ellipsis;
+  overflow: hidden;
+}
+
+.live-primary {
+  color: #c8ddff;
+  background: #11243b;
+  border-color: #234b7f;
+}
+
+.live-focus {
+  color: #0f2a18;
+  background: #7df4b2;
+  border-color: #7df4b2;
+  font-weight: 700;
+}
+
+.live-tag {
+  color: #e9d4a0;
+  background: #2a220e;
+  border-color: #5b4720;
+}
+
+.live-warn,
+.live-error {
+  color: #f7b2b2;
+  background: #2b1212;
+  border-color: #6e2d2d;
 }
 
 .player-output strong {

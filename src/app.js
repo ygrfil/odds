@@ -87,6 +87,29 @@ function normalizedPureTag(rangeText) {
   return s === "@sd13" ? "@sd12" : s;
 }
 
+function extractPercentAtoms(rangeText) {
+  const src = String(rangeText || "").replace(/\s+/g, "");
+  const raw = src.match(/\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)?%/g) || [];
+  const out = [];
+  for (const tok of raw) {
+    const nums = tok.slice(0, -1).split("-").map(Number);
+    if (!nums.every((n) => Number.isFinite(n) && n >= 0 && n <= 100)) continue;
+    if (nums.length === 2 && nums[0] > nums[1]) continue;
+    if (!out.includes(tok)) out.push(tok);
+  }
+  return out;
+}
+
+function coverageCounts(cov) {
+  if (!cov) return { matched: 0, total: 0, approx: false };
+  if (cov.approx) {
+    const matched = Number.isFinite(cov.estimatedMatched) ? cov.estimatedMatched : cov.matched;
+    const total = Number.isFinite(cov.population) ? cov.population : cov.total;
+    return { matched, total, approx: true };
+  }
+  return { matched: cov.matched, total: cov.total, approx: false };
+}
+
 function coverageText(cov) {
   if (!cov || cov.total <= 0) return "";
   if (cov.approx) {
@@ -101,7 +124,7 @@ function coverageText(cov) {
 
 function rangeLiveInfo(rangeText) {
   const expr = String(rangeText || "").trim();
-  if (!expr) return "";
+  if (!expr) return [];
 
   const tags = atTagsInRange(expr).filter((t) => TAG_HINTS[t]);
   const boardText = el.board.value.trim();
@@ -109,26 +132,47 @@ function rangeLiveInfo(rangeText) {
   const isHoldem = el.variant.value === "holdem";
   const variant = el.variant.value;
   const parts = [];
+  let covExpr = null;
 
   try {
-    const covExpr = previewRangeCoverage(boardText, variant, expr);
+    covExpr = previewRangeCoverage(boardText, variant, expr);
     const statExpr = coverageText(covExpr);
-    if (statExpr) parts.push(`Range: ${statExpr}`);
+    if (statExpr) parts.push({ tone: "primary", text: `Range: ${statExpr}` });
   } catch {
-    parts.push("Range: invalid expression");
-    return parts.join(" | ");
+    parts.push({ tone: "error", text: "Range: invalid expression" });
+    return parts;
   }
 
-  if (!tags.length) return parts.join(" | ");
+  const pctAtoms = extractPercentAtoms(expr);
+  if (covExpr && pctAtoms.length) {
+    try {
+      const baseExpr = pctAtoms.join(",");
+      const baseCov = previewRangeCoverage(boardText, variant, baseExpr);
+      const exprCnt = coverageCounts(covExpr);
+      const baseCnt = coverageCounts(baseCov);
+      if (baseCnt.matched > 0) {
+        const within = (exprCnt.matched * 100) / baseCnt.matched;
+        const approx = exprCnt.approx || baseCnt.approx;
+        const shownExpr = `${approx ? "~" : ""}${Math.max(0, Math.round(exprCnt.matched)).toLocaleString()}`;
+        const shownBase = `${approx ? "~" : ""}${Math.max(0, Math.round(baseCnt.matched)).toLocaleString()}`;
+        const pctLabel = pctAtoms.length === 1 ? pctAtoms[0] : "% filters";
+        parts.push({ tone: "focus", text: `Inside ${pctLabel}: ${within.toFixed(1)}% (${shownExpr}/${shownBase} combos)` });
+      }
+    } catch {
+      // ignore subset stats for invalid percent filter expression
+    }
+  }
+
+  if (!tags.length) return parts;
   const pureTag = normalizedPureTag(expr);
 
   for (const tag of tags) {
     if (tag === "@overpair" && !isHoldem) {
-      parts.push("@overpair: Hold'em only.");
+      parts.push({ tone: "warn", text: "@overpair: Hold'em only." });
       continue;
     }
     if (boardCards < 3) {
-      parts.push(`${tag}: needs flop+.`);
+      parts.push({ tone: "warn", text: `${tag}: needs flop+.` });
     } else {
       try {
         const combos = previewTagCoreCombos(boardText, variant, tag);
@@ -143,18 +187,34 @@ function rangeLiveInfo(rangeText) {
         }
         const tagNorm = tag === "@sd13" ? "@sd12" : tag;
         if (pureTag && pureTag === tagNorm) {
-          parts.push(`${tag}: ${combos.length ? combos.join(",") : "-"} (${stat})${extra}`);
+          parts.push({ tone: "tag", text: `${tag}: ${combos.length ? combos.join(",") : "-"} (${stat})${extra}` });
         } else if (isHoldem && combos.length > 0 && combos.length <= 8) {
-          parts.push(`${tag}: ${combos.join(",")} (${stat})${extra}`);
+          parts.push({ tone: "tag", text: `${tag}: ${combos.join(",")} (${stat})${extra}` });
         } else {
-          parts.push(`${tag}: ${stat}${extra}`);
+          parts.push({ tone: "tag", text: `${tag}: ${stat}${extra}` });
         }
       } catch {
-        parts.push(`${tag}: invalid board input`);
+        parts.push({ tone: "warn", text: `${tag}: invalid board input` });
       }
     }
   }
-  return parts.join(" | ");
+  return parts;
+}
+
+function renderLiveInfo(node, parts) {
+  node.innerHTML = "";
+  const chunks = Array.isArray(parts) ? parts.filter((p) => p && p.text) : [];
+  if (!chunks.length) {
+    node.style.display = "none";
+    return;
+  }
+  for (const p of chunks) {
+    const span = document.createElement("span");
+    span.className = `live-chip live-${p.tone || "tag"}`;
+    span.textContent = p.text;
+    node.appendChild(span);
+  }
+  node.style.display = "";
 }
 
 function saveLocal() {
@@ -315,8 +375,7 @@ function renderPlayers() {
       const h = rangeTagHints(p.range, el.variant.value);
       hint.classList.toggle("is-empty", !h);
       const live = rangeLiveInfo(p.range);
-      info.textContent = live;
-      info.style.display = live ? "" : "none";
+      renderLiveInfo(info, live);
     };
     range.addEventListener("input", () => {
       p.range = range.value;
