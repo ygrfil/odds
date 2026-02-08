@@ -10,7 +10,7 @@ import {
   previewRangeCoverage,
   categoryMatchTag
 } from "../src/sim-core.js";
-import { parseCards, fullDeck } from "../src/cards.js";
+import { cardToText, parseCards, fullDeck } from "../src/cards.js";
 import { compileRange } from "../src/parser.js";
 import { makeRng } from "../src/rng.js";
 
@@ -192,9 +192,24 @@ function simpleExactIfAny(rangeText, handSize) {
   return null;
 }
 
+function maybeExpandPureTagRange(rangeText, variant, boardCards) {
+  const normalized = String(rangeText || "").trim().toLowerCase().replace(/\s+/g, "");
+  const tag = normalized === "@sd13" ? "@sd12" : normalized;
+  const holdEmExpandable = new Set(["@sd", "@sd4", "@sd8", "@sd12", "@2p", "@set", "@straight", "@tpplus", "@overpair"]);
+  const omahaExpandable = new Set(["@sd", "@sd4", "@sd8", "@sd12"]);
+  const allowed = variant === "holdem" ? holdEmExpandable : omahaExpandable;
+  if (!allowed.has(tag)) return rangeText;
+  if (!Array.isArray(boardCards) || boardCards.length < 3 || boardCards.length > 5) return rangeText;
+  const boardText = boardCards.map((c) => cardToText(c)).join("");
+  const combos = previewTagCoreCombos(boardText, variant, tag);
+  if (!Array.isArray(combos) || combos.length === 0) return rangeText;
+  return combos.join(",");
+}
+
 function buildPlayerSampler(config, baseDeck, boardCards, player, idx, rng) {
   const handSize = variantHandSize(config.variant);
-  const rangeText = String(player.range || "*").trim() || "*";
+  const rawRangeText = String(player.range || "*").trim() || "*";
+  const rangeText = maybeExpandPureTagRange(rawRangeText, config.variant, boardCards);
   if (rangeText === "*") {
     return { mode: "all", hand_size: handSize };
   }
@@ -225,7 +240,7 @@ function buildPlayerSampler(config, baseDeck, boardCards, player, idx, rng) {
     const totalSpace = nChooseK(baseDeck.length, handSize);
     const hasTag = /@[a-z0-9_]+/i.test(rangeText);
     const hasSdTag = /@sd(?:\d+)?/i.test(rangeText);
-    const acceptance = estimateRangeAcceptance(baseDeck, handSize, predicate, rng, 320);
+    const acceptance = estimateRangeAcceptance(baseDeck, handSize, predicate, rng, hasTag ? 96 : 320);
 
     // Full 4-card enumeration is very expensive for dynamic tags like @sd.
     // In Monte Carlo mode, a large random pool is enough and much faster.
@@ -233,9 +248,18 @@ function buildPlayerSampler(config, baseDeck, boardCards, player, idx, rng) {
       && (hasSdTag || (hasTag && totalSpace > 90_000) || acceptance >= 0.03);
 
     if (preferSample) {
-      const target = hasSdTag ? 12_000 : handSize === 2 ? 12_000 : 10_000;
-      const maxTrials = hasSdTag ? 260_000 : handSize === 2 ? 150_000 : 180_000;
-      const maxMs = hasSdTag ? 900 : 700;
+      let target = handSize === 2 ? 12_000 : 10_000;
+      let maxTrials = handSize === 2 ? 150_000 : 180_000;
+      let maxMs = 700;
+      if (hasSdTag) {
+        target = 12_000;
+        maxTrials = 180_000;
+        maxMs = 500;
+      } else if (hasTag) {
+        target = handSize === 2 ? 8_000 : 6_000;
+        maxTrials = handSize === 2 ? 100_000 : 90_000;
+        maxMs = 450;
+      }
       const sampled = sampleRangePool(baseDeck, handSize, predicate, target, maxTrials, rng, maxMs);
       if (sampled.length > 0) {
         const sampler = { mode: "pool", hand_size: handSize, pool: sampled };
@@ -260,9 +284,21 @@ function buildPlayerSampler(config, baseDeck, boardCards, player, idx, rng) {
     return sampler;
   }
 
-  const target = handSize === 5 ? 14_000 : 10_000;
-  const maxTrials = handSize === 5 ? 280_000 : 320_000;
-  const sampled = sampleRangePool(baseDeck, handSize, predicate, target, maxTrials, rng, 900);
+  const hasTag = /@[a-z0-9_]+/i.test(rangeText);
+  const hasSdTag = /@sd(?:\d+)?/i.test(rangeText);
+  let target = handSize === 5 ? 14_000 : 10_000;
+  let maxTrials = handSize === 5 ? 280_000 : 320_000;
+  let maxMs = 900;
+  if (hasSdTag) {
+    target = 9_000;
+    maxTrials = 150_000;
+    maxMs = 550;
+  } else if (hasTag) {
+    target = 7_000;
+    maxTrials = 120_000;
+    maxMs = 550;
+  }
+  const sampled = sampleRangePool(baseDeck, handSize, predicate, target, maxTrials, rng, maxMs);
   if (!sampled.length) {
     throw new Error(`Player ${idx + 1} range appears empty on this board/dead-card setup`);
   }

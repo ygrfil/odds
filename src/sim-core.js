@@ -147,6 +147,21 @@ function minOutsForSdTag(tag) {
   return 4;
 }
 
+function pairRankFromScore(score) {
+  const cls = classIdFromScore(score);
+  if (cls !== 1) return 0;
+  return Math.floor((score - 1_000_000) / 3375);
+}
+
+function topBoardRank(board) {
+  let top = 2;
+  for (let i = 0; i < board.length; i++) {
+    const r = rankOf(board[i]);
+    if (r > top) top = r;
+  }
+  return top;
+}
+
 function coreRankLabel(c1, c2) {
   const r1 = rankOf(c1);
   const r2 = rankOf(c2);
@@ -222,13 +237,12 @@ function coreCategoryMatch(tag, core, board, variant) {
     return outs >= minOutsForSdTag(tag);
   }
 
-  const ranks = [rankOf(core[0]), rankOf(core[1]), ...board.map(rankOf)];
-  const cnt = new Uint8Array(15);
-  for (const r of ranks) cnt[r]++;
-  let top = 0;
-  for (let r = 2; r <= 14; r++) if (cnt[r] > top) top = cnt[r];
-
-  if (tag === "@tpplus") return cls >= 1 || top >= 2 || madeFlush;
+  if (tag === "@tpplus") {
+    if (cls >= 2) return true;
+    if (cls !== 1) return false;
+    const pr = pairRankFromScore(score);
+    return pr >= topBoardRank(board);
+  }
   if (tag === "@overpair") {
     const pocket = rankOf(core[0]) === rankOf(core[1]);
     if (!pocket) return false;
@@ -369,13 +383,6 @@ function previewOmahaSdStructures(boardText, variant, tag) {
     if (!coveredByWildcardTrio) out4set.add(item.label);
   }
   let out4 = [...out4set].sort();
-  const handSize = variantCardCount(variant);
-  if (handSize > 4) {
-    const x3 = "x".repeat(Math.max(0, handSize - 3));
-    const x4 = "x".repeat(Math.max(0, handSize - 4));
-    out3 = out3.map((s) => `${s}${x3}`);
-    out4 = out4.map((s) => `${s}${x4}`);
-  }
 
   const combined = [...new Set(out4.concat(out3))];
 
@@ -421,6 +428,19 @@ export function previewTagCoreCombos(boardText, variant, tag) {
   if (board.length < 3 || board.length > 5) return [];
   const knownTags = new Set(["@set", "@2p", "@fd", "@sd", "@sd4", "@sd8", "@sd12", "@sd13", "@flush", "@straight", "@tpplus", "@overpair"]);
   if (!knownTags.has(tag)) return [];
+  if (tag === "@tpplus") {
+    const labels = [];
+    labels.push(RANK_CHARS[topBoardRank(board)]);
+    const addIfAny = (label, subTag) => {
+      const cov = previewTagCoverage(boardText, variant, subTag);
+      if ((cov?.matched || 0) > 0) labels.push(label);
+    };
+    addIfAny("2P", "@2p");
+    addIfAny("SET", "@set");
+    addIfAny("STR", "@straight");
+    addIfAny("FLUSH", "@flush");
+    return [...new Set(labels)];
+  }
   if (variant !== "holdem" && (tag === "@sd" || tag === "@sd4" || tag === "@sd8" || tag === "@sd12" || tag === "@sd13")) {
     return previewOmahaSdStructures(boardText, variant, tag);
   }
@@ -620,13 +640,12 @@ function categoryMatch(tag, hand, board) {
     return out;
   }
 
-  const ranks = hand.concat(board).map(rankOf);
-  const cnt = new Uint8Array(15);
-  for (const r of ranks) cnt[r]++;
-  let top = 0;
-  for (let r = 2; r <= 14; r++) if (cnt[r] > top) top = cnt[r];
-
-  if (tag === "@tpplus") return cls >= 1 || top >= 2 || madeFlush;
+  if (tag === "@tpplus") {
+    if (cls >= 2) return true;
+    if (cls !== 1) return false;
+    const pr = pairRankFromScore(score);
+    return pr >= topBoardRank(board);
+  }
 
   if (tag === "@overpair") {
     if (!isHoldem || board.length < 3) return false;
