@@ -17,6 +17,7 @@ const RANK_CHARS = "??23456789TJQKA";
 const OMAHA_SD_PREVIEW_CACHE = new Map();
 const TAG_COVERAGE_CACHE = new Map();
 const RANGE_COVERAGE_CACHE = new Map();
+const SD_TAG_MEMO = new Map();
 const OMAHA_EXACT_COVERAGE_MAX = 60_000;
 
 function hash32(str) {
@@ -602,10 +603,21 @@ function categoryMatch(tag, hand, board) {
   if (tag === "@set") return cls === 3;
   if (tag === "@straight") return isStraightClassId(cls);
   if (tag === "@sd" || tag === "@sd4" || tag === "@sd8" || tag === "@sd12" || tag === "@sd13") {
+    const handRanksKey = hand.map(rankOf).sort((a, b) => a - b).join("");
+    const boardRanksKey = board.map(rankOf).sort((a, b) => a - b).join("");
+    const memoKey = `${isHoldem ? "h" : "o"}|${tag}|${board.length}|${boardRanksKey}|${handRanksKey}`;
+    if (SD_TAG_MEMO.has(memoKey)) return SD_TAG_MEMO.get(memoKey);
+
     const hasStraightNow = isHoldem ? hasHoldemStraightByRanks(hand, board) : hasOmahaStraight(hand, board);
-    if (board.length >= 5 || hasStraightNow) return false;
+    if (board.length >= 5 || hasStraightNow) {
+      SD_TAG_MEMO.set(memoKey, false);
+      return false;
+    }
     const outs = straightOutCountNextCard(hand, board, isHoldem);
-    return outs >= minOutsForSdTag(tag);
+    const out = outs >= minOutsForSdTag(tag);
+    SD_TAG_MEMO.set(memoKey, out);
+    if (SD_TAG_MEMO.size > 250_000) SD_TAG_MEMO.clear();
+    return out;
   }
 
   const ranks = hand.concat(board).map(rankOf);

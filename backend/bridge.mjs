@@ -18,6 +18,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const NATIVE_SIM_MANIFEST = path.join(PROJECT_ROOT, "native-sim", "Cargo.toml");
 const NATIVE_SIM_BIN_DEFAULT = path.join(PROJECT_ROOT, "native-sim", "target", "release", "native-sim");
+const PLAYER_SAMPLER_CACHE = new Map();
+const PLAYER_SAMPLER_CACHE_MAX = 48;
 
 function variantHandSize(variant) {
   if (variant === "holdem") return 2;
@@ -79,6 +81,27 @@ function comboKey(hand) {
   return hand.slice().sort((a, b) => a - b).join("-");
 }
 
+function getCachedSampler(key) {
+  if (!PLAYER_SAMPLER_CACHE.has(key)) return null;
+  const value = PLAYER_SAMPLER_CACHE.get(key);
+  PLAYER_SAMPLER_CACHE.delete(key);
+  PLAYER_SAMPLER_CACHE.set(key, value);
+  return value;
+}
+
+function putCachedSampler(key, sampler) {
+  if (!key || !sampler) return;
+  // Avoid caching very large pools to keep memory bounded.
+  if (Array.isArray(sampler.pool) && sampler.pool.length > 30_000) return;
+  if (PLAYER_SAMPLER_CACHE.has(key)) PLAYER_SAMPLER_CACHE.delete(key);
+  PLAYER_SAMPLER_CACHE.set(key, sampler);
+  while (PLAYER_SAMPLER_CACHE.size > PLAYER_SAMPLER_CACHE_MAX) {
+    const first = PLAYER_SAMPLER_CACHE.keys().next();
+    if (first?.done) break;
+    PLAYER_SAMPLER_CACHE.delete(first.value);
+  }
+}
+
 function pickDistinct(source, n, rng, out) {
   if (source.length < n) return false;
   out.length = 0;
@@ -131,11 +154,13 @@ function enumerateRangePool(baseDeck, handSize, predicate, cap, rng) {
   return { pool, matched };
 }
 
-function sampleRangePool(baseDeck, handSize, predicate, target, maxTrials, rng) {
+function sampleRangePool(baseDeck, handSize, predicate, target, maxTrials, rng, maxMs = Number.POSITIVE_INFINITY) {
   const pool = [];
   const seen = new Set();
   const tmp = [];
+  const started = performance.now();
   for (let i = 0; i < maxTrials; i++) {
+    if ((i & 1023) === 0 && (performance.now() - started) > maxMs) break;
     if (!pickDistinct(baseDeck, handSize, rng, tmp)) break;
     if (!predicate(tmp)) continue;
     const key = comboKey(tmp);
@@ -145,6 +170,16 @@ function sampleRangePool(baseDeck, handSize, predicate, target, maxTrials, rng) 
     if (pool.length >= target) break;
   }
   return pool;
+}
+
+function estimateRangeAcceptance(baseDeck, handSize, predicate, rng, trials = 320) {
+  const tmp = [];
+  let ok = 0;
+  for (let i = 0; i < trials; i++) {
+    if (!pickDistinct(baseDeck, handSize, rng, tmp)) break;
+    if (predicate(tmp)) ok++;
+  }
+  return ok / Math.max(1, trials);
 }
 
 function simpleExactIfAny(rangeText, handSize) {
@@ -174,6 +209,11 @@ function buildPlayerSampler(config, baseDeck, boardCards, player, idx, rng) {
     return { mode: "pool", hand_size: handSize, pool: [exact] };
   }
 
+  const normalizedRange = rangeText.toLowerCase().replace(/\s+/g, "");
+  const cacheKey = `${config.variant}|${baseDeck.join(",")}|${normalizedRange}|${handSize}`;
+  const cached = getCachedSampler(cacheKey);
+  if (cached) return cached;
+
   const compiled = compileRange(rangeText, config.variant, boardCards);
   if ((compiled.weight || 0) <= 0) {
     throw new Error(`Player ${idx + 1} range appears empty on this board/dead-card setup`);
@@ -182,25 +222,53 @@ function buildPlayerSampler(config, baseDeck, boardCards, player, idx, rng) {
   const predicate = (hand) => compiled.predicate(hand, null, helpers);
 
   if (handSize <= 4) {
+    const totalSpace = nChooseK(baseDeck.length, handSize);
+    const hasTag = /@[a-z0-9_]+/i.test(rangeText);
+    const hasSdTag = /@sd(?:\d+)?/i.test(rangeText);
+    const acceptance = estimateRangeAcceptance(baseDeck, handSize, predicate, rng, 320);
+
+    // Full 4-card enumeration is very expensive for dynamic tags like @sd.
+    // In Monte Carlo mode, a large random pool is enough and much faster.
+    const preferSample = handSize >= 4
+      && (hasSdTag || (hasTag && totalSpace > 90_000) || acceptance >= 0.03);
+
+    if (preferSample) {
+      const target = hasSdTag ? 12_000 : handSize === 2 ? 12_000 : 10_000;
+      const maxTrials = hasSdTag ? 260_000 : handSize === 2 ? 150_000 : 180_000;
+      const maxMs = hasSdTag ? 900 : 700;
+      const sampled = sampleRangePool(baseDeck, handSize, predicate, target, maxTrials, rng, maxMs);
+      if (sampled.length > 0) {
+        const sampler = { mode: "pool", hand_size: handSize, pool: sampled };
+        putCachedSampler(cacheKey, sampler);
+        return sampler;
+      }
+      // For dynamic tag ranges, avoid expensive exact enumeration in prep path.
+      if (hasTag) {
+        throw new Error(`Player ${idx + 1} range appears empty on this board/dead-card setup`);
+      }
+      // If sample found nothing for non-tag ranges, fall back to exact enumeration.
+    }
+
     const cap = handSize === 2 ? 15000 : 140000;
     const { pool, matched } = enumerateRangePool(baseDeck, handSize, predicate, cap, rng);
     if (!matched || pool.length === 0) {
       throw new Error(`Player ${idx + 1} range appears empty on this board/dead-card setup`);
     }
-    const totalSpace = nChooseK(baseDeck.length, handSize);
-    if (matched === totalSpace) {
-      return { mode: "all", hand_size: handSize };
-    }
-    return { mode: "pool", hand_size: handSize, pool };
+    if (matched === totalSpace) return { mode: "all", hand_size: handSize };
+    const sampler = { mode: "pool", hand_size: handSize, pool };
+    putCachedSampler(cacheKey, sampler);
+    return sampler;
   }
 
-  const target = handSize === 5 ? 32000 : 22000;
-  const maxTrials = handSize === 5 ? 450000 : 550000;
-  const sampled = sampleRangePool(baseDeck, handSize, predicate, target, maxTrials, rng);
+  const target = handSize === 5 ? 14_000 : 10_000;
+  const maxTrials = handSize === 5 ? 280_000 : 320_000;
+  const sampled = sampleRangePool(baseDeck, handSize, predicate, target, maxTrials, rng, 900);
   if (!sampled.length) {
     throw new Error(`Player ${idx + 1} range appears empty on this board/dead-card setup`);
   }
-  return { mode: "pool", hand_size: handSize, pool: sampled };
+  const sampler = { mode: "pool", hand_size: handSize, pool: sampled };
+  putCachedSampler(cacheKey, sampler);
+  return sampler;
 }
 
 function prepareNativeRequest(config, req) {
