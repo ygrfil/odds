@@ -16,6 +16,8 @@ const ALL_CARDS = fullDeck();
 const RANK_CHARS = "??23456789TJQKA";
 const OMAHA_SD_PREVIEW_CACHE = new Map();
 const TAG_COVERAGE_CACHE = new Map();
+const RANGE_COVERAGE_CACHE = new Map();
+const OMAHA_EXACT_COVERAGE_MAX = 60_000;
 
 function hash32(str) {
   let h = 2166136261 >>> 0;
@@ -24,6 +26,38 @@ function hash32(str) {
     h = Math.imul(h, 16777619) >>> 0;
   }
   return h >>> 0;
+}
+
+function nChooseK(n, k) {
+  if (k < 0 || k > n) return 0;
+  if (k === 0 || k === n) return 1;
+  const kk = Math.min(k, n - k);
+  let num = 1;
+  for (let i = 1; i <= kk; i++) {
+    num = (num * (n - kk + i)) / i;
+  }
+  return Math.round(num);
+}
+
+function exactCoverage(deck, handSize, predicate) {
+  const hand = new Array(handSize);
+  let matched = 0;
+  let total = 0;
+
+  function rec(start, depth) {
+    if (depth === handSize) {
+      total++;
+      if (predicate(hand)) matched++;
+      return;
+    }
+    for (let i = start; i <= deck.length - (handSize - depth); i++) {
+      hand[depth] = deck[i];
+      rec(i + 1, depth + 1);
+    }
+  }
+
+  rec(0, 0);
+  return { matched, total, pct: total > 0 ? (matched * 100) / total : 0, approx: false };
 }
 
 function variantCardCount(variant) {
@@ -422,6 +456,12 @@ export function previewTagCoverage(boardText, variant, tag) {
     const blocked = new Set(board);
     const deck = ALL_CARDS.filter((c) => !blocked.has(c));
     const handSize = variantCardCount(variant);
+    const population = nChooseK(deck.length, handSize);
+    if (population <= OMAHA_EXACT_COVERAGE_MAX) {
+      const out = exactCoverage(deck, handSize, (hand) => categoryMatch(tag, hand, board));
+      TAG_COVERAGE_CACHE.set(k, out);
+      return out;
+    }
     const sampleN = handSize === 4 ? 5000 : handSize === 5 ? 4000 : 3000;
     const sampleSeed = hash32(`${variant}|${board.join(",")}|${handSize}`) || 1;
     const rng = makeRng(sampleSeed);
@@ -431,7 +471,15 @@ export function previewTagCoverage(boardText, variant, tag) {
       if (!pickDistinct(deck, handSize, rng, scratch)) break;
       if (categoryMatch(tag, scratch, board)) matched++;
     }
-    const out = { matched, total: sampleN, pct: sampleN > 0 ? (matched * 100) / sampleN : 0, approx: true };
+    const estMatched = sampleN > 0 ? Math.round((matched / sampleN) * population) : 0;
+    const out = {
+      matched,
+      total: sampleN,
+      pct: sampleN > 0 ? (matched * 100) / sampleN : 0,
+      approx: true,
+      population,
+      estimatedMatched: estMatched
+    };
     TAG_COVERAGE_CACHE.set(k, out);
     return out;
   }
@@ -450,6 +498,68 @@ export function previewTagCoverage(boardText, variant, tag) {
   }
   const out = { matched, total, pct: total > 0 ? (matched * 100) / total : 0, approx: false };
   TAG_COVERAGE_CACHE.set(k, out);
+  return out;
+}
+
+export function previewRangeCoverage(boardText, variant, rangeText) {
+  const cacheKey = `${variant}|${String(boardText || "").trim()}|${String(rangeText || "").replace(/\s+/g, "")}`;
+  if (RANGE_COVERAGE_CACHE.has(cacheKey)) return RANGE_COVERAGE_CACHE.get(cacheKey);
+
+  const board = parseCards(boardText || "");
+  if (board.length < 3 || board.length > 5) {
+    const out = { matched: 0, total: 0, pct: 0, approx: false };
+    RANGE_COVERAGE_CACHE.set(cacheKey, out);
+    return out;
+  }
+  const handSize = variantCardCount(variant);
+  const compiled = compileRange(rangeText || "*", variant, board);
+  const helpers = { categoryMatch };
+
+  if (variant !== "holdem") {
+    const blocked = new Set(board);
+    const deck = ALL_CARDS.filter((c) => !blocked.has(c));
+    const sampleN = handSize === 4 ? 5000 : handSize === 5 ? 4000 : 3000;
+    const population = nChooseK(deck.length, handSize);
+    if (population <= OMAHA_EXACT_COVERAGE_MAX) {
+      const out = exactCoverage(deck, handSize, (hand) => compiled.predicate(hand, null, helpers));
+      RANGE_COVERAGE_CACHE.set(cacheKey, out);
+      return out;
+    }
+    const sampleSeed = hash32(`${variant}|${board.join(",")}|expr:${String(rangeText || "*")}|${handSize}`) || 1;
+    const rng = makeRng(sampleSeed);
+    const scratch = [];
+    let matched = 0;
+    for (let i = 0; i < sampleN; i++) {
+      if (!pickDistinct(deck, handSize, rng, scratch)) break;
+      if (compiled.predicate(scratch, null, helpers)) matched++;
+    }
+    const estMatched = sampleN > 0 ? Math.round((matched / sampleN) * population) : 0;
+    const out = {
+      matched,
+      total: sampleN,
+      pct: sampleN > 0 ? (matched * 100) / sampleN : 0,
+      approx: true,
+      population,
+      estimatedMatched: estMatched
+    };
+    RANGE_COVERAGE_CACHE.set(cacheKey, out);
+    return out;
+  }
+
+  const blocked = new Uint8Array(52);
+  for (const c of board) blocked[c] = 1;
+  let matched = 0;
+  let total = 0;
+  for (let c1 = 0; c1 < 52; c1++) {
+    if (blocked[c1]) continue;
+    for (let c2 = c1 + 1; c2 < 52; c2++) {
+      if (blocked[c2]) continue;
+      total++;
+      if (compiled.predicate([c1, c2], null, helpers)) matched++;
+    }
+  }
+  const out = { matched, total, pct: total > 0 ? (matched * 100) / total : 0, approx: false };
+  RANGE_COVERAGE_CACHE.set(cacheKey, out);
   return out;
 }
 
@@ -514,6 +624,10 @@ function categoryMatch(tag, hand, board) {
     return rankOf(hand[0]) > topBoard;
   }
   return false;
+}
+
+export function categoryMatchTag(tag, hand, board) {
+  return categoryMatch(tag, hand, board);
 }
 
 function fillAvailable(baseDeck, usedFlags, out) {
@@ -714,7 +828,7 @@ function sampleFromPool(pool, usedFlags, rng) {
 }
 
 export function rawToResult(raw, config) {
-  const { iterations: it, elapsedMs, wins, ties, losses, comboLists, classCounts, equityShares } = raw;
+  const { iterations: it, elapsedMs, wins, ties, losses, comboLists, classCounts, equityShares, comboCounts } = raw;
   const players = config.players;
   const n = players.length;
   const rows = players.map((p, i) => {
@@ -723,6 +837,14 @@ export function rawToResult(raw, config) {
     const winPct = (wins[i] / Math.max(1, it)) * 100;
     const tiePct = (ties[i] / Math.max(1, it)) * 100;
     const lossPct = (losses[i] / Math.max(1, it)) * 100;
+
+    let comboCount = comboCounts?.[i];
+    if (!Number.isFinite(comboCount)) {
+      const cl = comboLists?.[i];
+      if (cl instanceof Set) comboCount = cl.size;
+      else if (Array.isArray(cl)) comboCount = cl.length;
+      else comboCount = 0;
+    }
 
     const classes = classCounts[i]
       .map((v, idx) => ({ name: CLASS_NAMES[idx], v }))
@@ -738,7 +860,7 @@ export function rawToResult(raw, config) {
       win: `${winPct.toFixed(2)}%`,
       tie: `${tiePct.toFixed(2)}%`,
       loss: `${lossPct.toFixed(2)}%`,
-      combos: comboLists[i].size,
+      combos: comboCount,
       classes
     };
   });

@@ -1,5 +1,5 @@
 import { runSimulation } from "./engine.js";
-import { previewTagCoreCombos, previewTagCoverage } from "./sim-core.js";
+import { previewTagCoreCombos, previewTagCoverage, previewRangeCoverage } from "./sim-core.js";
 
 const state = {
   players: [
@@ -81,8 +81,31 @@ function atTagsInRange(rangeText) {
   return [...new Set(tags)];
 }
 
+function atTagAndClausesInRange(rangeText) {
+  const cleaned = String(rangeText || "").replace(/\s+/g, "").toLowerCase();
+  const raw = cleaned.match(/@[a-z0-9_]+(?::@[a-z0-9_]+)+/g) || [];
+  const uniq = [...new Set(raw)];
+  return uniq.filter((expr) => {
+    const tags = expr.match(/@[a-z0-9_]+/g) || [];
+    return tags.length >= 2 && tags.every((t) => TAG_HINTS[t]);
+  });
+}
+
+function coverageText(cov) {
+  if (!cov || cov.total <= 0) return "";
+  if (cov.approx) {
+    const pct = `~${cov.pct.toFixed(1)}%`;
+    if (Number.isFinite(cov.estimatedMatched) && Number.isFinite(cov.population) && cov.population > 0) {
+      return `${pct}, ~${cov.estimatedMatched.toLocaleString()}/${cov.population.toLocaleString()} combos`;
+    }
+    return `${pct}, ${cov.matched.toLocaleString()}/${cov.total.toLocaleString()} samples`;
+  }
+  return `${cov.pct.toFixed(1)}%, ${cov.matched.toLocaleString()}/${cov.total.toLocaleString()} combos`;
+}
+
 function atTagLiveInfo(rangeText) {
   const tags = atTagsInRange(rangeText).filter((t) => TAG_HINTS[t]);
+  const andClauses = atTagAndClausesInRange(rangeText);
   if (!tags.length) return "";
   const boardText = el.board.value.trim();
   const boardCards = Math.floor(boardText.length / 2);
@@ -97,7 +120,9 @@ function atTagLiveInfo(rangeText) {
         parts.push("@overpair: needs flop+.");
       } else {
         const combos = previewTagCoreCombos(boardText, "holdem", tag);
-        parts.push(`@overpair: ${combos.length ? combos.join(",") : "-"}`);
+        const cov = previewTagCoverage(boardText, "holdem", tag);
+        const stat = coverageText(cov);
+        parts.push(`@overpair: ${combos.length ? combos.join(",") : "-"} (${stat})`);
       }
       continue;
     }
@@ -108,7 +133,7 @@ function atTagLiveInfo(rangeText) {
       try {
         const combos = previewTagCoreCombos(boardText, el.variant.value, tag);
         const cov = previewTagCoverage(boardText, el.variant.value, tag);
-        const covTxt = cov.total > 0 ? ` (${cov.approx ? "~" : ""}${cov.pct.toFixed(1)}%)` : "";
+        const stat = coverageText(cov);
         let extra = "";
         if (!isHoldem && tag === "@sd") {
           const c4 = previewTagCoverage(boardText, el.variant.value, "@sd4");
@@ -116,11 +141,25 @@ function atTagLiveInfo(rangeText) {
             extra = " + blocker-only <4 out draws";
           }
         }
-        parts.push(`${tag}: ${combos.length ? combos.join(",") : "-"}${covTxt}${extra}`);
+        parts.push(`${tag}: ${combos.length ? combos.join(",") : "-"} (${stat})${extra}`);
       } catch {
         parts.push(`${tag}: invalid board input`);
       }
     }
+  }
+
+  if (boardCards >= 3) {
+    for (const expr of andClauses) {
+      try {
+        const cov = previewRangeCoverage(boardText, el.variant.value, expr);
+        const stat = coverageText(cov);
+        parts.push(`${expr}: ${stat}`);
+      } catch {
+        parts.push(`${expr}: invalid expression`);
+      }
+    }
+  } else if (andClauses.length) {
+    for (const expr of andClauses) parts.push(`${expr}: needs flop+.`);
   }
   return parts.join(" | ");
 }
@@ -193,7 +232,17 @@ function renderSummary(result) {
     el.runSummary.textContent = "";
     return;
   }
-  el.runSummary.textContent = `${result.iterations.toLocaleString()} iterations in ${(result.elapsedMs / 1000).toFixed(2)}s • ${result.variant.toUpperCase()} • ${String(result.method || "monte").toUpperCase()}`;
+  const engine = result.backend ? "NATIVE BACKEND" : "BROWSER";
+  const total = (result.elapsedMs / 1000).toFixed(2);
+  let extra = "";
+  if (result.backend && result.timings) {
+    const prep = Number(result.timings.prepareMs || 0);
+    const sim = Number(result.timings.nativeMs || result.backendComputeMs || 0);
+    if (prep > 0 || sim > 0) {
+      extra = ` • prep ${(prep / 1000).toFixed(2)}s • sim ${(sim / 1000).toFixed(2)}s`;
+    }
+  }
+  el.runSummary.textContent = `${result.iterations.toLocaleString()} iterations in ${total}s • ${result.variant.toUpperCase()} • ${String(result.method || "monte").toUpperCase()} • ${engine}${extra}`;
 }
 
 function playerOutputRow(row) {
@@ -312,18 +361,25 @@ async function run() {
   try {
     const controller = runAbortController;
     const result = await runSimulation(config, (p) => {
-      setStatus(`Iterations: ${p.iterations.toLocaleString()} | ${Math.round(p.ips).toLocaleString()} it/s | ${p.elapsed.toFixed(2)}s`);
+      const ips = Number(p.ips);
+      if (Number.isFinite(ips) && ips > 0 && Number(p.iterations) > 0) {
+        setStatus(`Iterations: ${p.iterations.toLocaleString()} | ${Math.round(ips).toLocaleString()} it/s | ${p.elapsed.toFixed(2)}s`);
+      } else {
+        setStatus(`Running... preparing/evaluating ranges | ${p.elapsed.toFixed(2)}s`);
+      }
     }, controller.signal);
     state.lastResult = result;
     renderSummary(result);
     renderPlayers();
+    const avgIps = result.iterations / Math.max(0.001, result.elapsedMs / 1000);
     if (result.aborted || controller.signal.aborted) {
-      setStatus(`Stopped at ${result.iterations.toLocaleString()} iterations in ${(result.elapsedMs / 1000).toFixed(2)}s.`);
+      setStatus(`Stopped at ${result.iterations.toLocaleString()} iterations in ${(result.elapsedMs / 1000).toFixed(2)}s (${Math.round(avgIps).toLocaleString()} it/s avg).`);
     } else {
-      setStatus(`Done. ${result.iterations.toLocaleString()} iterations in ${(result.elapsedMs / 1000).toFixed(2)}s.`);
+      setStatus(`Done. ${result.iterations.toLocaleString()} iterations in ${(result.elapsedMs / 1000).toFixed(2)}s (${Math.round(avgIps).toLocaleString()} it/s avg).`);
     }
   } catch (err) {
-    setStatus(`Error: ${err.message || String(err)}`);
+    if (runAbortController?.signal?.aborted || err?.name === "AbortError") setStatus("Stopped.");
+    else setStatus(`Error: ${err.message || String(err)}`);
   } finally {
     state.isRunning = false;
     runAbortController = null;

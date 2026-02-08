@@ -1,4 +1,4 @@
-# Poker Odds Lab (Browser-only)
+# Poker Odds Lab
 
 Desktop-first web app for poker equity calculations:
 - Hold'em
@@ -21,9 +21,29 @@ Desktop-first web app for poker equity calculations:
 - Local persistence (`localStorage`)
 - Export/import setup+results as `.json`
 - Quick-pick filters (`@set`, `@2p`, `@fd`, `@flush`, etc.)
+- Native backend mode (Go + Rust simulator) with automatic frontend fallback to browser engine when backend is not running
 
-## Run locally
-From project root:
+## Run locally (recommended)
+Run the native backend from project root:
+
+```bash
+go run ./backend
+```
+
+Optional (recommended so first request is fast):
+
+```bash
+cargo build --release --manifest-path native-sim/Cargo.toml
+```
+
+Open:
+- `http://localhost:8787/index.html`
+
+The UI automatically uses the native backend when available.
+If `native-sim/target/release/native-sim` is missing, backend will auto-build it on first use.
+
+## Browser-only fallback
+If you want to run without backend:
 
 ```bash
 python3 -m http.server 8080
@@ -31,6 +51,14 @@ python3 -m http.server 8080
 
 Open:
 - `http://localhost:8080/index.html`
+
+In this mode, calculations run fully in the browser.
+
+## Native backend API
+- `GET /api/health`
+- `POST /api/sim/run`
+- `POST /api/sim/preview/tag`
+- `POST /api/sim/preview/range`
 
 ## Syntax support (v1)
 Implemented:
@@ -51,8 +79,5 @@ Notes:
 - Exhaustive auto-mode requires exact suited hands for all players (e.g. `AsKdQsTd`). It is mathematically exact for those inputs.
 
 ## Performance notes
-- Engine optimized for lower allocation and faster evaluation loops.
-- Current local benchmark (short capped run, this machine):
-  - Hold'em 2-way random vs random: ~9k iterations/s
-  - PLO4 2-way random vs random: ~4.4k iterations/s
-  - PLO6 4-way random vs random: ~600 iterations/s
+- Native mode uses all available CPU cores by default.
+- Browser mode remains available as fallback and is slower for wide PLO range-vs-range workloads.
