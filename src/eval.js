@@ -25,6 +25,36 @@ const BOARD_3_COMBOS = [
   [0, 3, 4], [1, 2, 3], [1, 2, 4], [1, 3, 4], [2, 3, 4]
 ];
 
+function chooseCombos(n, k) {
+  const out = [];
+  const cur = [];
+  function dfs(start) {
+    if (cur.length === k) {
+      out.push(cur.slice());
+      return;
+    }
+    for (let i = start; i <= n - (k - cur.length); i++) {
+      cur.push(i);
+      dfs(i + 1);
+      cur.pop();
+    }
+  }
+  dfs(0);
+  return out;
+}
+
+const HOLD_STREET_COMBOS = {
+  5: [[0, 1, 2, 3, 4]],
+  6: chooseCombos(6, 5),
+  7: HOLD_COMBOS
+};
+
+const BOARD_STREET_COMBOS = {
+  3: [[0, 1, 2]],
+  4: chooseCombos(4, 3),
+  5: BOARD_3_COMBOS
+};
+
 const OMAHA_HOLE_2 = {
   4: [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]],
   5: [[0, 1], [0, 2], [0, 3], [0, 4], [1, 2], [1, 3], [1, 4], [2, 3], [2, 4], [3, 4]],
@@ -94,11 +124,21 @@ function evaluate5Score(c1, c2, c3, c4, c5) {
   return encode5(sorted[0], sorted[1], sorted[2], sorted[3], sorted[4]);
 }
 
+export function classIdFromScore(score) {
+  return Math.floor(score / 1_000_000);
+}
+
 export function bestHoldemScore(hole, board5) {
-  const all = [hole[0], hole[1], board5[0], board5[1], board5[2], board5[3], board5[4]];
+  return bestHoldemScoreStreet(hole, board5);
+}
+
+export function bestHoldemScoreStreet(hole, boardCards) {
+  const all = hole.concat(boardCards);
+  const combos = HOLD_STREET_COMBOS[all.length];
+  if (!combos) throw new Error("Hold'em street evaluation requires 5-7 total cards.");
   let best = 0;
-  for (let i = 0; i < HOLD_COMBOS.length; i++) {
-    const c = HOLD_COMBOS[i];
+  for (let i = 0; i < combos.length; i++) {
+    const c = combos[i];
     const sc = evaluate5Score(all[c[0]], all[c[1]], all[c[2]], all[c[3]], all[c[4]]);
     if (sc > best) best = sc;
   }
@@ -106,15 +146,22 @@ export function bestHoldemScore(hole, board5) {
 }
 
 export function bestOmahaScore(hole, board5) {
+  return bestOmahaScoreStreet(hole, board5);
+}
+
+export function bestOmahaScoreStreet(hole, boardCards) {
+  const bCombos = BOARD_STREET_COMBOS[boardCards.length];
+  if (!bCombos) throw new Error("Omaha street evaluation requires board with 3-5 cards.");
   const hCombos = OMAHA_HOLE_2[hole.length];
+  if (!hCombos) throw new Error("Omaha hand must be 4, 5, or 6 cards.");
   let best = 0;
   for (let i = 0; i < hCombos.length; i++) {
     const hc = hCombos[i];
     const h1 = hole[hc[0]];
     const h2 = hole[hc[1]];
-    for (let j = 0; j < BOARD_3_COMBOS.length; j++) {
-      const bc = BOARD_3_COMBOS[j];
-      const sc = evaluate5Score(h1, h2, board5[bc[0]], board5[bc[1]], board5[bc[2]]);
+    for (let j = 0; j < bCombos.length; j++) {
+      const bc = bCombos[j];
+      const sc = evaluate5Score(h1, h2, boardCards[bc[0]], boardCards[bc[1]], boardCards[bc[2]]);
       if (sc > best) best = sc;
     }
   }

@@ -23,7 +23,7 @@ const el = {
   run: document.querySelector("#run"),
   stop: document.querySelector("#stop"),
   status: document.querySelector("#status"),
-  results: document.querySelector("#results"),
+  runSummary: document.querySelector("#runSummary"),
   helpOpen: document.querySelector("#helpOpen"),
   helpClose: document.querySelector("#helpClose"),
   helpModal: document.querySelector("#helpModal"),
@@ -35,7 +35,7 @@ const el = {
 
 const quickPicks = [
   { label: "Set", token: "@set" },
-  { label: "2 Pair+", token: "@2p" },
+  { label: "2 Pair", token: "@2p" },
   { label: "Flush Draw", token: "@fd" },
   { label: "Flush", token: "@flush" },
   { label: "Straight", token: "@straight" },
@@ -91,39 +91,68 @@ function applyQuickPick(token) {
   const idx = Math.max(0, Math.min(state.players.length - 1, state.focusedPlayer));
   const player = state.players[idx];
   if (!player) return;
-  if (!player.range || player.range.trim() === "*") {
-    player.range = token;
-  } else {
-    player.range = `${player.range}:${token}`;
-  }
+  if (!player.range || player.range.trim() === "*") player.range = token;
+  else player.range = `${player.range}:${token}`;
   renderPlayers();
   saveLocal();
 }
 
+function openHelp() {
+  el.helpModal.classList.remove("hidden");
+}
+
+function closeHelp() {
+  el.helpModal.classList.add("hidden");
+}
+
+function setStatus(msg) {
+  el.status.textContent = msg;
+}
+
+function renderSummary(result) {
+  if (!result || !result.players?.length) {
+    el.runSummary.textContent = "";
+    return;
+  }
+  el.runSummary.textContent = `${result.iterations.toLocaleString()} iterations in ${(result.elapsedMs / 1000).toFixed(2)}s • ${result.variant.toUpperCase()}`;
+}
+
+function playerOutputRow(row) {
+  const wrap = document.createElement("div");
+  wrap.className = "player-output";
+
+  if (!row) {
+    wrap.textContent = "No result yet.";
+    return wrap;
+  }
+
+  wrap.innerHTML = `<span><strong>Eq</strong> ${row.equity}</span>
+    <span><strong>W</strong> ${row.win}</span>
+    <span><strong>T</strong> ${row.tie}</span>
+    <span><strong>L</strong> ${row.loss}</span>
+    <span><strong>Combos</strong> ${row.combos}</span>`;
+
+  const classes = document.createElement("div");
+  classes.className = "player-classes";
+  classes.textContent = row.classes || "";
+  wrap.appendChild(classes);
+  return wrap;
+}
+
 function renderPlayers() {
   el.players.innerHTML = "";
+  const results = state.lastResult?.players || [];
+
   state.players.forEach((p, i) => {
-    const card = document.createElement("div");
-    card.className = "player-card";
+    const row = document.createElement("div");
+    row.className = "player-row";
 
-    const head = document.createElement("div");
-    head.className = "player-head";
+    const main = document.createElement("div");
+    main.className = "player-main";
 
-    const nameInput = document.createElement("input");
-    nameInput.value = p.name;
-    nameInput.placeholder = `P${i + 1}`;
-    nameInput.style.maxWidth = "160px";
-    nameInput.addEventListener("input", () => {
-      p.name = nameInput.value;
-      saveLocal();
-    });
-
-    const short = document.createElement("span");
-    short.className = "small";
-    short.textContent = `Player ${i + 1}`;
-
-    head.appendChild(nameInput);
-    head.appendChild(short);
+    const tag = document.createElement("span");
+    tag.className = "player-tag";
+    tag.textContent = `P${i + 1}`;
 
     const range = document.createElement("input");
     range.className = "player-range-input";
@@ -138,58 +167,12 @@ function renderPlayers() {
       saveLocal();
     });
 
-    card.appendChild(head);
-    card.appendChild(range);
-    el.players.appendChild(card);
+    main.appendChild(tag);
+    main.appendChild(range);
+    row.appendChild(main);
+    row.appendChild(playerOutputRow(results[i]));
+    el.players.appendChild(row);
   });
-}
-
-function setStatus(msg) {
-  el.status.textContent = msg;
-}
-
-function openHelp() {
-  el.helpModal.classList.remove("hidden");
-}
-
-function closeHelp() {
-  el.helpModal.classList.add("hidden");
-}
-
-function renderResults(result) {
-  if (!result || !result.players?.length) {
-    el.results.innerHTML = "<p>No results yet.</p>";
-    return;
-  }
-
-  const html = [];
-  html.push(`<p class="small"><strong>${result.iterations.toLocaleString()}</strong> iterations in <strong>${(result.elapsedMs / 1000).toFixed(2)}s</strong>. Variant: <strong>${result.variant}</strong>.</p>`);
-  html.push('<div class="table-wrap"><table><thead><tr><th>Player</th><th>Range</th><th>Equity</th><th>Win</th><th>Tie</th><th>Loss</th><th>Combos</th><th>Hand Classes</th></tr></thead><tbody>');
-
-  for (const row of result.players) {
-    html.push(`<tr>
-      <td>${escapeHtml(row.player)}</td>
-      <td>${escapeHtml(row.range)}</td>
-      <td><strong>${row.equity}</strong></td>
-      <td>${row.win}</td>
-      <td>${row.tie}</td>
-      <td>${row.loss}</td>
-      <td>${row.combos}</td>
-      <td>${escapeHtml(row.classes)}</td>
-    </tr>`);
-  }
-
-  html.push("</tbody></table></div>");
-  el.results.innerHTML = html.join("");
-}
-
-function escapeHtml(s) {
-  return String(s)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
 }
 
 function currentConfig() {
@@ -213,12 +196,14 @@ async function run() {
   setStatus("Running simulation...");
   el.run.disabled = true;
   el.stop.disabled = false;
+
   try {
     const result = await runSimulation(config, (p) => {
-      setStatus(`Iterations: ${p.iterations.toLocaleString()} | ${Math.round(p.ips).toLocaleString()} it/s | elapsed: ${p.elapsed.toFixed(2)}s | board: ${p.boardClass}`);
+      setStatus(`Iterations: ${p.iterations.toLocaleString()} | ${Math.round(p.ips).toLocaleString()} it/s | ${p.elapsed.toFixed(2)}s`);
     }, runAbortController.signal);
     state.lastResult = result;
-    renderResults(result);
+    renderSummary(result);
+    renderPlayers();
     setStatus(`Done. ${result.iterations.toLocaleString()} iterations in ${(result.elapsedMs / 1000).toFixed(2)}s.`);
   } catch (err) {
     setStatus(`Error: ${err.message || String(err)}`);
@@ -269,11 +254,8 @@ function importSetup(file) {
         range: p.range || "*"
       }));
 
-      if (payload.result) {
-        state.lastResult = payload.result;
-        renderResults(payload.result);
-      }
-
+      state.lastResult = payload.result || null;
+      renderSummary(state.lastResult);
       renderPlayers();
       saveLocal();
       setStatus("Setup imported.");
@@ -317,6 +299,7 @@ function wire() {
   window.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !el.helpModal.classList.contains("hidden")) closeHelp();
   });
+
   el.exportSetup.addEventListener("click", exportSetup);
   el.importSetup.addEventListener("click", () => el.importFile.click());
   el.importFile.addEventListener("change", () => {
@@ -332,8 +315,8 @@ function wire() {
 
 loadLocal();
 renderQuickPicks();
+renderSummary(state.lastResult);
 renderPlayers();
-renderResults(null);
 wire();
 el.stop.disabled = true;
 setStatus("Idle.");

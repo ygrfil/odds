@@ -36,13 +36,13 @@
         </div>
 
         <div class="control-row board-row">
-          <label class="grow">
+          <label>
             Board (0-5 cards, e.g. AsKdJh)
-            <input id="board" type="text" placeholder="" />
+            <input id="board" class="cards-short" type="text" maxlength="10" placeholder="AsKdJh" />
           </label>
-          <label class="grow">
+          <label>
             Dead cards (optional)
-            <input id="dead" type="text" placeholder="e.g. 2c3c" />
+            <input id="dead" class="cards-short" type="text" maxlength="10" placeholder="2c3c" />
           </label>
         </div>
 
@@ -61,16 +61,12 @@
 
       <div class="content-grid">
         <section class="panel" id="playersPanel">
-          <h2>Players</h2>
-          <div id="players"></div>
-        </section>
-
-        <section class="panel" id="outputPanel">
           <div class="output-head">
-            <h2>Output</h2>
+            <h2>Players</h2>
             <div id="status" class="status-line">Idle.</div>
           </div>
-          <div id="results"></div>
+          <div id="runSummary" class="small"></div>
+          <div id="players"></div>
         </section>
       </div>
 

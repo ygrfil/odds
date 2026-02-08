@@ -1,4 +1,12 @@
-import { bestHoldemScore, bestOmahaScore, boardDrawInfo, classifyBoard, CLASS_NAMES } from "./eval.js";
+import {
+  bestHoldemScore,
+  bestOmahaScore,
+  bestHoldemScoreStreet,
+  bestOmahaScoreStreet,
+  classIdFromScore,
+  classifyBoard,
+  CLASS_NAMES
+} from "./eval.js";
 import { fullDeck, parseCards, rankOf } from "./cards.js";
 import { compileRange } from "./parser.js";
 import { makeRng } from "./rng.js";
@@ -14,13 +22,35 @@ function variantCardCount(variant) {
 }
 
 function categoryMatch(tag, hand, board) {
-  const info = boardDrawInfo(hand, board);
-  if (tag === "@fd") return info.flushDraw;
-  if (tag === "@flush") return info.madeFlush;
-  if (tag === "@2p") return info.twoPairOrBetter;
-  if (tag === "@set") return info.set;
-
   if (board.length < 3) return false;
+  const isHoldem = hand.length === 2;
+
+  const boardSuitCnt = [0, 0, 0, 0];
+  const handSuitCnt = [0, 0, 0, 0];
+  for (const c of board) boardSuitCnt[c % 4]++;
+  for (const c of hand) handSuitCnt[c % 4]++;
+
+  let madeFlush = false;
+  let flushDraw = false;
+  for (let s = 0; s < 4; s++) {
+    if (isHoldem) {
+      const total = boardSuitCnt[s] + handSuitCnt[s];
+      if (total >= 5) madeFlush = true;
+      if (!madeFlush && board.length < 5 && total === 4) flushDraw = true;
+    } else {
+      if (handSuitCnt[s] >= 2 && boardSuitCnt[s] >= 3) madeFlush = true;
+      if (!madeFlush && board.length < 5 && handSuitCnt[s] >= 2 && boardSuitCnt[s] === 2) flushDraw = true;
+    }
+  }
+
+  const score = isHoldem ? bestHoldemScoreStreet(hand, board) : bestOmahaScoreStreet(hand, board);
+  const cls = classIdFromScore(score);
+
+  if (tag === "@fd") return flushDraw;
+  if (tag === "@flush") return cls === 5 || cls === 8;
+  if (tag === "@2p") return cls === 2;
+  if (tag === "@set") return cls === 3;
+
   const ranks = hand.concat(board).map(rankOf);
   const uniq = [...new Set(ranks)].sort((a, b) => a - b);
   let hasStraight = false;
@@ -31,16 +61,16 @@ function categoryMatch(tag, hand, board) {
     }
   }
   if (!hasStraight && [14, 2, 3, 4, 5].every((r) => uniq.includes(r))) hasStraight = true;
-  if (tag === "@straight") return hasStraight;
+  if (tag === "@straight") return cls === 4 || cls === 8 || hasStraight;
 
   const cnt = new Uint8Array(15);
   for (const r of ranks) cnt[r]++;
   let top = 0;
   for (let r = 2; r <= 14; r++) if (cnt[r] > top) top = cnt[r];
-  if (tag === "@tpplus") return top >= 2 || hasStraight || info.madeFlush;
+  if (tag === "@tpplus") return cls >= 1 || top >= 2 || hasStraight || madeFlush;
 
   if (tag === "@overpair") {
-    if (board.length < 3 || hand.length < 2) return false;
+    if (!isHoldem || board.length < 3) return false;
     const pocket = rankOf(hand[0]) === rankOf(hand[1]);
     if (!pocket) return false;
     const topBoard = Math.max(...board.map(rankOf));
