@@ -6,14 +6,10 @@ self.onmessage = async (event) => {
 
   try {
     const raw = await runSimulationRaw(msg.config, {
-      capMs: msg.capMs,
       iterCap: msg.iterCap,
       seedOverride: msg.seed,
       poolScale: msg.poolScale,
-      disableStabilityStop: true,
-      onProgress: (progress) => {
-        self.postMessage({ type: "progress", workerId: msg.workerId, progress });
-      }
+      disableStabilityStop: true
     });
 
     self.postMessage({

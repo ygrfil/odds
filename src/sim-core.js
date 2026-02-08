@@ -208,7 +208,6 @@ export function rawToResult(raw, config) {
     iterations: it,
     elapsedMs,
     variant: config.variant,
-    mode: config.mode,
     players: rows,
     input: {
       board: config.board,
@@ -247,7 +246,7 @@ export async function runSimulationRaw(config, options = {}) {
   const classCounts = players.map(() => new Array(CLASS_NAMES.length).fill(0));
 
   const start = performance.now();
-  const capMs = options.capMs ?? (config.mode === "quick" ? 5000 : 60000);
+  const capMs = Number.isFinite(options.capMs) ? options.capMs : Number.POSITIVE_INFINITY;
   const iterCap = Math.max(500, Number(options.iterCap ?? config.iterationCap ?? 100000));
 
   let it = 0;
@@ -291,6 +290,7 @@ export async function runSimulationRaw(config, options = {}) {
   }
 
   while (it < iterCap) {
+    if (options.signal?.aborted) break;
     const now = performance.now();
     if (now - start >= capMs) break;
 
@@ -346,20 +346,6 @@ export async function runSimulationRaw(config, options = {}) {
       const elapsed = (performance.now() - start) / 1000;
       options.onProgress({ iterations: it, elapsed, boardClass: classifyBoard(board5), ips: it / Math.max(0.001, elapsed) });
       lastProgress = performance.now();
-      await new Promise((r) => setTimeout(r, 0));
-    }
-
-    if (config.mode === "long" && !options.disableStabilityStop && it > 3000) {
-      let stable = true;
-      for (let i = 0; i < players.length; i++) {
-        const eq = ((wins[i] + ties[i] / players.length) / it) * 100;
-        const prevEq = ((Math.max(0, wins[i] - 30) + Math.max(0, ties[i] - 10) / players.length) / Math.max(1, it - 30)) * 100;
-        if (Math.abs(eq - prevEq) >= 0.01) {
-          stable = false;
-          break;
-        }
-      }
-      if (stable && performance.now() - start > 7000) break;
     }
   }
 

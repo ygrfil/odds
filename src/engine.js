@@ -1,17 +1,8 @@
 import { runSimulationRaw, rawToResult } from "./sim-core.js";
 
 function chooseWorkerCount(config) {
-  const requested = config.workers;
   const hw = typeof navigator !== "undefined" && navigator.hardwareConcurrency ? navigator.hardwareConcurrency : 2;
-  const auto = Math.max(1, Math.min(4, hw));
-  if (!requested || requested === "auto") return auto;
-  const n = Number(requested);
-  if (!Number.isFinite(n) || n < 1) return auto;
-  return Math.max(1, Math.min(6, Math.floor(n)));
-}
-
-function hasRestrictiveTags(config) {
-  return (config.players || []).some((p) => (p.range || "").includes("@"));
+  return Math.max(1, hw);
 }
 
 function mergeWorkerPayloads(payloads, playerCount) {
@@ -40,79 +31,111 @@ function mergeWorkerPayloads(payloads, playerCount) {
   return { iterations, elapsedMs, wins, ties, losses, classCounts, comboLists };
 }
 
-async function runWorkers(config, workerCount, onProgress) {
-  const capMs = config.mode === "quick" ? 5000 : 60000;
+async function runWorkers(config, workerCount, onProgress, signal) {
   const totalIterCap = Math.max(500, Number(config.iterationCap || 100000));
-  const iterPerWorker = Math.max(500, Math.ceil(totalIterCap / workerCount));
-
-  const workers = [];
-  const donePayloads = [];
-  let finished = 0;
-
   const start = performance.now();
-  const progressByWorker = Array.from({ length: workerCount }, () => ({ iterations: 0, elapsed: 0 }));
+  const cumulative = {
+    iterations: 0,
+    elapsedMs: 0,
+    wins: new Array(config.players.length).fill(0),
+    ties: new Array(config.players.length).fill(0),
+    losses: new Array(config.players.length).fill(0),
+    classCounts: Array.from({ length: config.players.length }, () => new Array(9).fill(0)),
+    comboLists: Array.from({ length: config.players.length }, () => new Set())
+  };
 
-  return await new Promise((resolve, reject) => {
-    for (let i = 0; i < workerCount; i++) {
-      const w = new Worker(new URL("./sim-worker.js", import.meta.url), { type: "module" });
-      workers.push(w);
+  const handSize = config.variant === "holdem" ? 2 : config.variant === "plo4" ? 4 : config.variant === "plo5" ? 5 : 6;
+  const batchPerWorker = handSize === 2 ? 4000 : handSize === 4 ? 2500 : 1500;
 
-      w.onmessage = (event) => {
-        const msg = event.data;
-        if (!msg) return;
-
-        if (msg.type === "progress") {
-          progressByWorker[i] = msg.progress;
-          const totalIt = progressByWorker.reduce((a, x) => a + (x.iterations || 0), 0);
-          const elapsed = (performance.now() - start) / 1000;
-          onProgress?.({ iterations: totalIt, elapsed, ips: totalIt / Math.max(0.001, elapsed), boardClass: "multi-core" });
-        }
-
-        if (msg.type === "error") {
-          workers.forEach((x) => x.terminate());
-          reject(new Error(msg.error || "Worker failed"));
-        }
-
-        if (msg.type === "done") {
-          donePayloads.push(msg.payload);
-          finished++;
-          if (finished === workerCount) {
-            workers.forEach((x) => x.terminate());
-            const merged = mergeWorkerPayloads(donePayloads, config.players.length);
-            merged.elapsedMs = performance.now() - start;
-            resolve(merged);
-          }
-        }
-      };
-
-      w.onerror = (err) => {
+  async function runBatch(iterPerWorker, batchIndex) {
+    const workers = [];
+    const donePayloads = [];
+    let finished = 0;
+    return await new Promise((resolve, reject) => {
+      const abortHandler = () => {
         workers.forEach((x) => x.terminate());
-        reject(new Error(err?.message || "Worker execution failed"));
+        resolve(null);
       };
+      if (signal) signal.addEventListener("abort", abortHandler, { once: true });
 
-      w.postMessage({
-        type: "run",
-        workerId: i,
-        config,
-        capMs,
-        iterCap: iterPerWorker,
-        seed: Number.isFinite(config.seed) ? Number(config.seed) + i * 100003 : undefined,
-        poolScale: 1 / workerCount
-      });
+      for (let i = 0; i < workerCount; i++) {
+        const w = new Worker(new URL("./sim-worker.js", import.meta.url), { type: "module" });
+        workers.push(w);
+
+        w.onmessage = (event) => {
+          const msg = event.data;
+          if (!msg) return;
+          if (msg.type === "error") {
+            workers.forEach((x) => x.terminate());
+            reject(new Error(msg.error || "Worker failed"));
+            return;
+          }
+          if (msg.type === "done") {
+            donePayloads.push(msg.payload);
+            finished++;
+            if (finished === workerCount) {
+              workers.forEach((x) => x.terminate());
+              resolve(donePayloads);
+            }
+          }
+        };
+
+        w.onerror = (err) => {
+          workers.forEach((x) => x.terminate());
+          reject(new Error(err?.message || "Worker execution failed"));
+        };
+
+        w.postMessage({
+          type: "run",
+          workerId: i,
+          config,
+          iterCap: iterPerWorker,
+          seed: batchIndex * 1000003 + i * 100003 + 17,
+          poolScale: 1 / workerCount
+        });
+      }
+    });
+  }
+
+  let batch = 0;
+  while (cumulative.iterations < totalIterCap) {
+    if (signal?.aborted) break;
+    const remaining = totalIterCap - cumulative.iterations;
+    const iterPerWorker = Math.max(1, Math.min(batchPerWorker, Math.ceil(remaining / workerCount)));
+    const payloads = await runBatch(iterPerWorker, batch++);
+    if (!payloads || payloads.length === 0) break;
+    const merged = mergeWorkerPayloads(payloads, config.players.length);
+    cumulative.iterations += merged.iterations;
+    for (let p = 0; p < config.players.length; p++) {
+      cumulative.wins[p] += merged.wins[p];
+      cumulative.ties[p] += merged.ties[p];
+      cumulative.losses[p] += merged.losses[p];
+      for (let c = 0; c < 9; c++) cumulative.classCounts[p][c] += merged.classCounts[p][c];
+      for (const key of merged.comboLists[p]) cumulative.comboLists[p].add(key);
     }
-  });
+    cumulative.elapsedMs = performance.now() - start;
+    const elapsed = cumulative.elapsedMs / 1000;
+    onProgress?.({
+      iterations: cumulative.iterations,
+      elapsed,
+      ips: cumulative.iterations / Math.max(0.001, elapsed),
+      boardClass: "multi-core"
+    });
+  }
+
+  cumulative.elapsedMs = performance.now() - start;
+  return cumulative;
 }
 
-export async function runSimulation(config, onProgress) {
+export async function runSimulation(config, onProgress, signal) {
   const workersAvailable = typeof Worker !== "undefined";
-  let workerCount = chooseWorkerCount(config);
-  if (hasRestrictiveTags(config) && workerCount > 2) workerCount = 2;
+  const workerCount = chooseWorkerCount(config);
 
   let raw;
   if (workersAvailable && workerCount > 1) {
-    raw = await runWorkers(config, workerCount, onProgress);
+    raw = await runWorkers(config, workerCount, onProgress, signal);
   } else {
-    raw = await runSimulationRaw(config, { onProgress });
+    raw = await runSimulationRaw(config, { onProgress, signal });
   }
 
   return rawToResult(raw, config);

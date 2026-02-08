@@ -6,21 +6,22 @@ const state = {
     { name: "P2", range: "*" }
   ],
   focusedPlayer: 0,
-  lastResult: null
+  lastResult: null,
+  isRunning: false
 };
+
+let runAbortController = null;
 
 const el = {
   variant: document.querySelector("#variant"),
-  speedMode: document.querySelector("#speedMode"),
   iterationCap: document.querySelector("#iterationCap"),
-  seed: document.querySelector("#seed"),
-  workers: document.querySelector("#workers"),
   board: document.querySelector("#board"),
   dead: document.querySelector("#dead"),
   addPlayer: document.querySelector("#addPlayer"),
   removePlayer: document.querySelector("#removePlayer"),
   players: document.querySelector("#players"),
   run: document.querySelector("#run"),
+  stop: document.querySelector("#stop"),
   status: document.querySelector("#status"),
   results: document.querySelector("#results"),
   exportSetup: document.querySelector("#exportSetup"),
@@ -45,10 +46,7 @@ const quickPicks = [
 function saveLocal() {
   localStorage.setItem("poker-odds-lab-state", JSON.stringify({
     variant: el.variant.value,
-    mode: el.speedMode.value,
     iterationCap: el.iterationCap.value,
-    seed: el.seed.value,
-    workers: el.workers.value,
     board: el.board.value,
     dead: el.dead.value,
     players: state.players
@@ -61,10 +59,7 @@ function loadLocal() {
     if (!raw) return;
     const s = JSON.parse(raw);
     el.variant.value = s.variant || "holdem";
-    el.speedMode.value = s.mode || "quick";
     el.iterationCap.value = s.iterationCap || "150000";
-    el.seed.value = s.seed || "";
-    el.workers.value = s.workers || "auto";
     el.board.value = s.board || "";
     el.dead.value = s.dead || "";
     if (Array.isArray(s.players) && s.players.length >= 2) {
@@ -157,7 +152,7 @@ function renderResults(result) {
   }
 
   const html = [];
-  html.push(`<p><strong>${result.iterations.toLocaleString()}</strong> iterations in <strong>${(result.elapsedMs / 1000).toFixed(2)}s</strong>. Variant: <strong>${result.variant}</strong>, mode: <strong>${result.mode}</strong>.</p>`);
+  html.push(`<p><strong>${result.iterations.toLocaleString()}</strong> iterations in <strong>${(result.elapsedMs / 1000).toFixed(2)}s</strong>. Variant: <strong>${result.variant}</strong>.</p>`);
   html.push('<div class="table-wrap"><table><thead><tr><th>Player</th><th>Range</th><th>Equity</th><th>Win</th><th>Tie</th><th>Loss</th><th>Combos</th><th>Hand Classes</th></tr></thead><tbody>');
 
   for (const row of result.players) {
@@ -189,10 +184,7 @@ function escapeHtml(s) {
 function currentConfig() {
   return {
     variant: el.variant.value,
-    mode: el.speedMode.value,
     iterationCap: Number(el.iterationCap.value || 150000),
-    seed: el.seed.value ? Number(el.seed.value) : undefined,
-    workers: el.workers.value,
     board: el.board.value.trim(),
     dead: el.dead.value.trim(),
     players: state.players.map((p, i) => ({
@@ -203,21 +195,34 @@ function currentConfig() {
 }
 
 async function run() {
+  if (state.isRunning) return;
   const config = currentConfig();
+  runAbortController = new AbortController();
+  state.isRunning = true;
   setStatus("Running simulation...");
   el.run.disabled = true;
+  el.stop.disabled = false;
   try {
     const result = await runSimulation(config, (p) => {
       setStatus(`Iterations: ${p.iterations.toLocaleString()} | ${Math.round(p.ips).toLocaleString()} it/s | elapsed: ${p.elapsed.toFixed(2)}s | board: ${p.boardClass}`);
-    });
+    }, runAbortController.signal);
     state.lastResult = result;
     renderResults(result);
     setStatus(`Done. ${result.iterations.toLocaleString()} iterations in ${(result.elapsedMs / 1000).toFixed(2)}s.`);
   } catch (err) {
     setStatus(`Error: ${err.message || String(err)}`);
   } finally {
+    state.isRunning = false;
+    runAbortController = null;
     el.run.disabled = false;
+    el.stop.disabled = true;
   }
+}
+
+function stopRun() {
+  if (!state.isRunning || !runAbortController) return;
+  runAbortController.abort();
+  setStatus("Stopping...");
 }
 
 function exportSetup() {
@@ -245,9 +250,7 @@ function importSetup(file) {
       if (!setup.players || setup.players.length < 2) throw new Error("Invalid setup file");
 
       el.variant.value = setup.variant || "holdem";
-      el.speedMode.value = setup.mode || "quick";
       el.iterationCap.value = setup.iterationCap || 150000;
-      el.seed.value = setup.seed || "";
       el.board.value = setup.board || "";
       el.dead.value = setup.dead || "";
       state.players = setup.players.slice(0, 6).map((p, i) => ({
@@ -272,6 +275,7 @@ function importSetup(file) {
 
 function wire() {
   el.addPlayer.addEventListener("click", () => {
+    if (state.isRunning) return;
     if (state.players.length >= 6) {
       setStatus("Max 6 players.");
       return;
@@ -282,6 +286,7 @@ function wire() {
   });
 
   el.removePlayer.addEventListener("click", () => {
+    if (state.isRunning) return;
     if (state.players.length <= 2) {
       setStatus("Minimum 2 players.");
       return;
@@ -292,6 +297,7 @@ function wire() {
   });
 
   el.run.addEventListener("click", run);
+  el.stop.addEventListener("click", stopRun);
   el.exportSetup.addEventListener("click", exportSetup);
   el.importSetup.addEventListener("click", () => el.importFile.click());
   el.importFile.addEventListener("change", () => {
@@ -300,7 +306,7 @@ function wire() {
     el.importFile.value = "";
   });
 
-  [el.variant, el.speedMode, el.iterationCap, el.seed, el.workers, el.board, el.dead].forEach((node) => {
+  [el.variant, el.iterationCap, el.board, el.dead].forEach((node) => {
     node.addEventListener("input", saveLocal);
   });
 }
@@ -310,4 +316,5 @@ renderQuickPicks();
 renderPlayers();
 renderResults(null);
 wire();
+el.stop.disabled = true;
 setStatus("Idle.");
