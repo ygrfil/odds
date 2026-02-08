@@ -195,7 +195,7 @@ function simpleExactIfAny(rangeText, handSize) {
 function maybeExpandPureTagRange(rangeText, variant, boardCards) {
   const normalized = String(rangeText || "").trim().toLowerCase().replace(/\s+/g, "");
   const tag = normalized === "@sd13" ? "@sd12" : normalized;
-  const holdEmExpandable = new Set(["@sd", "@sd4", "@sd8", "@sd12", "@2p", "@set", "@straight", "@tpplus", "@overpair"]);
+  const holdEmExpandable = new Set(["@sd", "@sd4", "@sd8", "@sd12", "@2p", "@set", "@fd", "@flush", "@straight", "@tpplus", "@overpair"]);
   const omahaExpandable = new Set(["@sd", "@sd4", "@sd8", "@sd12"]);
   const allowed = variant === "holdem" ? holdEmExpandable : omahaExpandable;
   if (!allowed.has(tag)) return rangeText;

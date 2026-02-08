@@ -61,7 +61,7 @@ const TAG_HINTS = {
   "@sd13": "Legacy alias for @sd12 (12+ outs).",
   "@flush": "Made flush now. Omaha requires exactly 2 hole + 3 board.",
   "@straight": "Made straight now only. Hold'em can use any 5-card combo; Omaha uses exactly 2 hole + 3 board.",
-  "@tpplus": "Pair or better made now (pair/two-pair/trips/straight/flush/full-house/quads/straight-flush).",
+  "@tpplus": "Top pair or better (top pair / overpair / two-pair+). Not middle or bottom pair.",
   "@overpair": "Hold'em only: pocket pair higher than top board rank."
 };
 
@@ -81,14 +81,10 @@ function atTagsInRange(rangeText) {
   return [...new Set(tags)];
 }
 
-function atTagAndClausesInRange(rangeText) {
-  const cleaned = String(rangeText || "").replace(/\s+/g, "").toLowerCase();
-  const raw = cleaned.match(/@[a-z0-9_]+(?::@[a-z0-9_]+)+/g) || [];
-  const uniq = [...new Set(raw)];
-  return uniq.filter((expr) => {
-    const tags = expr.match(/@[a-z0-9_]+/g) || [];
-    return tags.length >= 2 && tags.every((t) => TAG_HINTS[t]);
-  });
+function normalizedPureTag(rangeText) {
+  const s = String(rangeText || "").replace(/\s+/g, "").toLowerCase();
+  if (!/^@[a-z0-9_]+$/.test(s)) return "";
+  return s === "@sd13" ? "@sd12" : s;
 }
 
 function coverageText(cov) {
@@ -103,63 +99,60 @@ function coverageText(cov) {
   return `${cov.pct.toFixed(1)}%, ${cov.matched.toLocaleString()}/${cov.total.toLocaleString()} combos`;
 }
 
-function atTagLiveInfo(rangeText) {
-  const tags = atTagsInRange(rangeText).filter((t) => TAG_HINTS[t]);
-  const andClauses = atTagAndClausesInRange(rangeText);
-  if (!tags.length) return "";
+function rangeLiveInfo(rangeText) {
+  const expr = String(rangeText || "").trim();
+  if (!expr) return "";
+
+  const tags = atTagsInRange(expr).filter((t) => TAG_HINTS[t]);
   const boardText = el.board.value.trim();
   const boardCards = Math.floor(boardText.length / 2);
   const isHoldem = el.variant.value === "holdem";
+  const variant = el.variant.value;
   const parts = [];
 
+  try {
+    const covExpr = previewRangeCoverage(boardText, variant, expr);
+    const statExpr = coverageText(covExpr);
+    if (statExpr) parts.push(`Range: ${statExpr}`);
+  } catch {
+    parts.push("Range: invalid expression");
+    return parts.join(" | ");
+  }
+
+  if (!tags.length) return parts.join(" | ");
+  const pureTag = normalizedPureTag(expr);
+
   for (const tag of tags) {
-    if (tag === "@overpair") {
-      if (!isHoldem) {
-        parts.push("@overpair: Hold'em only.");
-      } else if (boardCards < 3) {
-        parts.push("@overpair: needs flop+.");
-      } else {
-        const combos = previewTagCoreCombos(boardText, "holdem", tag);
-        const cov = previewTagCoverage(boardText, "holdem", tag);
-        const stat = coverageText(cov);
-        parts.push(`@overpair: ${combos.length ? combos.join(",") : "-"} (${stat})`);
-      }
+    if (tag === "@overpair" && !isHoldem) {
+      parts.push("@overpair: Hold'em only.");
       continue;
     }
-
     if (boardCards < 3) {
       parts.push(`${tag}: needs flop+.`);
     } else {
       try {
-        const combos = previewTagCoreCombos(boardText, el.variant.value, tag);
-        const cov = previewTagCoverage(boardText, el.variant.value, tag);
+        const combos = previewTagCoreCombos(boardText, variant, tag);
+        const cov = previewTagCoverage(boardText, variant, tag);
         const stat = coverageText(cov);
         let extra = "";
         if (!isHoldem && tag === "@sd") {
-          const c4 = previewTagCoverage(boardText, el.variant.value, "@sd4");
+          const c4 = previewTagCoverage(boardText, variant, "@sd4");
           if (cov.pct > c4.pct + 0.2) {
             extra = " + blocker-only <4 out draws";
           }
         }
-        parts.push(`${tag}: ${combos.length ? combos.join(",") : "-"} (${stat})${extra}`);
+        const tagNorm = tag === "@sd13" ? "@sd12" : tag;
+        if (pureTag && pureTag === tagNorm) {
+          parts.push(`${tag}: ${combos.length ? combos.join(",") : "-"} (${stat})${extra}`);
+        } else if (isHoldem && combos.length > 0 && combos.length <= 8) {
+          parts.push(`${tag}: ${combos.join(",")} (${stat})${extra}`);
+        } else {
+          parts.push(`${tag}: ${stat}${extra}`);
+        }
       } catch {
         parts.push(`${tag}: invalid board input`);
       }
     }
-  }
-
-  if (boardCards >= 3) {
-    for (const expr of andClauses) {
-      try {
-        const cov = previewRangeCoverage(boardText, el.variant.value, expr);
-        const stat = coverageText(cov);
-        parts.push(`${expr}: ${stat}`);
-      } catch {
-        parts.push(`${expr}: invalid expression`);
-      }
-    }
-  } else if (andClauses.length) {
-    for (const expr of andClauses) parts.push(`${expr}: needs flop+.`);
   }
   return parts.join(" | ");
 }
@@ -321,7 +314,7 @@ function renderPlayers() {
     const refreshDerived = () => {
       const h = rangeTagHints(p.range, el.variant.value);
       hint.classList.toggle("is-empty", !h);
-      const live = atTagLiveInfo(p.range);
+      const live = rangeLiveInfo(p.range);
       info.textContent = live;
       info.style.display = live ? "" : "none";
     };

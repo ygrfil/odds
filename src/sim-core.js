@@ -527,21 +527,27 @@ export function previewRangeCoverage(boardText, variant, rangeText) {
   if (RANGE_COVERAGE_CACHE.has(cacheKey)) return RANGE_COVERAGE_CACHE.get(cacheKey);
 
   const board = parseCards(boardText || "");
-  if (board.length < 3 || board.length > 5) {
+  if (board.length > 5) {
     const out = { matched: 0, total: 0, pct: 0, approx: false };
     RANGE_COVERAGE_CACHE.set(cacheKey, out);
     return out;
   }
   const handSize = variantCardCount(variant);
+  const hasTagExpr = /@[a-z0-9_]+/i.test(String(rangeText || ""));
   const compiled = compileRange(rangeText || "*", variant, board);
   const helpers = { categoryMatch };
 
   if (variant !== "holdem") {
     const blocked = new Set(board);
     const deck = ALL_CARDS.filter((c) => !blocked.has(c));
-    const sampleN = handSize === 4 ? 5000 : handSize === 5 ? 4000 : 3000;
+    const sampleN = hasTagExpr
+      ? (handSize === 4 ? 5000 : handSize === 5 ? 4000 : 3000)
+      : (handSize === 4 ? 12000 : handSize === 5 ? 9000 : 7000);
     const population = nChooseK(deck.length, handSize);
-    if (population <= OMAHA_EXACT_COVERAGE_MAX) {
+    const exactLimit = hasTagExpr
+      ? OMAHA_EXACT_COVERAGE_MAX
+      : (handSize <= 4 ? 300000 : 90000);
+    if (population <= exactLimit) {
       const out = exactCoverage(deck, handSize, (hand) => compiled.predicate(hand, null, helpers));
       RANGE_COVERAGE_CACHE.set(cacheKey, out);
       return out;
