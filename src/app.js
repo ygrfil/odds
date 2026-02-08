@@ -39,7 +39,6 @@ const quickPicks = [
   { label: "2 Pair", token: "@2p" },
   { label: "Flush Draw", token: "@fd" },
   { label: "Straight Draw", token: "@sd" },
-  { label: "SD 4+ Outs", token: "@sd4" },
   { label: "SD 8+ Outs", token: "@sd8" },
   { label: "SD 12+ Outs", token: "@sd12" },
   { label: "Flush", token: "@flush" },
@@ -55,8 +54,8 @@ const TAG_HINTS = {
   "@set": "Set/Trips made now. Hold'em: trips from hole+board. Omaha: must be formed with exactly 2 hole + 3 board.",
   "@2p": "Exactly two pair made now.",
   "@fd": "Flush draw (4 to a flush, not yet made). Omaha requires 2 suited hole cards + 2 suited board cards.",
-  "@sd": "Straight draw (not made yet, but can become straight with one future board card). Uses street-correct rules.",
-  "@sd4": "Straight draw with 4 outs or more (includes gutshots and better).",
+  "@sd": "Straight draw with 1+ outs (includes rare <4 out cases). Uses street-correct rules.",
+  "@sd4": "Straight draw with 4+ outs.",
   "@sd8": "Straight draw with 8 outs or more.",
   "@sd12": "Straight draw with 12 outs or more.",
   "@sd13": "Legacy alias for @sd12 (12+ outs).",
@@ -110,7 +109,14 @@ function atTagLiveInfo(rangeText) {
         const combos = previewTagCoreCombos(boardText, el.variant.value, tag);
         const cov = previewTagCoverage(boardText, el.variant.value, tag);
         const covTxt = cov.total > 0 ? ` (${cov.approx ? "~" : ""}${cov.pct.toFixed(1)}%)` : "";
-        parts.push(`${tag}: ${combos.length ? combos.join(",") : "-"}${covTxt}`);
+        let extra = "";
+        if (!isHoldem && tag === "@sd") {
+          const c4 = previewTagCoverage(boardText, el.variant.value, "@sd4");
+          if (cov.pct > c4.pct + 0.2) {
+            extra = " + blocker-only <4 out draws";
+          }
+        }
+        parts.push(`${tag}: ${combos.length ? combos.join(",") : "-"}${covTxt}${extra}`);
       } catch {
         parts.push(`${tag}: invalid board input`);
       }

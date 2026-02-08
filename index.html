@@ -77,8 +77,6 @@
             <button id="helpClose" type="button">Close</button>
           </div>
           <div class="help-body">
-            <p>This app uses PPT-style generic syntax for Hold'em and Omaha ranges. Case is ignored. Ranks: <code>A K Q J T 9..2</code>, suits: <code>s h d c</code>.</p>
-
             <h3>1) Core Combinators</h3>
             <ul>
               <li><code>,</code> = union (OR): <code>JJ,AK</code></li>
@@ -119,7 +117,7 @@
               <li><code>@set</code> made trips/set now</li>
               <li><code>@2p</code> exactly two pair now</li>
               <li><code>@fd</code> flush draw (not made flush)</li>
-              <li><code>@sd</code> straight draw (not made straight, but can become straight with one next board card)</li>
+              <li><code>@sd</code> straight draw with 1+ outs (includes rare &lt;4 out cases)</li>
               <li><code>@sd4</code> straight draw with 4+ outs</li>
               <li><code>@sd8</code> straight draw with 8+ outs</li>
               <li><code>@sd12</code> straight draw with 12+ outs</li>

@@ -17,6 +17,15 @@ const RANK_CHARS = "??23456789TJQKA";
 const OMAHA_SD_PREVIEW_CACHE = new Map();
 const TAG_COVERAGE_CACHE = new Map();
 
+function hash32(str) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h >>> 0;
+}
+
 function variantCardCount(variant) {
   if (variant === "holdem") return 2;
   if (variant === "plo4") return 4;
@@ -29,6 +38,57 @@ function isStraightClassId(cls) {
   return cls === 4 || cls === 8;
 }
 
+function isFiveRanksStraight(r1, r2, r3, r4, r5) {
+  const mask = new Uint8Array(15);
+  mask[r1] = 1; mask[r2] = 1; mask[r3] = 1; mask[r4] = 1; mask[r5] = 1;
+  let uniq = 0;
+  for (let r = 2; r <= 14; r++) if (mask[r]) uniq++;
+  if (uniq !== 5) return false;
+  for (let hi = 14; hi >= 6; hi--) {
+    if (mask[hi] && mask[hi - 1] && mask[hi - 2] && mask[hi - 3] && mask[hi - 4]) return true;
+  }
+  return !!(mask[14] && mask[5] && mask[4] && mask[3] && mask[2]);
+}
+
+function hasHoldemStraightByRanks(hand, board) {
+  const present = new Uint8Array(15);
+  for (let i = 0; i < hand.length; i++) present[rankOf(hand[i])] = 1;
+  for (let i = 0; i < board.length; i++) present[rankOf(board[i])] = 1;
+  for (let hi = 14; hi >= 6; hi--) {
+    if (present[hi] && present[hi - 1] && present[hi - 2] && present[hi - 3] && present[hi - 4]) return true;
+  }
+  return !!(present[14] && present[5] && present[4] && present[3] && present[2]);
+}
+
+function hasOmahaCoreStraight(core, board) {
+  if (board.length < 3) return false;
+  const hr1 = rankOf(core[0]);
+  const hr2 = rankOf(core[1]);
+  const n = board.length;
+  for (let i = 0; i < n - 2; i++) {
+    const r1 = rankOf(board[i]);
+    for (let j = i + 1; j < n - 1; j++) {
+      const r2 = rankOf(board[j]);
+      for (let k = j + 1; k < n; k++) {
+        const r3 = rankOf(board[k]);
+        if (isFiveRanksStraight(hr1, hr2, r1, r2, r3)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function hasOmahaStraight(hand, board) {
+  if (board.length < 3) return false;
+  const hn = hand.length;
+  for (let a = 0; a < hn - 1; a++) {
+    for (let b = a + 1; b < hn; b++) {
+      if (hasOmahaCoreStraight([hand[a], hand[b]], board)) return true;
+    }
+  }
+  return false;
+}
+
 function straightOutCountNextCard(hand, board, isHoldem) {
   if (board.length >= 5) return 0;
   const used = new Uint8Array(52);
@@ -38,18 +98,18 @@ function straightOutCountNextCard(hand, board, isHoldem) {
   for (let c = 0; c < 52; c++) {
     if (used[c]) continue;
     const nextBoard = board.concat(c);
-    const nextScore = isHoldem ? bestHoldemScoreStreet(hand, nextBoard) : bestOmahaScoreStreet(hand, nextBoard);
-    const nextCls = classIdFromScore(nextScore);
-    if (isStraightClassId(nextCls)) outs++;
+    const isStraight = isHoldem ? hasHoldemStraightByRanks(hand, nextBoard) : hasOmahaStraight(hand, nextBoard);
+    if (isStraight) outs++;
   }
   return outs;
 }
 
 function minOutsForSdTag(tag) {
+  if (tag === "@sd") return 1;
   if (tag === "@sd12" || tag === "@sd13") return 12;
   if (tag === "@sd8") return 8;
   if (tag === "@sd4") return 4;
-  return 1;
+  return 4;
 }
 
 function coreRankLabel(c1, c2) {
@@ -80,9 +140,8 @@ function straightOutCountForCoreNextCard(core, board, isHoldem) {
   for (let c = 0; c < 52; c++) {
     if (used[c]) continue;
     const nextBoard = board.concat(c);
-    const sc = isHoldem ? bestHoldemScoreStreet(core, nextBoard) : bestOmahaCore2ScoreStreet(core, nextBoard);
-    const cls = classIdFromScore(sc);
-    if (isStraightClassId(cls)) outs++;
+    const isStraight = isHoldem ? hasHoldemStraightByRanks(core, nextBoard) : hasOmahaCoreStraight(core, nextBoard);
+    if (isStraight) outs++;
   }
   return outs;
 }
@@ -122,7 +181,8 @@ function coreCategoryMatch(tag, core, board, variant) {
   if (tag === "@straight") return isStraightClassId(cls);
 
   if (tag === "@sd" || tag === "@sd4" || tag === "@sd8" || tag === "@sd12" || tag === "@sd13") {
-    if (board.length >= 5 || isStraightClassId(cls)) return false;
+    const hasStraightNow = isHoldem ? hasHoldemStraightByRanks(core, board) : hasOmahaCoreStraight(core, board);
+    if (board.length >= 5 || hasStraightNow) return false;
     const outs = straightOutCountForCoreNextCard(core, board, isHoldem);
     return outs >= minOutsForSdTag(tag);
   }
@@ -167,9 +227,7 @@ function straightOutCountOmahaHandNextCard(hand, board) {
   let outs = 0;
   for (let c = 0; c < 52; c++) {
     if (used[c]) continue;
-    const sc = bestOmahaScoreStreet(hand, board.concat(c));
-    const cls = classIdFromScore(sc);
-    if (isStraightClassId(cls)) outs++;
+    if (hasOmahaStraight(hand, board.concat(c))) outs++;
   }
   return outs;
 }
@@ -229,8 +287,7 @@ function previewOmahaSdStructures(boardText, variant, tag) {
 
           const hand = buildCardsFromRanksForBoard(ranks, boardMask);
           if (!hand) continue;
-          const cls = classIdFromScore(bestOmahaScoreStreet(hand, board));
-          if (isStraightClassId(cls)) continue;
+          if (hasOmahaStraight(hand, board)) continue;
           const outs = straightOutCountOmahaHandNextCard(hand, board);
           if (outs < threshold) continue;
 
@@ -366,7 +423,8 @@ export function previewTagCoverage(boardText, variant, tag) {
     const deck = ALL_CARDS.filter((c) => !blocked.has(c));
     const handSize = variantCardCount(variant);
     const sampleN = handSize === 4 ? 5000 : handSize === 5 ? 4000 : 3000;
-    const rng = makeRng(0x9e3779b9 ^ (k.length * 2654435761));
+    const sampleSeed = hash32(`${variant}|${board.join(",")}|${handSize}`) || 1;
+    const rng = makeRng(sampleSeed);
     const scratch = [];
     let matched = 0;
     for (let i = 0; i < sampleN; i++) {
@@ -434,7 +492,8 @@ function categoryMatch(tag, hand, board) {
   if (tag === "@set") return cls === 3;
   if (tag === "@straight") return isStraightClassId(cls);
   if (tag === "@sd" || tag === "@sd4" || tag === "@sd8" || tag === "@sd12" || tag === "@sd13") {
-    if (board.length >= 5 || isStraightClassId(cls)) return false;
+    const hasStraightNow = isHoldem ? hasHoldemStraightByRanks(hand, board) : hasOmahaStraight(hand, board);
+    if (board.length >= 5 || hasStraightNow) return false;
     const outs = straightOutCountNextCard(hand, board, isHoldem);
     return outs >= minOutsForSdTag(tag);
   }
