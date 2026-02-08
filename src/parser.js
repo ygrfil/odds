@@ -28,7 +28,7 @@ const MACRO_REPLACEMENTS = {
 
 const RANK_VARS = new Set(["R", "O", "N"]);
 const SUIT_VARS = new Set(["x", "y", "z", "w"]);
-const CATEGORY_TAGS = new Set(["@set", "@2p", "@fd", "@flush", "@straight", "@tpplus", "@overpair"]);
+const CATEGORY_TAGS = new Set(["@set", "@2p", "@fd", "@sd", "@sd4", "@sd8", "@sd12", "@sd13", "@flush", "@straight", "@tpplus", "@overpair"]);
 
 const percentileCache = new Map();
 

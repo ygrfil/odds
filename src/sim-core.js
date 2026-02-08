@@ -1,17 +1,21 @@
 import {
   bestHoldemScore,
   bestOmahaScore,
+  bestOmahaCore2ScoreStreet,
   bestHoldemScoreStreet,
   bestOmahaScoreStreet,
   classIdFromScore,
   classifyBoard,
   CLASS_NAMES
 } from "./eval.js";
-import { RANKS, SUITS, cardFromRankSuit, fullDeck, parseCards, rankOf } from "./cards.js";
+import { RANKS, SUITS, cardFromRankSuit, fullDeck, parseCards, rankOf, suitOf } from "./cards.js";
 import { compileRange } from "./parser.js";
 import { makeRng } from "./rng.js";
 
 const ALL_CARDS = fullDeck();
+const RANK_CHARS = "??23456789TJQKA";
+const OMAHA_SD_PREVIEW_CACHE = new Map();
+const TAG_COVERAGE_CACHE = new Map();
 
 function variantCardCount(variant) {
   if (variant === "holdem") return 2;
@@ -19,6 +23,383 @@ function variantCardCount(variant) {
   if (variant === "plo5") return 5;
   if (variant === "plo6") return 6;
   throw new Error(`Unsupported variant: ${variant}`);
+}
+
+function isStraightClassId(cls) {
+  return cls === 4 || cls === 8;
+}
+
+function straightOutCountNextCard(hand, board, isHoldem) {
+  if (board.length >= 5) return 0;
+  const used = new Uint8Array(52);
+  for (let i = 0; i < hand.length; i++) used[hand[i]] = 1;
+  for (let i = 0; i < board.length; i++) used[board[i]] = 1;
+  let outs = 0;
+  for (let c = 0; c < 52; c++) {
+    if (used[c]) continue;
+    const nextBoard = board.concat(c);
+    const nextScore = isHoldem ? bestHoldemScoreStreet(hand, nextBoard) : bestOmahaScoreStreet(hand, nextBoard);
+    const nextCls = classIdFromScore(nextScore);
+    if (isStraightClassId(nextCls)) outs++;
+  }
+  return outs;
+}
+
+function minOutsForSdTag(tag) {
+  if (tag === "@sd12" || tag === "@sd13") return 12;
+  if (tag === "@sd8") return 8;
+  if (tag === "@sd4") return 4;
+  return 1;
+}
+
+function coreRankLabel(c1, c2) {
+  const r1 = rankOf(c1);
+  const r2 = rankOf(c2);
+  const high = Math.max(r1, r2);
+  const low = Math.min(r1, r2);
+  const hasFaceNumMix = high >= 11 && low <= 10;
+  const a = hasFaceNumMix ? RANK_CHARS[low] : RANK_CHARS[high];
+  const b = hasFaceNumMix ? RANK_CHARS[high] : RANK_CHARS[low];
+  return `${a}${b}`;
+}
+
+function coreSuitLabel(c1, c2) {
+  const s1 = SUITS[suitOf(c1)];
+  const s2 = SUITS[suitOf(c2)];
+  if (s1 === s2) return `${s1}${s2}`;
+  return `${s1}${s2}`;
+}
+
+function straightOutCountForCoreNextCard(core, board, isHoldem) {
+  if (board.length >= 5) return 0;
+  const used = new Uint8Array(52);
+  used[core[0]] = 1;
+  used[core[1]] = 1;
+  for (let i = 0; i < board.length; i++) used[board[i]] = 1;
+  let outs = 0;
+  for (let c = 0; c < 52; c++) {
+    if (used[c]) continue;
+    const nextBoard = board.concat(c);
+    const sc = isHoldem ? bestHoldemScoreStreet(core, nextBoard) : bestOmahaCore2ScoreStreet(core, nextBoard);
+    const cls = classIdFromScore(sc);
+    if (isStraightClassId(cls)) outs++;
+  }
+  return outs;
+}
+
+function coreCategoryMatch(tag, core, board, variant) {
+  if (board.length < 3) return false;
+  const isHoldem = variant === "holdem";
+  if (tag === "@overpair" && !isHoldem) return false;
+
+  const boardSuitCnt = [0, 0, 0, 0];
+  const coreSuitCnt = [0, 0, 0, 0];
+  for (const c of board) boardSuitCnt[suitOf(c)]++;
+  coreSuitCnt[suitOf(core[0])]++;
+  coreSuitCnt[suitOf(core[1])]++;
+
+  let madeFlush = false;
+  let flushDraw = false;
+  for (let s = 0; s < 4; s++) {
+    if (isHoldem) {
+      const total = boardSuitCnt[s] + coreSuitCnt[s];
+      if (total >= 5) madeFlush = true;
+      if (!madeFlush && board.length < 5 && total === 4) flushDraw = true;
+    } else {
+      if (coreSuitCnt[s] >= 2 && boardSuitCnt[s] >= 3) madeFlush = true;
+      if (!madeFlush && board.length < 5 && coreSuitCnt[s] >= 2 && boardSuitCnt[s] === 2) flushDraw = true;
+    }
+  }
+
+  if (tag === "@fd") return flushDraw;
+  if (tag === "@flush") return madeFlush;
+
+  const score = isHoldem ? bestHoldemScoreStreet(core, board) : bestOmahaCore2ScoreStreet(core, board);
+  const cls = classIdFromScore(score);
+
+  if (tag === "@2p") return cls === 2;
+  if (tag === "@set") return cls === 3;
+  if (tag === "@straight") return isStraightClassId(cls);
+
+  if (tag === "@sd" || tag === "@sd4" || tag === "@sd8" || tag === "@sd12" || tag === "@sd13") {
+    if (board.length >= 5 || isStraightClassId(cls)) return false;
+    const outs = straightOutCountForCoreNextCard(core, board, isHoldem);
+    return outs >= minOutsForSdTag(tag);
+  }
+
+  const ranks = [rankOf(core[0]), rankOf(core[1]), ...board.map(rankOf)];
+  const cnt = new Uint8Array(15);
+  for (const r of ranks) cnt[r]++;
+  let top = 0;
+  for (let r = 2; r <= 14; r++) if (cnt[r] > top) top = cnt[r];
+
+  if (tag === "@tpplus") return cls >= 1 || top >= 2 || madeFlush;
+  if (tag === "@overpair") {
+    const pocket = rankOf(core[0]) === rankOf(core[1]);
+    if (!pocket) return false;
+    const topBoard = Math.max(...board.map(rankOf));
+    return rankOf(core[0]) > topBoard;
+  }
+
+  return false;
+}
+
+function formatRankComboUser(ranks) {
+  const uniq = [...new Set(ranks)].sort((a, b) => a - b);
+  const nums = uniq.filter((r) => r <= 10);
+  const faces = uniq.filter((r) => r >= 11);
+  if (faces.length === 1 && nums.length === 2 && uniq.length === 3) {
+    const p = nums.slice().sort((a, b) => b - a).map((r) => RANK_CHARS[r]).join("");
+    return `${p}${RANK_CHARS[faces[0]]}`;
+  }
+  if (faces.length === 1 && nums.length === 3 && uniq.length === 4) {
+    const p = nums.slice().sort((a, b) => a - b).map((r) => RANK_CHARS[r]).join("");
+    return `${p}${RANK_CHARS[faces[0]]}`;
+  }
+  return uniq.map((r) => RANK_CHARS[r]).join("");
+}
+
+function straightOutCountOmahaHandNextCard(hand, board) {
+  if (board.length >= 5) return 0;
+  const used = new Uint8Array(52);
+  for (let i = 0; i < hand.length; i++) used[hand[i]] = 1;
+  for (let i = 0; i < board.length; i++) used[board[i]] = 1;
+  let outs = 0;
+  for (let c = 0; c < 52; c++) {
+    if (used[c]) continue;
+    const sc = bestOmahaScoreStreet(hand, board.concat(c));
+    const cls = classIdFromScore(sc);
+    if (isStraightClassId(cls)) outs++;
+  }
+  return outs;
+}
+
+function buildCardsFromRanksForBoard(ranks, boardMask) {
+  const hand = [];
+  const used = new Uint8Array(52);
+  for (let i = 0; i < ranks.length; i++) {
+    const r = ranks[i];
+    let picked = -1;
+    for (let s = 0; s < 4; s++) {
+      const c = (r - 2) * 4 + s;
+      if (boardMask[c] || used[c]) continue;
+      picked = c;
+      break;
+    }
+    if (picked === -1) return null;
+    used[picked] = 1;
+    hand.push(picked);
+  }
+  return hand;
+}
+
+function previewOmahaSdStructures(boardText, variant, tag) {
+  const cacheKey = `${variant}|${tag}|${boardText}`;
+  if (OMAHA_SD_PREVIEW_CACHE.has(cacheKey)) return OMAHA_SD_PREVIEW_CACHE.get(cacheKey).slice();
+
+  const board = parseCards(boardText || "");
+  if (board.length < 3 || board.length > 4) return [];
+  const threshold = minOutsForSdTag(tag);
+  const boardMask = new Uint8Array(52);
+  const boardRankCnt = new Uint8Array(15);
+  for (let i = 0; i < board.length; i++) {
+    const c = board[i];
+    boardMask[c] = 1;
+    boardRankCnt[rankOf(c)]++;
+  }
+
+  const raw4 = [];
+  const trioToKickers = new Map();
+
+  for (let a = 14; a >= 2; a--) {
+    for (let b = a; b >= 2; b--) {
+      for (let c = b; c >= 2; c--) {
+        for (let d = c; d >= 2; d--) {
+          const ranks = [a, b, c, d];
+          const cnt = new Uint8Array(15);
+          cnt[a]++; cnt[b]++; cnt[c]++; cnt[d]++;
+          let feasible = true;
+          for (let r = 2; r <= 14; r++) {
+            if (cnt[r] > 0 && cnt[r] + boardRankCnt[r] > 4) {
+              feasible = false;
+              break;
+            }
+          }
+          if (!feasible) continue;
+
+          const hand = buildCardsFromRanksForBoard(ranks, boardMask);
+          if (!hand) continue;
+          const cls = classIdFromScore(bestOmahaScoreStreet(hand, board));
+          if (isStraightClassId(cls)) continue;
+          const outs = straightOutCountOmahaHandNextCard(hand, board);
+          if (outs < threshold) continue;
+
+          const uniq4 = [...new Set(ranks)].sort((x, y) => x - y);
+          raw4.push({ ranks: uniq4, label: formatRankComboUser(ranks) });
+
+          if (uniq4.length === 4) {
+            for (let i = 0; i < 4; i++) {
+              const trio = uniq4.filter((_, idx) => idx !== i);
+              const kicker = uniq4[i];
+              const key = trio.join("-");
+              if (!trioToKickers.has(key)) trioToKickers.set(key, new Set());
+              trioToKickers.get(key).add(kicker);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const compressTrios = new Set();
+  for (const [k, kickers] of trioToKickers.entries()) {
+    const trioLen = k.split("-").length;
+    const neededDistinctKickers = Math.max(1, 13 - trioLen);
+    if (kickers.size >= neededDistinctKickers) compressTrios.add(k);
+  }
+  let out3 = [...compressTrios]
+    .map((k) => formatRankComboUser(k.split("-").map(Number)))
+    .sort();
+
+  const out4set = new Set();
+  for (let i = 0; i < raw4.length; i++) {
+    const item = raw4[i];
+    let coveredByWildcardTrio = false;
+    if (item.ranks.length === 4) {
+      for (let j = 0; j < 4; j++) {
+        const trio = item.ranks.filter((_, idx) => idx !== j).join("-");
+        if (compressTrios.has(trio)) {
+          coveredByWildcardTrio = true;
+          break;
+        }
+      }
+    }
+    if (!coveredByWildcardTrio) out4set.add(item.label);
+  }
+  let out4 = [...out4set].sort();
+  const handSize = variantCardCount(variant);
+  if (handSize > 4) {
+    const x3 = "x".repeat(Math.max(0, handSize - 3));
+    const x4 = "x".repeat(Math.max(0, handSize - 4));
+    out3 = out3.map((s) => `${s}${x3}`);
+    out4 = out4.map((s) => `${s}${x4}`);
+  }
+
+  const combined = [...new Set(out4.concat(out3))];
+
+  // If a 2-rank structure exists (e.g. "68"), remove any longer structure
+  // that is fully covered by that wildcard family (e.g. "689", "689J", ...).
+  const rankSet = (label) => {
+    const base = String(label).replace(/x+$/g, "");
+    const set = new Set();
+    for (let i = 0; i < base.length; i++) {
+      const ch = base[i];
+      if ("23456789TJQKA".includes(ch)) set.add(ch);
+    }
+    return set;
+  };
+  const covers = (small, big) => {
+    if (small.size >= big.size) return false;
+    for (const ch of small) {
+      if (!big.has(ch)) return false;
+    }
+    return true;
+  };
+  const twoRankSets = combined
+    .map((label) => ({ label, set: rankSet(label) }))
+    .filter((x) => x.set.size === 2)
+    .map((x) => x.set);
+
+  const pruned = combined.filter((label) => {
+    const s = rankSet(label);
+    if (s.size <= 2) return true;
+    for (let i = 0; i < twoRankSets.length; i++) {
+      if (covers(twoRankSets[i], s)) return false;
+    }
+    return true;
+  });
+
+  const out = pruned.slice(0, 280);
+  OMAHA_SD_PREVIEW_CACHE.set(cacheKey, out.slice());
+  return out;
+}
+
+export function previewTagCoreCombos(boardText, variant, tag) {
+  const board = parseCards(boardText || "");
+  if (board.length < 3 || board.length > 5) return [];
+  const knownTags = new Set(["@set", "@2p", "@fd", "@sd", "@sd4", "@sd8", "@sd12", "@sd13", "@flush", "@straight", "@tpplus", "@overpair"]);
+  if (!knownTags.has(tag)) return [];
+  if (variant !== "holdem" && (tag === "@sd" || tag === "@sd4" || tag === "@sd8" || tag === "@sd12" || tag === "@sd13")) {
+    return previewOmahaSdStructures(boardText, variant, tag);
+  }
+
+  const blocked = new Uint8Array(52);
+  for (const c of board) blocked[c] = 1;
+  const labels = new Set();
+
+  for (let c1 = 0; c1 < 52; c1++) {
+    if (blocked[c1]) continue;
+    for (let c2 = c1 + 1; c2 < 52; c2++) {
+      if (blocked[c2]) continue;
+      const core = [c1, c2];
+      if (!coreCategoryMatch(tag, core, board, variant)) continue;
+      if (tag === "@fd" || tag === "@flush") labels.add(coreSuitLabel(c1, c2));
+      else labels.add(coreRankLabel(c1, c2));
+    }
+  }
+
+  return [...labels];
+}
+
+export function previewTagCoverage(boardText, variant, tag) {
+  const k = `${variant}|${tag}|${boardText}`;
+  if (TAG_COVERAGE_CACHE.has(k)) return TAG_COVERAGE_CACHE.get(k);
+  const board = parseCards(boardText || "");
+  if (board.length < 3 || board.length > 5) {
+    const z = { matched: 0, total: 0, pct: 0, approx: false };
+    TAG_COVERAGE_CACHE.set(k, z);
+    return z;
+  }
+
+  if (variant !== "holdem") {
+    const blocked = new Set(board);
+    const deck = ALL_CARDS.filter((c) => !blocked.has(c));
+    const handSize = variantCardCount(variant);
+    const sampleN = handSize === 4 ? 5000 : handSize === 5 ? 4000 : 3000;
+    const rng = makeRng(0x9e3779b9 ^ (k.length * 2654435761));
+    const scratch = [];
+    let matched = 0;
+    for (let i = 0; i < sampleN; i++) {
+      if (!pickDistinct(deck, handSize, rng, scratch)) break;
+      if (categoryMatch(tag, scratch, board)) matched++;
+    }
+    const out = { matched, total: sampleN, pct: sampleN > 0 ? (matched * 100) / sampleN : 0, approx: true };
+    TAG_COVERAGE_CACHE.set(k, out);
+    return out;
+  }
+
+  const blocked = new Uint8Array(52);
+  for (const c of board) blocked[c] = 1;
+  let matched = 0;
+  let total = 0;
+  for (let c1 = 0; c1 < 52; c1++) {
+    if (blocked[c1]) continue;
+    for (let c2 = c1 + 1; c2 < 52; c2++) {
+      if (blocked[c2]) continue;
+      total++;
+      if (coreCategoryMatch(tag, [c1, c2], board, variant)) matched++;
+    }
+  }
+  const out = { matched, total, pct: total > 0 ? (matched * 100) / total : 0, approx: false };
+  TAG_COVERAGE_CACHE.set(k, out);
+  return out;
+}
+
+export function previewHoldemStraightDrawRankCombos(boardText, minOuts = 1) {
+  if (minOuts <= 1) return previewTagCoreCombos(boardText, "holdem", "@sd");
+  if (minOuts <= 4) return previewTagCoreCombos(boardText, "holdem", "@sd4");
+  if (minOuts <= 8) return previewTagCoreCombos(boardText, "holdem", "@sd8");
+  return previewTagCoreCombos(boardText, "holdem", "@sd12");
 }
 
 function categoryMatch(tag, hand, board) {
@@ -51,24 +432,20 @@ function categoryMatch(tag, hand, board) {
 
   if (tag === "@2p") return cls === 2;
   if (tag === "@set") return cls === 3;
+  if (tag === "@straight") return isStraightClassId(cls);
+  if (tag === "@sd" || tag === "@sd4" || tag === "@sd8" || tag === "@sd12" || tag === "@sd13") {
+    if (board.length >= 5 || isStraightClassId(cls)) return false;
+    const outs = straightOutCountNextCard(hand, board, isHoldem);
+    return outs >= minOutsForSdTag(tag);
+  }
 
   const ranks = hand.concat(board).map(rankOf);
-  const uniq = [...new Set(ranks)].sort((a, b) => a - b);
-  let hasStraight = false;
-  for (let i = 0; i <= uniq.length - 5; i++) {
-    if (uniq[i + 4] - uniq[i] === 4) {
-      hasStraight = true;
-      break;
-    }
-  }
-  if (!hasStraight && [14, 2, 3, 4, 5].every((r) => uniq.includes(r))) hasStraight = true;
-  if (tag === "@straight") return cls === 4 || cls === 8 || hasStraight;
-
   const cnt = new Uint8Array(15);
   for (const r of ranks) cnt[r]++;
   let top = 0;
   for (let r = 2; r <= 14; r++) if (cnt[r] > top) top = cnt[r];
-  if (tag === "@tpplus") return cls >= 1 || top >= 2 || hasStraight || madeFlush;
+
+  if (tag === "@tpplus") return cls >= 1 || top >= 2 || madeFlush;
 
   if (tag === "@overpair") {
     if (!isHoldem || board.length < 3) return false;

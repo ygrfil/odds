@@ -172,6 +172,21 @@ export function bestOmahaScoreStreet(hole, boardCards) {
   return best;
 }
 
+export function bestOmahaCore2ScoreStreet(core2, boardCards) {
+  if (!Array.isArray(core2) || core2.length !== 2) throw new Error("Omaha core evaluation requires exactly 2 hole cards.");
+  const bCombos = BOARD_STREET_COMBOS[boardCards.length];
+  if (!bCombos) throw new Error("Omaha street evaluation requires board with 3-5 cards.");
+  let best = 0;
+  const h1 = core2[0];
+  const h2 = core2[1];
+  for (let j = 0; j < bCombos.length; j++) {
+    const bc = bCombos[j];
+    const sc = evaluate5Score(h1, h2, boardCards[bc[0]], boardCards[bc[1]], boardCards[bc[2]]);
+    if (sc > best) best = sc;
+  }
+  return best;
+}
+
 export function classNameFromScore(score) {
   return CLASS_NAMES[Math.floor(score / 1_000_000)] || "High Card";
 }

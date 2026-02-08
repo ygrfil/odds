@@ -1,4 +1,5 @@
 import { runSimulation } from "./engine.js";
+import { previewTagCoreCombos, previewTagCoverage } from "./sim-core.js";
 
 const state = {
   players: [
@@ -37,6 +38,10 @@ const quickPicks = [
   { label: "Set", token: "@set" },
   { label: "2 Pair", token: "@2p" },
   { label: "Flush Draw", token: "@fd" },
+  { label: "Straight Draw", token: "@sd" },
+  { label: "SD 4+ Outs", token: "@sd4" },
+  { label: "SD 8+ Outs", token: "@sd8" },
+  { label: "SD 12+ Outs", token: "@sd12" },
   { label: "Flush", token: "@flush" },
   { label: "Straight", token: "@straight" },
   { label: "Top Pair+", token: "@tpplus" },
@@ -45,6 +50,74 @@ const quickPicks = [
   { label: "Single Suited", token: "$ss" },
   { label: "No Pair", token: "$np" }
 ];
+
+const TAG_HINTS = {
+  "@set": "Set/Trips made now. Hold'em: trips from hole+board. Omaha: must be formed with exactly 2 hole + 3 board.",
+  "@2p": "Exactly two pair made now.",
+  "@fd": "Flush draw (4 to a flush, not yet made). Omaha requires 2 suited hole cards + 2 suited board cards.",
+  "@sd": "Straight draw (not made yet, but can become straight with one future board card). Uses street-correct rules.",
+  "@sd4": "Straight draw with 4 outs or more (includes gutshots and better).",
+  "@sd8": "Straight draw with 8 outs or more.",
+  "@sd12": "Straight draw with 12 outs or more.",
+  "@sd13": "Legacy alias for @sd12 (12+ outs).",
+  "@flush": "Made flush now. Omaha requires exactly 2 hole + 3 board.",
+  "@straight": "Made straight now only. Hold'em can use any 5-card combo; Omaha uses exactly 2 hole + 3 board.",
+  "@tpplus": "Pair or better made now (pair/two-pair/trips/straight/flush/full-house/quads/straight-flush).",
+  "@overpair": "Hold'em only: pocket pair higher than top board rank."
+};
+
+function rangeTagHints(rangeText, variant) {
+  const tags = String(rangeText || "").toLowerCase().match(/@[a-z0-9_]+/g) || [];
+  const uniq = [...new Set(tags)].filter((t) => TAG_HINTS[t]);
+  if (!uniq.length) return "";
+  const gameRule = variant === "holdem"
+    ? "Game rule: Hold'em hand evaluation can use any 5-card combination."
+    : "Game rule: Omaha hand evaluation always uses exactly 2 hole cards + 3 board cards.";
+  const lines = uniq.map((t) => `${t}: ${TAG_HINTS[t]}`);
+  return `${lines.join("\n")}\n${gameRule}`;
+}
+
+function atTagsInRange(rangeText) {
+  const tags = String(rangeText || "").toLowerCase().match(/@[a-z0-9_]+/g) || [];
+  return [...new Set(tags)];
+}
+
+function atTagLiveInfo(rangeText) {
+  const tags = atTagsInRange(rangeText).filter((t) => TAG_HINTS[t]);
+  if (!tags.length) return "";
+  const boardText = el.board.value.trim();
+  const boardCards = Math.floor(boardText.length / 2);
+  const isHoldem = el.variant.value === "holdem";
+  const parts = [];
+
+  for (const tag of tags) {
+    if (tag === "@overpair") {
+      if (!isHoldem) {
+        parts.push("@overpair: Hold'em only.");
+      } else if (boardCards < 3) {
+        parts.push("@overpair: needs flop+.");
+      } else {
+        const combos = previewTagCoreCombos(boardText, "holdem", tag);
+        parts.push(`@overpair: ${combos.length ? combos.join(",") : "-"}`);
+      }
+      continue;
+    }
+
+    if (boardCards < 3) {
+      parts.push(`${tag}: needs flop+.`);
+    } else {
+      try {
+        const combos = previewTagCoreCombos(boardText, el.variant.value, tag);
+        const cov = previewTagCoverage(boardText, el.variant.value, tag);
+        const covTxt = cov.total > 0 ? ` (${cov.approx ? "~" : ""}${cov.pct.toFixed(1)}%)` : "";
+        parts.push(`${tag}: ${combos.length ? combos.join(",") : "-"}${covTxt}`);
+      } catch {
+        parts.push(`${tag}: invalid board input`);
+      }
+    }
+  }
+  return parts.join(" | ");
+}
 
 function saveLocal() {
   localStorage.setItem("poker-odds-lab-state", JSON.stringify({
@@ -162,14 +235,47 @@ function renderPlayers() {
     range.addEventListener("focus", () => {
       state.focusedPlayer = i;
     });
-    range.addEventListener("input", () => {
-      p.range = range.value;
-      saveLocal();
-    });
 
     main.appendChild(tag);
     main.appendChild(range);
+    const hint = document.createElement("button");
+    hint.type = "button";
+    hint.className = "tag-hint";
+    hint.textContent = "?";
+    hint.setAttribute("aria-expanded", "false");
+    hint.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const existing = row.querySelector(".tag-hint-popover");
+      document.querySelectorAll(".tag-hint-popover").forEach((n) => n.remove());
+      document.querySelectorAll(".tag-hint[aria-expanded='true']").forEach((n) => n.setAttribute("aria-expanded", "false"));
+      if (existing) return;
+      const help = rangeTagHints(p.range, el.variant.value);
+
+      const pop = document.createElement("div");
+      pop.className = "tag-hint-popover";
+      pop.textContent = help || "No @tag used in this range.";
+      pop.addEventListener("click", (e) => e.stopPropagation());
+      row.appendChild(pop);
+      hint.setAttribute("aria-expanded", "true");
+    });
+    main.appendChild(hint);
     row.appendChild(main);
+    const info = document.createElement("div");
+    info.className = "player-live-note";
+    row.appendChild(info);
+    const refreshDerived = () => {
+      const h = rangeTagHints(p.range, el.variant.value);
+      hint.classList.toggle("is-empty", !h);
+      const live = atTagLiveInfo(p.range);
+      info.textContent = live;
+      info.style.display = live ? "" : "none";
+    };
+    range.addEventListener("input", () => {
+      p.range = range.value;
+      saveLocal();
+      refreshDerived();
+    });
+    refreshDerived();
     row.appendChild(playerOutputRow(results[i]));
     el.players.appendChild(row);
   });
@@ -272,6 +378,11 @@ function importSetup(file) {
 }
 
 function wire() {
+  document.addEventListener("click", () => {
+    document.querySelectorAll(".tag-hint-popover").forEach((n) => n.remove());
+    document.querySelectorAll(".tag-hint[aria-expanded='true']").forEach((n) => n.setAttribute("aria-expanded", "false"));
+  });
+
   el.addPlayer.addEventListener("click", () => {
     if (state.isRunning) return;
     if (state.players.length >= 6) {
@@ -316,6 +427,11 @@ function wire() {
   [el.variant, el.iterationCap, el.board, el.dead].forEach((node) => {
     node.addEventListener("input", saveLocal);
   });
+  el.variant.addEventListener("change", () => {
+    saveLocal();
+    renderPlayers();
+  });
+  el.board.addEventListener("input", renderPlayers);
 }
 
 loadLocal();

@@ -77,10 +77,79 @@
             <button id="helpClose" type="button">Close</button>
           </div>
           <div class="help-body">
-            <p>Core combinators: <code>,</code> union, <code>:</code> intersection, <code>!</code> exclusion, and parentheses for grouping.</p>
-            <p>Quick examples: <code>AA,AK$s</code>, <code>15%</code>, <code>30%-50%</code>, <code>AA:xxyy,JJ!JJJ,KK</code>.</p>
-            <p>Useful macros: <code>$s</code>, <code>$o</code>, <code>$ds</code>, <code>$ss</code>, <code>$np</code>, <code>$nt</code>, <code>$B</code>, <code>$M</code>, <code>$Z</code>, <code>$L</code>, <code>$N</code>, <code>$F</code>, <code>$R</code>, <code>$W</code>, <code>$0g</code>, <code>$1g</code>, <code>$2g</code>.</p>
-            <p>Board input supports exact cards only, e.g. <code>AsKdJh</code>, <code>2s3s8sTd</code>.</p>
+            <p>This app uses PPT-style generic syntax for Hold'em and Omaha ranges. Case is ignored. Ranks: <code>A K Q J T 9..2</code>, suits: <code>s h d c</code>.</p>
+
+            <h3>1) Core Combinators</h3>
+            <ul>
+              <li><code>,</code> = union (OR): <code>JJ,AK</code></li>
+              <li><code>:</code> = intersection (AND): <code>AK:xx</code></li>
+              <li><code>!</code> = exclusion (NOT): <code>AA!AAA</code></li>
+              <li>Parentheses group expressions: <code>(AA,AK):xxyy</code></li>
+            </ul>
+
+            <h3>2) Basic Examples</h3>
+            <ul>
+              <li>Hold'em: <code>AA</code>, <code>AK$s</code>, <code>AT$o</code>, <code>15%</code>, <code>30%-50%</code></li>
+              <li>Omaha: <code>AA</code>, <code>AA$ds</code>, <code>AA$ss</code>, <code>*$np</code>, <code>TT-77</code></li>
+              <li>Mixed: <code>AA:xxyy, JJ!JJJ, KK</code></li>
+            </ul>
+
+            <h3>3) Spans, Lists, and Progressions</h3>
+            <ul>
+              <li>Rank spans: <code>KQJT-T987</code>, <code>AAJT-AA87</code></li>
+              <li>Bracket lists: <code>[A-Q][J-T]23</code>, <code>[2,4,6,8,T][3,5,7,9]</code></li>
+              <li>Plus/minus progression: <code>T8+</code>, <code>664-</code>, <code>J[T-]</code></li>
+            </ul>
+
+            <h3>4) Macros (Supported)</h3>
+            <ul>
+              <li>Hold'em: <code>$s</code> suited, <code>$o</code> offsuit</li>
+              <li>Omaha: <code>$ds</code>, <code>$ss</code>, <code>$np</code>, <code>$op</code>, <code>$tp</code>, <code>$nt</code></li>
+              <li>Rank groups: <code>$B $M $Z $L $N $F $R $W</code></li>
+              <li>Rundown helpers: <code>$0g $1g $2g</code></li>
+            </ul>
+
+            <h3>5) Weighting</h3>
+            <ul>
+              <li><code>AA-KK@100,QQ@50</code> means QQ appears half as often as AA/KK.</li>
+            </ul>
+
+            <h3>6) Draw/Hand Filter Tags</h3>
+            <ul>
+              <li><code>@set</code> made trips/set now</li>
+              <li><code>@2p</code> exactly two pair now</li>
+              <li><code>@fd</code> flush draw (not made flush)</li>
+              <li><code>@sd</code> straight draw (not made straight, but can become straight with one next board card)</li>
+              <li><code>@sd4</code> straight draw with 4+ outs</li>
+              <li><code>@sd8</code> straight draw with 8+ outs</li>
+              <li><code>@sd12</code> straight draw with 12+ outs</li>
+              <li><code>@sd13</code> accepted as legacy alias of <code>@sd12</code></li>
+              <li><code>@flush</code> made flush now</li>
+              <li><code>@straight</code> made straight now</li>
+              <li><code>@tpplus</code> pair or better now</li>
+              <li><code>@overpair</code> hold'em only pocket overpair vs board</li>
+            </ul>
+
+            <h3>7) Rule Differences (Very Important)</h3>
+            <ul>
+              <li>Hold'em evaluation can use any legal 5-card combination from hole + board.</li>
+              <li>Omaha (PLO4/5/6) always uses exactly 2 hole cards and 3 board cards.</li>
+            </ul>
+
+            <h3>8) Board / Dead Input</h3>
+            <ul>
+              <li>Board accepts exact cards only (0 to 5 cards): <code>AsKdJh</code>, <code>2s3s8sTd</code></li>
+              <li>Dead accepts exact cards only: <code>AhKs</code></li>
+            </ul>
+
+            <h3>9) Practical Ready-to-use Examples</h3>
+            <ul>
+              <li><code>(AA,KK,AK$s):15%</code></li>
+              <li><code>AsKs:@fd</code></li>
+              <li><code>AA$ds!AAA</code></li>
+              <li><code>AKQJ-9876$ss:20%</code></li>
+              <li><code>(@fd,@sd):15%</code></li>
+            </ul>
           </div>
         </div>
       </div>
