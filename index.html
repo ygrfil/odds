@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Poker Odds Lab</title>
+    <link rel="stylesheet" href="./src/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>Poker Odds Lab</h1>
+          <p>Hold'em, PLO4, PLO5, PLO6 Monte Carlo odds</p>
+        </div>
+        <div class="mode-chip">Browser Engine</div>
+      </header>
+
+      <section class="panel controls">
+        <div class="control-row">
+          <label>
+            Variant
+            <select id="variant">
+              <option value="holdem">Hold'em</option>
+              <option value="plo4">Omaha 4 (PLO4)</option>
+              <option value="plo5">Omaha 5 (PLO5)</option>
+              <option value="plo6">Omaha 6 (PLO6)</option>
+            </select>
+          </label>
+          <label>
+            Mode
+            <select id="speedMode">
+              <option value="quick">Quick (&lt;5s)</option>
+              <option value="long">Long (2 decimals or 60s)</option>
+            </select>
+          </label>
+          <label>
+            Iteration cap
+            <input id="iterationCap" type="number" min="500" max="5000000" step="500" value="150000" />
+          </label>
+          <label>
+            Seed (optional)
+            <input id="seed" type="number" placeholder="random" />
+          </label>
+          <label>
+            Workers
+            <select id="workers">
+              <option value="auto">Auto</option>
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="4">4</option>
+              <option value="6">6</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="control-row board-row">
+          <label class="grow">
+            Board (0-5 cards, e.g. AsKdJh)
+            <input id="board" type="text" placeholder="" />
+          </label>
+          <label class="grow">
+            Dead cards (optional)
+            <input id="dead" type="text" placeholder="e.g. 2c3c" />
+          </label>
+        </div>
+
+        <div class="range-picks" id="rangePicks"></div>
+
+        <div class="action-row">
+          <button id="addPlayer" type="button">+ Player</button>
+          <button id="removePlayer" type="button">- Player</button>
+          <button id="run" type="button" class="primary">Run Simulation</button>
+          <button id="exportSetup" type="button">Export Setup</button>
+          <button id="importSetup" type="button">Import Setup</button>
+          <input id="importFile" type="file" accept=".json,application/json" hidden />
+        </div>
+      </section>
+
+      <section class="panel" id="playersPanel">
+        <h2>Players</h2>
+        <div id="players"></div>
+      </section>
+
+      <section class="panel" id="statusPanel">
+        <h2>Status</h2>
+        <pre id="status">Idle.</pre>
+      </section>
+
+      <section class="panel" id="resultsPanel">
+        <h2>Results</h2>
+        <div id="results"></div>
+      </section>
+
+      <section class="panel syntax-panel">
+        <h2>Syntax coverage (v1)</h2>
+        <p>
+          Supports combinators <code>,</code> <code>:</code> <code>!</code>, parentheses,
+          card literals, wildcard <code>*</code>, rank/suit lists, rank spans,
+          weighted ranges <code>@N</code>, top-off wildcards, and key macros
+          (<code>$s</code>, <code>$o</code>, <code>$ds</code>, <code>$ss</code>,
+          <code>$np</code>, <code>$nt</code>, <code>$B</code>, <code>$M</code>, <code>$Z</code>,
+          <code>$L</code>, <code>$N</code>, <code>$F</code>, <code>$R</code>, <code>$W</code>,
+          <code>$0g</code>, <code>$1g</code>, <code>$2g</code>).
+          Percentile ranges (<code>15%</code>, <code>30%-50%</code>) use a fast heuristic model.
+        </p>
+      </section>
+    </div>
+
+    <script type="module" src="./src/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,177 @@
+:root {
+  --bg: #090d14;
+  --panel: #101825;
+  --text: #e9f0ff;
+  --muted: #9fb2cc;
+  --border: #21324a;
+  --accent: #14b8a6;
+  --accent-2: #f59e0b;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  color: var(--text);
+  background: radial-gradient(circle at 0% 0%, #14243a, #090d14 42%);
+}
+
+.app-shell {
+  max-width: 1220px;
+  margin: 0 auto;
+  padding: 24px;
+  display: grid;
+  gap: 16px;
+}
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.topbar h1 { margin: 0; font-size: 34px; }
+.topbar p { margin: 4px 0 0; color: var(--muted); }
+
+.mode-chip {
+  background: linear-gradient(120deg, var(--accent), #0d7ea8);
+  color: #fff;
+  padding: 8px 12px;
+  border-radius: 999px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 16px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+}
+
+h2 { margin: 0 0 12px; font-size: 18px; }
+
+.controls {
+  display: grid;
+  gap: 12px;
+}
+
+.control-row {
+  display: flex;
+  gap: 10px;
+  align-items: end;
+  flex-wrap: wrap;
+}
+
+label {
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+input, select, button, textarea {
+  font: inherit;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  padding: 10px;
+  color: var(--text);
+  background: #0a1320;
+}
+
+input, select { min-width: 170px; }
+
+.grow { flex: 1; }
+.grow input { width: 100%; }
+
+button {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #072322;
+}
+
+.action-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+#players {
+  display: grid;
+  gap: 10px;
+}
+
+.player-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  background: #0d1726;
+}
+
+.player-head {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.player-range {
+  width: 100%;
+}
+
+pre {
+  margin: 0;
+  white-space: pre-wrap;
+  font-family: "IBM Plex Mono", "Consolas", monospace;
+}
+
+.range-picks {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.range-picks button {
+  background: #221b0f;
+  border-color: #5c4514;
+  color: #f8d99a;
+  padding: 6px 9px;
+}
+
+.table-wrap {
+  overflow: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 720px;
+}
+
+th, td {
+  border-bottom: 1px solid var(--border);
+  padding: 8px;
+  text-align: left;
+  font-size: 14px;
+}
+
+th { color: var(--muted); font-weight: 700; }
+
+.small {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.syntax-panel p {
+  margin: 0;
+  line-height: 1.5;
+}
+
+@media (max-width: 960px) {
+  .topbar { flex-direction: column; gap: 10px; }
+}
