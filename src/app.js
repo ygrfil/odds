@@ -24,6 +24,9 @@ const el = {
   stop: document.querySelector("#stop"),
   status: document.querySelector("#status"),
   results: document.querySelector("#results"),
+  helpOpen: document.querySelector("#helpOpen"),
+  helpClose: document.querySelector("#helpClose"),
+  helpModal: document.querySelector("#helpModal"),
   exportSetup: document.querySelector("#exportSetup"),
   importSetup: document.querySelector("#importSetup"),
   importFile: document.querySelector("#importFile"),
@@ -122,9 +125,9 @@ function renderPlayers() {
     head.appendChild(nameInput);
     head.appendChild(short);
 
-    const range = document.createElement("textarea");
-    range.className = "player-range";
-    range.rows = 2;
+    const range = document.createElement("input");
+    range.className = "player-range-input";
+    range.type = "text";
     range.value = p.range;
     range.placeholder = "Range syntax (PPT-style), e.g. AA,AK$s,15%";
     range.addEventListener("focus", () => {
@@ -145,6 +148,14 @@ function setStatus(msg) {
   el.status.textContent = msg;
 }
 
+function openHelp() {
+  el.helpModal.classList.remove("hidden");
+}
+
+function closeHelp() {
+  el.helpModal.classList.add("hidden");
+}
+
 function renderResults(result) {
   if (!result || !result.players?.length) {
     el.results.innerHTML = "<p>No results yet.</p>";
@@ -152,7 +163,7 @@ function renderResults(result) {
   }
 
   const html = [];
-  html.push(`<p><strong>${result.iterations.toLocaleString()}</strong> iterations in <strong>${(result.elapsedMs / 1000).toFixed(2)}s</strong>. Variant: <strong>${result.variant}</strong>.</p>`);
+  html.push(`<p class="small"><strong>${result.iterations.toLocaleString()}</strong> iterations in <strong>${(result.elapsedMs / 1000).toFixed(2)}s</strong>. Variant: <strong>${result.variant}</strong>.</p>`);
   html.push('<div class="table-wrap"><table><thead><tr><th>Player</th><th>Range</th><th>Equity</th><th>Win</th><th>Tie</th><th>Loss</th><th>Combos</th><th>Hand Classes</th></tr></thead><tbody>');
 
   for (const row of result.players) {
@@ -298,6 +309,14 @@ function wire() {
 
   el.run.addEventListener("click", run);
   el.stop.addEventListener("click", stopRun);
+  el.helpOpen.addEventListener("click", openHelp);
+  el.helpClose.addEventListener("click", closeHelp);
+  el.helpModal.addEventListener("click", (event) => {
+    if (event.target === el.helpModal) closeHelp();
+  });
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !el.helpModal.classList.contains("hidden")) closeHelp();
+  });
   el.exportSetup.addEventListener("click", exportSetup);
   el.importSetup.addEventListener("click", () => el.importFile.click());
   el.importFile.addEventListener("change", () => {

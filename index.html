@@ -13,7 +13,7 @@
           <h1>Poker Odds Lab</h1>
           <p>Hold'em, PLO4, PLO5, PLO6 Monte Carlo odds</p>
         </div>
-        <div class="mode-chip">Browser Engine</div>
+        <div class="mode-chip">Desktop Layout</div>
       </header>
 
       <section class="panel controls">
@@ -31,6 +31,8 @@
             Iteration cap
             <input id="iterationCap" type="number" min="500" max="5000000" step="500" value="150000" />
           </label>
+          <div class="spacer"></div>
+          <button id="helpOpen" type="button">Help</button>
         </div>
 
         <div class="control-row board-row">
@@ -63,29 +65,28 @@
           <div id="players"></div>
         </section>
 
-        <section class="panel" id="resultsPanel">
-          <h2>Results</h2>
+        <section class="panel" id="outputPanel">
+          <div class="output-head">
+            <h2>Output</h2>
+            <div id="status" class="status-line">Idle.</div>
+          </div>
           <div id="results"></div>
         </section>
+      </div>
 
-        <section class="panel" id="statusPanel">
-          <h2>Status</h2>
-          <pre id="status">Idle.</pre>
-        </section>
-
-        <section class="panel syntax-panel">
-          <h2>Syntax coverage (v1)</h2>
-          <p>
-            Supports combinators <code>,</code> <code>:</code> <code>!</code>, parentheses,
-            card literals, wildcard <code>*</code>, rank/suit lists, rank spans,
-            weighted ranges <code>@N</code>, top-off wildcards, and key macros
-            (<code>$s</code>, <code>$o</code>, <code>$ds</code>, <code>$ss</code>,
-            <code>$np</code>, <code>$nt</code>, <code>$B</code>, <code>$M</code>, <code>$Z</code>,
-            <code>$L</code>, <code>$N</code>, <code>$F</code>, <code>$R</code>, <code>$W</code>,
-            <code>$0g</code>, <code>$1g</code>, <code>$2g</code>).
-            Percentile ranges (<code>15%</code>, <code>30%-50%</code>) use a fast heuristic model.
-          </p>
-        </section>
+      <div id="helpModal" class="help-modal hidden" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
+        <div class="help-card">
+          <div class="help-head">
+            <h2 id="helpTitle">Syntax Help</h2>
+            <button id="helpClose" type="button">Close</button>
+          </div>
+          <div class="help-body">
+            <p>Core combinators: <code>,</code> union, <code>:</code> intersection, <code>!</code> exclusion, and parentheses for grouping.</p>
+            <p>Quick examples: <code>AA,AK$s</code>, <code>15%</code>, <code>30%-50%</code>, <code>AA:xxyy,JJ!JJJ,KK</code>.</p>
+            <p>Useful macros: <code>$s</code>, <code>$o</code>, <code>$ds</code>, <code>$ss</code>, <code>$np</code>, <code>$nt</code>, <code>$B</code>, <code>$M</code>, <code>$Z</code>, <code>$L</code>, <code>$N</code>, <code>$F</code>, <code>$R</code>, <code>$W</code>, <code>$0g</code>, <code>$1g</code>, <code>$2g</code>.</p>
+            <p>Board input supports exact cards only, e.g. <code>AsKdJh</code>, <code>2s3s8sTd</code>.</p>
+          </div>
+        </div>
       </div>
     </div>
 
