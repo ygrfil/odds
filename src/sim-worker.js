@@ -1,16 +1,40 @@
-import { runSimulationRaw } from "./sim-core.js";
+import { runExhaustiveRaw, runSimulationRaw } from "./sim-core.js";
+
+let activeController = null;
+let runToken = 0;
 
 self.onmessage = async (event) => {
   const msg = event.data;
-  if (!msg || msg.type !== "run") return;
+  if (!msg) return;
+  if (msg.type === "stop") {
+    if (activeController) activeController.abort();
+    return;
+  }
+  if (msg.type !== "run") return;
 
   try {
-    const raw = await runSimulationRaw(msg.config, {
+    const token = ++runToken;
+    activeController = new AbortController();
+    const runner = msg.mode === "exact" ? runExhaustiveRaw : runSimulationRaw;
+    const raw = await runner(msg.config, {
       iterCap: msg.iterCap,
       seedOverride: msg.seed,
       poolScale: msg.poolScale,
-      disableStabilityStop: true
+      partitionIndex: msg.partitionIndex,
+      partitionCount: msg.partitionCount,
+      disableStabilityStop: true,
+      signal: activeController.signal,
+      onProgress: (p) => {
+        self.postMessage({
+          type: "progress",
+          workerId: msg.workerId,
+          progress: {
+            iterations: p.iterations || 0
+          }
+        });
+      }
     });
+    if (token !== runToken) return;
 
     self.postMessage({
       type: "done",
@@ -21,6 +45,7 @@ self.onmessage = async (event) => {
         wins: raw.wins,
         ties: raw.ties,
         losses: raw.losses,
+        equityShares: raw.equityShares,
         comboLists: raw.comboLists.map((s) => Array.from(s)),
         classCounts: raw.classCounts
       }
@@ -31,5 +56,7 @@ self.onmessage = async (event) => {
       workerId: msg.workerId,
       error: err?.message || String(err)
     });
+  } finally {
+    activeController = null;
   }
 };

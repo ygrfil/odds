@@ -13,6 +13,7 @@ const state = {
 let runAbortController = null;
 
 const el = {
+  method: document.querySelector("#method"),
   variant: document.querySelector("#variant"),
   iterationCap: document.querySelector("#iterationCap"),
   board: document.querySelector("#board"),
@@ -48,6 +49,7 @@ const quickPicks = [
 
 function saveLocal() {
   localStorage.setItem("poker-odds-lab-state", JSON.stringify({
+    method: el.method.value,
     variant: el.variant.value,
     iterationCap: el.iterationCap.value,
     board: el.board.value,
@@ -61,6 +63,7 @@ function loadLocal() {
     const raw = localStorage.getItem("poker-odds-lab-state");
     if (!raw) return;
     const s = JSON.parse(raw);
+    el.method.value = s.method || "monte";
     el.variant.value = s.variant || "holdem";
     el.iterationCap.value = s.iterationCap || "150000";
     el.board.value = s.board || "";
@@ -177,6 +180,7 @@ function renderPlayers() {
 
 function currentConfig() {
   return {
+    method: el.method.value,
     variant: el.variant.value,
     iterationCap: Number(el.iterationCap.value || 150000),
     board: el.board.value.trim(),
@@ -186,6 +190,12 @@ function currentConfig() {
       range: p.range?.trim() || "*"
     }))
   };
+}
+
+function syncMethodUI() {
+  const exact = el.method.value === "exact";
+  el.iterationCap.disabled = exact;
+  el.iterationCap.title = exact ? "Not used in exhaustive mode." : "";
 }
 
 async function run() {
@@ -198,13 +208,18 @@ async function run() {
   el.stop.disabled = false;
 
   try {
+    const controller = runAbortController;
     const result = await runSimulation(config, (p) => {
       setStatus(`Iterations: ${p.iterations.toLocaleString()} | ${Math.round(p.ips).toLocaleString()} it/s | ${p.elapsed.toFixed(2)}s`);
-    }, runAbortController.signal);
+    }, controller.signal);
     state.lastResult = result;
     renderSummary(result);
     renderPlayers();
-    setStatus(`Done. ${result.iterations.toLocaleString()} iterations in ${(result.elapsedMs / 1000).toFixed(2)}s.`);
+    if (result.aborted || controller.signal.aborted) {
+      setStatus(`Stopped at ${result.iterations.toLocaleString()} iterations in ${(result.elapsedMs / 1000).toFixed(2)}s.`);
+    } else {
+      setStatus(`Done. ${result.iterations.toLocaleString()} iterations in ${(result.elapsedMs / 1000).toFixed(2)}s.`);
+    }
   } catch (err) {
     setStatus(`Error: ${err.message || String(err)}`);
   } finally {
@@ -246,6 +261,7 @@ function importSetup(file) {
       if (!setup.players || setup.players.length < 2) throw new Error("Invalid setup file");
 
       el.variant.value = setup.variant || "holdem";
+      el.method.value = setup.method || "monte";
       el.iterationCap.value = setup.iterationCap || 150000;
       el.board.value = setup.board || "";
       el.dead.value = setup.dead || "";
@@ -255,6 +271,7 @@ function importSetup(file) {
       }));
 
       state.lastResult = payload.result || null;
+      syncMethodUI();
       renderSummary(state.lastResult);
       renderPlayers();
       saveLocal();
@@ -308,12 +325,14 @@ function wire() {
     el.importFile.value = "";
   });
 
-  [el.variant, el.iterationCap, el.board, el.dead].forEach((node) => {
+  [el.method, el.variant, el.iterationCap, el.board, el.dead].forEach((node) => {
     node.addEventListener("input", saveLocal);
   });
+  el.method.addEventListener("change", syncMethodUI);
 }
 
 loadLocal();
+syncMethodUI();
 renderQuickPicks();
 renderSummary(state.lastResult);
 renderPlayers();

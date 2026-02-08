@@ -68,6 +68,10 @@ function encode5(a, b, c, d, e) {
   return (((((a * 15) + b) * 15 + c) * 15 + d) * 15) + e;
 }
 
+function encode3(a, b, c) {
+  return ((a * 15) + b) * 15 + c;
+}
+
 function evaluate5Score(c1, c2, c3, c4, c5) {
   const r1 = rankOf(c1); const r2 = rankOf(c2); const r3 = rankOf(c3); const r4 = rankOf(c4); const r5 = rankOf(c5);
   const s1 = suitOf(c1); const s2 = suitOf(c2); const s3 = suitOf(c3); const s4 = suitOf(c4); const s5 = suitOf(c5);
@@ -120,7 +124,7 @@ function evaluate5Score(c1, c2, c3, c4, c5) {
     }
     return 2_000_000 + hi * 225 + lo * 15 + kicker;
   }
-  if (g1c === 2) return 1_000_000 + g1r * 3375 + encode5(singles[0], singles[1], singles[2], 0, 0);
+  if (g1c === 2) return 1_000_000 + g1r * 3375 + encode3(singles[0], singles[1], singles[2]);
   return encode5(sorted[0], sorted[1], sorted[2], sorted[3], sorted[4]);
 }
 

@@ -7,7 +7,7 @@ import {
   classifyBoard,
   CLASS_NAMES
 } from "./eval.js";
-import { fullDeck, parseCards, rankOf } from "./cards.js";
+import { RANKS, SUITS, cardFromRankSuit, fullDeck, parseCards, rankOf } from "./cards.js";
 import { compileRange } from "./parser.js";
 import { makeRng } from "./rng.js";
 
@@ -43,11 +43,12 @@ function categoryMatch(tag, hand, board) {
     }
   }
 
+  if (tag === "@fd") return flushDraw;
+  if (tag === "@flush") return madeFlush;
+
   const score = isHoldem ? bestHoldemScoreStreet(hand, board) : bestOmahaScoreStreet(hand, board);
   const cls = classIdFromScore(score);
 
-  if (tag === "@fd") return flushDraw;
-  if (tag === "@flush") return cls === 5 || cls === 8;
   if (tag === "@2p") return cls === 2;
   if (tag === "@set") return cls === 3;
 
@@ -153,6 +154,77 @@ function tryParseExactLiteral(rangeText, handSize) {
   }
 }
 
+function parseExactLiteralOrThrow(rangeText, handSize, label) {
+  const parsed = tryParseExactLiteral(rangeText, handSize);
+  if (!parsed) {
+    throw new Error(`${label} must be an exact suited hand in exhaustive mode.`);
+  }
+  return parsed;
+}
+
+function tryParseFixedPattern(rangeText, handSize) {
+  const t = (rangeText || "").replace(/\s+/g, "");
+  if (!t) return null;
+  if (/[,:!()@$\[\]{}%&*xXyYzZwWrRoOnN+\-]/.test(t)) return null;
+  const tokens = [];
+  for (let i = 0; i < t.length;) {
+    const r = t[i].toUpperCase();
+    if (!RANKS.includes(r)) return null;
+    let suit = null;
+    if (i + 1 < t.length) {
+      const s = t[i + 1].toLowerCase();
+      if (SUITS.includes(s)) {
+        suit = s;
+        i += 2;
+      } else {
+        i += 1;
+      }
+    } else {
+      i += 1;
+    }
+    tokens.push({ rank: r, suit });
+  }
+  if (tokens.length !== handSize) return null;
+  return tokens;
+}
+
+function buildPoolFromFixedPattern(tokens, baseMask) {
+  const perPos = tokens.map((tok) => {
+    if (tok.suit) return [cardFromRankSuit(tok.rank, tok.suit)];
+    return [...SUITS].map((s) => cardFromRankSuit(tok.rank, s));
+  });
+
+  const used = new Uint8Array(52);
+  const cur = [];
+  const seen = new Set();
+  const pool = [];
+
+  function rec(pos) {
+    if (pos === perPos.length) {
+      const hand = cur.slice();
+      const k = comboKey(hand);
+      if (!seen.has(k)) {
+        seen.add(k);
+        pool.push(hand);
+      }
+      return;
+    }
+    const options = perPos[pos];
+    for (let i = 0; i < options.length; i++) {
+      const c = options[i];
+      if (!baseMask[c] || used[c]) continue;
+      used[c] = 1;
+      cur.push(c);
+      rec(pos + 1);
+      cur.pop();
+      used[c] = 0;
+    }
+  }
+
+  rec(0);
+  return pool;
+}
+
 function estimateAcceptance(rangeCompiled, baseDeck, handSize, rng, helpers, trials = 300) {
   let ok = 0;
   const tmp = [];
@@ -206,11 +278,12 @@ function sampleFromPool(pool, usedFlags, rng) {
 }
 
 export function rawToResult(raw, config) {
-  const { iterations: it, elapsedMs, wins, ties, losses, comboLists, classCounts } = raw;
+  const { iterations: it, elapsedMs, wins, ties, losses, comboLists, classCounts, equityShares } = raw;
   const players = config.players;
   const n = players.length;
   const rows = players.map((p, i) => {
-    const equity = ((wins[i] + ties[i] / n) / Math.max(1, it)) * 100;
+    const eqShare = equityShares?.[i] ?? (wins[i] + ties[i] / n);
+    const equity = (eqShare / Math.max(1, it)) * 100;
     const winPct = (wins[i] / Math.max(1, it)) * 100;
     const tiePct = (ties[i] / Math.max(1, it)) * 100;
     const lossPct = (losses[i] / Math.max(1, it)) * 100;
@@ -237,6 +310,7 @@ export function rawToResult(raw, config) {
   return {
     iterations: it,
     elapsedMs,
+    aborted: !!raw.aborted,
     variant: config.variant,
     players: rows,
     input: {
@@ -261,6 +335,8 @@ export async function runSimulationRaw(config, options = {}) {
 
   const blocked = new Set(board.concat(dead));
   const baseDeck = ALL_CARDS.filter((c) => !blocked.has(c));
+  const baseMask = new Uint8Array(52);
+  for (let i = 0; i < baseDeck.length; i++) baseMask[baseDeck[i]] = 1;
   const ranges = players.map((p) => compileRange((p.range || "*").trim() || "*", variant, board));
   const poolScale = Number.isFinite(options.poolScale) ? Math.max(0.1, Math.min(1, options.poolScale)) : 1;
   const samplerPlans = players.map((p, i) => ({
@@ -272,15 +348,19 @@ export async function runSimulationRaw(config, options = {}) {
   const wins = players.map(() => 0);
   const ties = players.map(() => 0);
   const losses = players.map(() => 0);
+  const equityShares = players.map(() => 0);
   const comboLists = players.map(() => new Set());
   const classCounts = players.map(() => new Array(CLASS_NAMES.length).fill(0));
 
   const start = performance.now();
   const capMs = Number.isFinite(options.capMs) ? options.capMs : Number.POSITIVE_INFINITY;
-  const iterCap = Math.max(500, Number(options.iterCap ?? config.iterationCap ?? 100000));
+  const iterCapRaw = Number(options.iterCap ?? config.iterationCap ?? 100000);
+  const iterCap = Number.isFinite(iterCapRaw) ? Math.max(1, Math.floor(iterCapRaw)) : 100000;
 
   let it = 0;
+  let loops = 0;
   let lastProgress = start;
+  let lastYield = start;
 
   const helpers = { categoryMatch };
   const usedFlags = new Uint8Array(52);
@@ -291,6 +371,14 @@ export async function runSimulationRaw(config, options = {}) {
 
   for (let i = 0; i < samplerPlans.length; i++) {
     const s = samplerPlans[i];
+    const fixed = tryParseFixedPattern(s.rangeText, handSize);
+    if (fixed) {
+      const pool = buildPoolFromFixedPattern(fixed, baseMask);
+      if (pool.length === 0) throw new Error(`Player ${i + 1} range appears empty on this board/dead-card setup`);
+      s.pool = pool;
+      continue;
+    }
+
     const exact = tryParseExactLiteral(s.rangeText, handSize);
     if (exact) {
       if (s.compiled.predicate(exact, null, helpers)) {
@@ -320,9 +408,15 @@ export async function runSimulationRaw(config, options = {}) {
   }
 
   while (it < iterCap) {
+    loops++;
     if (options.signal?.aborted) break;
     const now = performance.now();
     if (now - start >= capMs) break;
+    if ((loops & 1023) === 0 && now - lastYield > 16) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      lastYield = performance.now();
+      if (options.signal?.aborted) break;
+    }
 
     usedFlags.fill(0);
     for (const c of blocked) usedFlags[c] = 1;
@@ -365,6 +459,7 @@ export async function runSimulationRaw(config, options = {}) {
       if (winners[i]) {
         if (winnerCount === 1) wins[i]++;
         else ties[i]++;
+        equityShares[i] += 1 / winnerCount;
       } else {
         losses[i]++;
       }
@@ -385,6 +480,126 @@ export async function runSimulationRaw(config, options = {}) {
     wins,
     ties,
     losses,
+    equityShares,
+    comboLists,
+    classCounts
+  };
+}
+
+export async function runExhaustiveRaw(config, options = {}) {
+  const variant = config.variant;
+  const players = config.players;
+  const handSize = variantCardCount(variant);
+  if (players.length < 2) throw new Error("At least 2 players required");
+  if (players.length > 6) throw new Error("Max 6 players supported");
+
+  const boardKnown = parseCards(config.board || "");
+  if (boardKnown.length > 5) throw new Error("Board can have at most 5 cards");
+  const dead = parseCards(config.dead || "");
+
+  const parsedHands = players.map((p, i) =>
+    parseExactLiteralOrThrow((p.range || "").trim(), handSize, `Player ${i + 1}`)
+  );
+
+  const blocked = new Set(boardKnown.concat(dead));
+  for (let i = 0; i < parsedHands.length; i++) {
+    for (const c of parsedHands[i]) {
+      if (blocked.has(c)) throw new Error(`Player ${i + 1} exact hand conflicts with board/dead cards.`);
+      blocked.add(c);
+    }
+  }
+
+  const deck = ALL_CARDS.filter((c) => !blocked.has(c));
+  const need = 5 - boardKnown.length;
+  if (need < 0) throw new Error("Invalid board size.");
+
+  const wins = players.map(() => 0);
+  const ties = players.map(() => 0);
+  const losses = players.map(() => 0);
+  const equityShares = players.map(() => 0);
+  const comboLists = players.map((_, i) => new Set([comboKey(parsedHands[i])]));
+  const classCounts = players.map(() => new Array(CLASS_NAMES.length).fill(0));
+
+  const start = performance.now();
+  const board5 = boardKnown.slice();
+  const chosen = [];
+  let assigned = 0;
+  let visited = 0;
+  let lastProgress = start;
+
+  const partitionIndex = Math.max(0, Number(options.partitionIndex || 0));
+  const partitionCount = Math.max(1, Number(options.partitionCount || 1));
+
+  function evalBoard(board) {
+    const scores = parsedHands.map((h) =>
+      variant === "holdem" ? bestHoldemScore(h, board) : bestOmahaScore(h, board)
+    );
+    let maxScore = -1;
+    for (let i = 0; i < scores.length; i++) if (scores[i] > maxScore) maxScore = scores[i];
+    const winners = [];
+    for (let i = 0; i < scores.length; i++) {
+      if (scores[i] === maxScore) winners.push(i);
+      classCounts[i][Math.floor(scores[i] / 1_000_000)]++;
+    }
+    for (let i = 0; i < players.length; i++) {
+      if (winners.includes(i)) {
+        if (winners.length === 1) wins[i]++;
+        else ties[i]++;
+        equityShares[i] += 1 / winners.length;
+      } else {
+        losses[i]++;
+      }
+    }
+  }
+
+  function recurse(startIdx, depth) {
+    if (options.signal?.aborted) return;
+    if (depth === need) {
+      if ((visited % partitionCount) === partitionIndex) {
+        board5.length = boardKnown.length;
+        for (let i = 0; i < chosen.length; i++) board5.push(chosen[i]);
+        evalBoard(board5);
+        assigned++;
+        const now = performance.now();
+        if (options.onProgress && now - lastProgress > 300) {
+          const elapsed = (now - start) / 1000;
+          options.onProgress({
+            iterations: assigned,
+            elapsed,
+            boardClass: classifyBoard(board5),
+            ips: assigned / Math.max(0.001, elapsed)
+          });
+          lastProgress = now;
+        }
+      }
+      visited++;
+      return;
+    }
+    for (let i = startIdx; i <= deck.length - (need - depth); i++) {
+      if (options.signal?.aborted) return;
+      chosen.push(deck[i]);
+      recurse(i + 1, depth + 1);
+      chosen.pop();
+    }
+  }
+
+  if (need === 0) {
+    if ((visited % partitionCount) === partitionIndex) {
+      evalBoard(boardKnown);
+      assigned++;
+    }
+    visited++;
+  } else {
+    recurse(0, 0);
+  }
+
+  return {
+    iterations: assigned,
+    elapsedMs: performance.now() - start,
+    wins,
+    ties,
+    losses,
+    equityShares,
     comboLists,
     classCounts
   };
