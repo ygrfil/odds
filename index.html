@@ -133,17 +133,17 @@
 
             <h3>6) Draw/Hand Filter Tags</h3>
             <ul>
-              <li><code>@tp</code> top pair now only</li>
+              <li><code>@tp</code> top-pair core structures (with any side cards)</li>
               <li><code>@overpair</code> hold'em only pocket overpair vs board</li>
-              <li><code>@2p</code> exactly two pair now</li>
-              <li><code>@set</code> made trips/set now</li>
-              <li><code>@s</code> made straight now (exact straight class)</li>
-              <li><code>@f</code> made flush now (exact flush class)</li>
-              <li><code>@fd</code> flush draw (not made flush)</li>
-              <li><code>@sd</code> straight draw with 1+ outs (includes rare &lt;4 out cases)</li>
-              <li><code>@sd4</code> straight draw with 4+ outs</li>
-              <li><code>@sd8</code> straight draw with 8+ outs</li>
-              <li><code>@sd12</code> straight draw with 12+ outs</li>
+              <li><code>@2p</code> two-pair core structures (with any side cards)</li>
+              <li><code>@set</code> set/trips core structures (with any side cards)</li>
+              <li><code>@s</code> straight core structures (with any side cards)</li>
+              <li><code>@f</code> flush core structures (with any side cards)</li>
+              <li><code>@fd</code> flush-draw core structures (with any side cards)</li>
+              <li><code>@sd</code> straight-draw core structures with 1+ outs (with any side cards)</li>
+              <li><code>@sd4</code> straight-draw core structures with 4+ outs (with any side cards)</li>
+              <li><code>@sd8</code> straight-draw core structures with 8+ outs (with any side cards)</li>
+              <li><code>@sd12</code> straight-draw core structures with 12+ outs (with any side cards)</li>
               <li><code>+</code> on ready hands includes stronger made hands: <code>@2p+</code>, <code>@set+</code>, <code>@s+</code>, <code>@f+</code>, <code>@tp+</code>, <code>@overpair+</code></li>
               <li><code>+</code> is not valid on draw tags (<code>@fd</code>, <code>@sd*</code>)</li>
               <li>Legacy aliases still accepted: <code>@straight</code> = <code>@s</code>, <code>@flush</code> = <code>@f</code>, <code>@tpplus</code> = <code>@tp+</code>, <code>@sd13</code> = <code>@sd12</code></li>

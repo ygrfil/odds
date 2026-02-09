@@ -1,4 +1,4 @@
-import { previewTagCoreCombos, previewTagCoverage, previewRangeCoverage } from "./sim-core.js";
+import { previewTagCoverage, previewRangeCoverage } from "./sim-core.js";
 import { extractNormalizedTags, normalizePureTagToken, splitTagToken } from "./tag-utils.js";
 
 function atTagsInRange(rangeText) {
@@ -122,7 +122,6 @@ function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "") 
       continue;
     }
     try {
-      const combos = previewTagCoreCombos(boardText, variant, tag);
       const cov = (pureTag && pureTag === tag && covExpr && typeof covExpr === "object")
         ? covExpr
         : previewTagCoverage(boardText, variant, tag);
@@ -132,13 +131,10 @@ function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "") 
         const c4 = previewTagCoverage(boardText, variant, "@sd4");
         if (cov.pct > c4.pct + 0.2) extra = " + blocker-only <4 out draws";
       }
-      if (pureTag && pureTag === tag) {
-        parts.push({ tone: "tag", text: `${tag}: ${combos.length ? combos.join(",") : "-"} (${stat})${extra}` });
-      } else if (isHoldem && combos.length > 0 && combos.length <= 8) {
-        parts.push({ tone: "tag", text: `${tag}: ${combos.join(",")} (${stat})${extra}` });
-      } else {
-        parts.push({ tone: "tag", text: `${tag}: ${stat}${extra}` });
+      if (pureTag && pureTag === tag && tags.length === 1) {
+        continue;
       }
+      parts.push({ tone: "tag", text: `${tag}: ${stat}${extra}` });
     } catch {
       parts.push({ tone: "warn", text: `${tag}: invalid board input` });
     }

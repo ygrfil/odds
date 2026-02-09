@@ -14,7 +14,6 @@ import {
 import { cardToText, parseCards, fullDeck } from "../src/cards.js";
 import { compileRange } from "../src/parser.js";
 import { makeRng } from "../src/rng.js";
-import { normalizePureTagToken, splitTagToken } from "../src/tag-utils.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, "..");
@@ -25,7 +24,7 @@ const NATIVE_SIM_BUILD_STAMP = path.join(PROJECT_ROOT, "native-sim", "target", "
 const NATIVE_SIM_BUILD_STAMP_VERSION = 2;
 const PLAYER_SAMPLER_CACHE = new Map();
 const PLAYER_SAMPLER_CACHE_MAX = 48;
-const SAMPLER_CACHE_VERSION = 2;
+const SAMPLER_CACHE_VERSION = 3;
 const SAMPLER_DISK_DIR = path.join(PROJECT_ROOT, "backend", ".cache", `samplers-v${SAMPLER_CACHE_VERSION}`);
 const SAMPLER_MAX_POOL_TO_CACHE = 30_000;
 const SAMPLER_MAX_FILE_BYTES = 14 * 1024 * 1024;
@@ -277,38 +276,8 @@ function simpleExactIfAny(rangeText, handSize) {
   return null;
 }
 
-function maybeExpandPureTagRange(rangeText, variant, boardCards) {
-  const tag = normalizePureTagToken(rangeText);
-  if (!tag) return rangeText;
-  const tagInfo = splitTagToken(tag);
-  if (!tagInfo) return rangeText;
-  const holdEmExpandable = new Set([
-    "@tp",
-    "@tp+",
-    "@overpair",
-    "@overpair+",
-    "@2p",
-    "@2p+",
-    "@set",
-    "@set+",
-    "@s",
-    "@s+",
-    "@f",
-    "@f+",
-    "@fd",
-    "@sd",
-    "@sd4",
-    "@sd8",
-    "@sd12"
-  ]);
-  const omahaExpandable = new Set(["@sd", "@sd4", "@sd8", "@sd12"]);
-  if (variant === "holdem" && !holdEmExpandable.has(tagInfo.token)) return rangeText;
-  if (variant !== "holdem" && !omahaExpandable.has(tagInfo.base)) return rangeText;
-  if (!Array.isArray(boardCards) || boardCards.length < 3 || boardCards.length > 5) return rangeText;
-  const boardText = boardCards.map((c) => cardToText(c)).join("");
-  const combos = previewTagCoreCombos(boardText, variant, tagInfo.token);
-  if (!Array.isArray(combos) || combos.length === 0) return rangeText;
-  return combos.join(",");
+function maybeExpandPureTagRange(rangeText, _variant, _boardCards) {
+  return rangeText;
 }
 
 function cardsKey(cards, ordered = true) {

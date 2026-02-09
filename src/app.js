@@ -1,5 +1,5 @@
 import { runSimulation } from "./engine.js";
-import { previewTagCoreCombos, previewTagCoverage, previewRangeCoverage } from "./sim-core.js";
+import { previewTagCoverage, previewRangeCoverage } from "./sim-core.js";
 import { extractNormalizedTags, normalizePureTagToken, splitTagToken } from "./tag-utils.js";
 import {
   normalizePercentileProfile,
@@ -69,26 +69,26 @@ const quickPicks = [
 ];
 
 const TAG_BASE_HINTS = {
-  "@tp": "Top pair now only (pair rank equals top board rank).",
+  "@tp": "Top-pair core structure (with any side cards). In Omaha this can include stronger made hands when side cards improve the result.",
   "@overpair": "Hold'em only: pocket pair higher than top board rank.",
-  "@2p": "Exactly two pair made now.",
-  "@set": "Set/trips made now. Hold'em: trips from hole+board. Omaha: exactly 2 hole + 3 board.",
-  "@s": "Made straight now only (not straight flush).",
-  "@f": "Made flush now only (not full house/quads/straight flush). Omaha: exactly 2 hole + 3 board.",
-  "@fd": "Flush draw (4 to a flush, not yet made). Omaha requires 2 suited hole cards + 2 suited board cards.",
-  "@sd": "Straight draw with 1+ outs (includes rare <4 out cases). Uses street-correct rules.",
-  "@sd4": "Straight draw with 4+ outs.",
-  "@sd8": "Straight draw with 8 outs or more.",
-  "@sd12": "Straight draw with 12 outs or more."
+  "@2p": "Two-pair board-core structures (with any side cards). Example on QJT: QJ, QT, JT cores.",
+  "@set": "Set/trips core structures (with any side cards).",
+  "@s": "Straight core structures (with any side cards).",
+  "@f": "Flush core structures (with any side cards). Omaha flush cores use exactly 2 hole + 3 board cards.",
+  "@fd": "Flush-draw core structures (with any side cards).",
+  "@sd": "Straight-draw core structures with 1+ outs (with any side cards).",
+  "@sd4": "Straight-draw core structures with 4+ outs (with any side cards).",
+  "@sd8": "Straight-draw core structures with 8+ outs (with any side cards).",
+  "@sd12": "Straight-draw core structures with 12+ outs (with any side cards)."
 };
 
 const TAG_PLUS_HINTS = {
-  "@tp": "Top pair or better (top pair, overpair, or any 2-pair+ hand).",
-  "@overpair": "Overpair or any stronger made hand (2-pair+).",
-  "@2p": "Two pair or better (set, straight, flush, full house, quads, straight flush).",
-  "@set": "Set/trips or better (straight, flush, full house, quads, straight flush).",
-  "@s": "Straight or better (flush, full house, quads, straight flush).",
-  "@f": "Flush or better (full house, quads, straight flush)."
+  "@tp": "Top-pair structures plus stronger made-hand structures.",
+  "@overpair": "Overpair or stronger made-hand structures (Hold'em only).",
+  "@2p": "Two-pair structures plus stronger made-hand structures.",
+  "@set": "Set/trips structures plus stronger made-hand structures.",
+  "@s": "Straight structures plus stronger made-hand structures.",
+  "@f": "Flush structures plus stronger made-hand structures."
 };
 
 function tagHintText(tagToken) {
@@ -289,7 +289,6 @@ function rangeLiveInfo(
       parts.push({ tone: "warn", text: `${tag}: needs flop+.` });
     } else {
       try {
-        const combos = previewTagCoreCombos(boardText, variant, tag);
         const cov = (pureTag && pureTag === tag && covExpr && typeof covExpr === "object")
           ? covExpr
           : previewTagCoverage(boardText, variant, tag);
@@ -301,13 +300,10 @@ function rangeLiveInfo(
             extra = " + blocker-only <4 out draws";
           }
         }
-        if (pureTag && pureTag === tag) {
-          parts.push({ tone: "tag", text: `${tag}: ${combos.length ? combos.join(",") : "-"} (${stat})${extra}` });
-        } else if (isHoldem && combos.length > 0 && combos.length <= 8) {
-          parts.push({ tone: "tag", text: `${tag}: ${combos.join(",")} (${stat})${extra}` });
-        } else {
-          parts.push({ tone: "tag", text: `${tag}: ${stat}${extra}` });
+        if (pureTag && pureTag === tag && tags.length === 1) {
+          continue;
         }
+        parts.push({ tone: "tag", text: `${tag}: ${stat}${extra}` });
       } catch {
         parts.push({ tone: "warn", text: `${tag}: invalid board input` });
       }
