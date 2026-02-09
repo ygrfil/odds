@@ -12,6 +12,14 @@ const state = {
 };
 
 let runAbortController = null;
+const liveInfoState = {
+  worker: null,
+  requestSeq: 0,
+  timers: new Map(),
+  latestRequestByPlayer: new Map(),
+  nodeByPlayer: new Map(),
+  contextByPlayer: new Map()
+};
 
 const el = {
   variant: document.querySelector("#variant"),
@@ -101,6 +109,24 @@ function extractPercentAtoms(rangeText) {
   return out;
 }
 
+function parseSimplePercentSpec(expr) {
+  const s = String(expr || "").replace(/\s+/g, "");
+  const top = s.match(/^(\d+(?:\.\d+)?)%$/);
+  if (top) {
+    const p = Number(top[1]);
+    if (Number.isFinite(p) && p >= 0 && p <= 100) return { label: `${top[1]}%`, nominalPct: p };
+    return null;
+  }
+  const band = s.match(/^(\d+(?:\.\d+)?)%-(\d+(?:\.\d+)?)%$/);
+  if (band) {
+    const low = Number(band[1]);
+    const high = Number(band[2]);
+    if (!Number.isFinite(low) || !Number.isFinite(high) || low < 0 || high > 100 || low > high) return null;
+    return { label: `${band[1]}%-${band[2]}%`, nominalPct: high - low };
+  }
+  return null;
+}
+
 function coverageCounts(cov) {
   if (!cov) return { matched: 0, total: 0, approx: false };
   if (cov.approx) {
@@ -123,15 +149,14 @@ function coverageText(cov) {
   return `${cov.pct.toFixed(1)}%, ${cov.matched.toLocaleString()}/${cov.total.toLocaleString()} combos`;
 }
 
-function rangeLiveInfo(rangeText) {
+function rangeLiveInfo(rangeText, boardText = el.board.value.trim(), variant = el.variant.value) {
   const expr = String(rangeText || "").trim();
   if (!expr) return [];
 
   const tags = atTagsInRange(expr).filter((t) => TAG_HINTS[t]);
-  const boardText = el.board.value.trim();
-  const boardCards = Math.floor(boardText.length / 2);
-  const isHoldem = el.variant.value === "holdem";
-  const variant = el.variant.value;
+  const boardCards = Math.floor(String(boardText).replace(/\s+/g, "").length / 2);
+  const isHoldem = variant === "holdem";
+  const pctSpec = parseSimplePercentSpec(expr);
   const parts = [];
   let covExpr = null;
 
@@ -145,7 +170,13 @@ function rangeLiveInfo(rangeText) {
   }
 
   const pctAtoms = extractPercentAtoms(expr);
-  if (covExpr && pctAtoms.length) {
+  if (covExpr && pctSpec && boardCards > 0 && Math.abs(covExpr.pct - pctSpec.nominalPct) >= 0.05) {
+    parts.push({
+      tone: "focus",
+      text: `${pctSpec.label} is a preflop percentile filter; current board blockers make it ${covExpr.pct.toFixed(1)}% of remaining combos.`
+    });
+  }
+  if (covExpr && pctAtoms.length && !pctSpec) {
     try {
       const baseExpr = pctAtoms.join(",");
       const baseCov = previewRangeCoverage(boardText, variant, baseExpr);
@@ -216,6 +247,89 @@ function renderLiveInfo(node, parts) {
     node.appendChild(span);
   }
   node.style.display = "";
+}
+
+function initLiveInfoWorker() {
+  if (typeof Worker === "undefined") return;
+  try {
+    const worker = new Worker(new URL("./live-info-worker.js", import.meta.url), { type: "module" });
+    worker.onmessage = (event) => {
+      const msg = event.data;
+      if (!msg || msg.type !== "range-live-info-result") return;
+      const playerIndex = Number(msg.playerIndex);
+      const requestId = Number(msg.requestId);
+      if (liveInfoState.latestRequestByPlayer.get(playerIndex) !== requestId) return;
+      const node = liveInfoState.nodeByPlayer.get(playerIndex);
+      if (!node) return;
+      renderLiveInfo(node, Array.isArray(msg.parts) ? msg.parts : []);
+    };
+    worker.onerror = () => {
+      worker.terminate();
+      liveInfoState.worker = null;
+    };
+    liveInfoState.worker = worker;
+  } catch {
+    liveInfoState.worker = null;
+  }
+}
+
+function pruneLiveInfoState() {
+  const maxPlayers = state.players.length;
+  for (const [idx, timer] of liveInfoState.timers.entries()) {
+    if (idx >= maxPlayers) {
+      clearTimeout(timer);
+      liveInfoState.timers.delete(idx);
+    }
+  }
+  for (const idx of liveInfoState.latestRequestByPlayer.keys()) {
+    if (idx >= maxPlayers) liveInfoState.latestRequestByPlayer.delete(idx);
+  }
+  for (const idx of liveInfoState.contextByPlayer.keys()) {
+    if (idx >= maxPlayers) liveInfoState.contextByPlayer.delete(idx);
+  }
+}
+
+function dispatchLiveInfoUpdate(playerIndex) {
+  liveInfoState.timers.delete(playerIndex);
+  const ctx = liveInfoState.contextByPlayer.get(playerIndex);
+  const node = liveInfoState.nodeByPlayer.get(playerIndex);
+  if (!ctx || !node) return;
+
+  const requestId = ++liveInfoState.requestSeq;
+  liveInfoState.latestRequestByPlayer.set(playerIndex, requestId);
+
+  if (liveInfoState.worker) {
+    liveInfoState.worker.postMessage({
+      type: "range-live-info",
+      playerIndex,
+      requestId,
+      boardText: ctx.boardText,
+      variant: ctx.variant,
+      rangeText: ctx.rangeText
+    });
+    return;
+  }
+
+  setTimeout(() => {
+    if (liveInfoState.latestRequestByPlayer.get(playerIndex) !== requestId) return;
+    const parts = rangeLiveInfo(ctx.rangeText, ctx.boardText, ctx.variant);
+    const latestNode = liveInfoState.nodeByPlayer.get(playerIndex);
+    if (!latestNode) return;
+    renderLiveInfo(latestNode, parts);
+  }, 0);
+}
+
+function queueLiveInfoUpdate(playerIndex, rangeText, immediate = false) {
+  liveInfoState.contextByPlayer.set(playerIndex, {
+    rangeText: String(rangeText || ""),
+    boardText: el.board.value.trim(),
+    variant: el.variant.value
+  });
+  const prevTimer = liveInfoState.timers.get(playerIndex);
+  if (prevTimer) clearTimeout(prevTimer);
+  const delay = immediate ? 0 : 180;
+  const timer = setTimeout(() => dispatchLiveInfoUpdate(playerIndex), delay);
+  liveInfoState.timers.set(playerIndex, timer);
 }
 
 function saveLocal() {
@@ -343,6 +457,7 @@ function buildRangeCoverageSnapshot(config) {
 
 function renderPlayers() {
   el.players.innerHTML = "";
+  liveInfoState.nodeByPlayer.clear();
   const results = state.lastResult?.players || [];
 
   state.players.forEach((p, i) => {
@@ -392,21 +507,22 @@ function renderPlayers() {
     const info = document.createElement("div");
     info.className = "player-live-note";
     row.appendChild(info);
-    const refreshDerived = () => {
+    liveInfoState.nodeByPlayer.set(i, info);
+    const refreshDerived = (immediate = false) => {
       const h = rangeTagHints(p.range, el.variant.value);
       hint.classList.toggle("is-empty", !h);
-      const live = rangeLiveInfo(p.range);
-      renderLiveInfo(info, live);
+      queueLiveInfoUpdate(i, p.range, immediate);
     };
     range.addEventListener("input", () => {
       p.range = range.value;
       saveLocal();
-      refreshDerived();
+      refreshDerived(false);
     });
-    refreshDerived();
+    refreshDerived(false);
     row.appendChild(playerOutputRow(results[i]));
     el.players.appendChild(row);
   });
+  pruneLiveInfoState();
 }
 
 function currentConfig() {
@@ -584,9 +700,13 @@ function wire() {
 }
 
 loadLocal();
+initLiveInfoWorker();
 renderQuickPicks();
 renderSummary(state.lastResult);
 renderPlayers();
 wire();
+window.addEventListener("beforeunload", () => {
+  if (liveInfoState.worker) liveInfoState.worker.terminate();
+});
 el.stop.disabled = true;
 setStatus("Idle.");
