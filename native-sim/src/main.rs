@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::io::{self, Read};
 
 use anyhow::{Context, Result};
@@ -10,6 +9,8 @@ use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use serde::{Deserialize, Serialize};
 
+type ChooseTable = [[usize; 7]; 53];
+
 #[derive(Debug, Deserialize)]
 struct Request {
     variant: String,
@@ -19,6 +20,9 @@ struct Request {
     players: Vec<PlayerReq>,
     workers: Option<usize>,
     seed: Option<u64>,
+    confidence_target_pct: Option<f64>,
+    confidence_min_iters: Option<usize>,
+    confidence_level: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,6 +50,9 @@ struct RawOut {
     combo_counts: Vec<usize>,
     combo_lists: Vec<Vec<String>>,
     class_counts: Vec<Vec<usize>>,
+    confidence_reached: bool,
+    confidence_half_width_pct: f64,
+    confidence_level: f64,
 }
 
 #[derive(Clone)]
@@ -54,14 +61,65 @@ enum Sampler {
     Pool { hand_size: usize, pool: Vec<Vec<u8>> },
 }
 
+struct ComboSet {
+    bits: Vec<u64>,
+    seen: usize,
+}
+
+impl ComboSet {
+    fn new(total_space: usize) -> Self {
+        let words = (total_space + 63) / 64;
+        Self {
+            bits: vec![0u64; words],
+            seen: 0,
+        }
+    }
+
+    fn insert_index(&mut self, idx: usize) {
+        let word = idx >> 6;
+        let bit = idx & 63;
+        let mask = 1u64 << bit;
+        let cur = self.bits[word];
+        if (cur & mask) == 0 {
+            self.bits[word] = cur | mask;
+            self.seen += 1;
+        }
+    }
+
+    fn merge_from(&mut self, other: &ComboSet) {
+        for i in 0..self.bits.len() {
+            let before = self.bits[i];
+            let merged = before | other.bits[i];
+            if merged != before {
+                self.seen += (merged ^ before).count_ones() as usize;
+                self.bits[i] = merged;
+            }
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.seen
+    }
+}
+
 struct Partial {
     iterations: usize,
     wins: Vec<usize>,
     ties: Vec<usize>,
     losses: Vec<usize>,
     equity_shares: Vec<f64>,
-    combo_lists: Vec<HashSet<u64>>,
+    equity_squares: Vec<f64>,
+    combo_sets: Vec<ComboSet>,
     class_counts: Vec<Vec<usize>>,
+}
+
+#[derive(Clone, Copy)]
+struct ConfidenceCfg {
+    enabled: bool,
+    target_pct: f64,
+    min_iters: usize,
+    level: f64,
+    z: f64,
 }
 
 fn main() {
@@ -87,6 +145,9 @@ fn real_main() -> Result<()> {
     let samplers = build_samplers(&req)?;
     let workers = choose_workers(req.workers, req.iteration_cap);
     let seed = req.seed.unwrap_or(0x9E37_79B9_A5A5_1234);
+    let conf = confidence_cfg(&req);
+    let choose = build_choose_table();
+    let combo_space = choose[52][variant_hand_size(&req.variant)];
     let start = std::time::Instant::now();
 
     let thread_pool = ThreadPoolBuilder::new()
@@ -94,31 +155,82 @@ fn real_main() -> Result<()> {
         .build()
         .context("failed to build rayon thread pool")?;
 
-    let parts = split_iterations(req.iteration_cap, workers);
-    let partials: Vec<Partial> = thread_pool.install(|| {
-        parts
-            .into_par_iter()
-            .enumerate()
-            .map(|(idx, iters)| simulate_partition(&req, &samplers, iters, seed.wrapping_add((idx as u64 + 1) * 0x9E37_79B9_7F4A_7C15)))
-            .collect()
-    });
+    let pcount = req.players.len();
+    let mut total = new_partial(pcount, combo_space);
+    let mut remaining = req.iteration_cap;
+    let mut round = 0usize;
+    let round_iters = choose_round_iters(req.iteration_cap, workers, conf.enabled);
 
-    let merged = merge_partials(partials);
+    while remaining > 0 {
+        let run_now = if conf.enabled {
+            remaining.min(round_iters)
+        } else {
+            remaining
+        };
+        if run_now == 0 {
+            break;
+        }
+
+        let parts = split_iterations(run_now, workers);
+        let partials: Vec<Partial> = thread_pool.install(|| {
+            parts
+                .into_par_iter()
+                .enumerate()
+                .map(|(idx, iters)| {
+                    let worker_seed = seed
+                        .wrapping_add(((idx as u64) + 1) * 0x9E37_79B9_7F4A_7C15)
+                        .wrapping_add((round as u64) * 0xBF58_476D_1CE4_E5B9);
+                    simulate_partition(&req, &samplers, iters, worker_seed, &choose, combo_space)
+                })
+                .collect()
+        });
+
+        for part in partials {
+            merge_in_place(&mut total, part);
+        }
+
+        if total.iterations == 0 {
+            break;
+        }
+
+        remaining = remaining.saturating_sub(run_now);
+        round = round.wrapping_add(1);
+
+        if conf.enabled {
+            let (done, _) = confidence_reached(&total, conf);
+            if done {
+                break;
+            }
+        }
+    }
+
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let (_, max_half_width_pct) = confidence_reached(&total, conf);
+    let confidence_reached_now = conf.enabled
+        && total.iterations >= conf.min_iters
+        && max_half_width_pct.is_finite()
+        && max_half_width_pct <= conf.target_pct;
 
     let out = Response {
         ok: true,
         error: None,
         raw: Some(RawOut {
-            iterations: merged.iterations,
+            iterations: total.iterations,
             elapsed_ms,
-            wins: merged.wins,
-            ties: merged.ties,
-            losses: merged.losses,
-            equity_shares: merged.equity_shares,
-            combo_counts: merged.combo_lists.iter().map(|s| s.len()).collect(),
-            combo_lists: (0..merged.combo_lists.len()).map(|_| Vec::new()).collect(),
-            class_counts: merged.class_counts,
+            wins: total.wins,
+            ties: total.ties,
+            losses: total.losses,
+            equity_shares: total.equity_shares,
+            combo_counts: total.combo_sets.iter().map(ComboSet::count).collect(),
+            combo_lists: (0..pcount).map(|_| Vec::new()).collect(),
+            class_counts: total.class_counts,
+            confidence_reached: confidence_reached_now,
+            confidence_half_width_pct: if max_half_width_pct.is_finite() {
+                max_half_width_pct
+            } else {
+                0.0
+            },
+            confidence_level: conf.level,
         }),
     };
     serde_json::to_writer(io::stdout(), &out).context("failed to write output json")?;
@@ -170,7 +282,7 @@ fn variant_hand_size(variant: &str) -> usize {
     }
 }
 
-fn choose_workers(requested: Option<usize>, iteration_cap: usize) -> usize {
+fn choose_workers(requested: Option<usize>, _iteration_cap: usize) -> usize {
     let mut workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
@@ -179,7 +291,6 @@ fn choose_workers(requested: Option<usize>, iteration_cap: usize) -> usize {
             workers = workers.min(r);
         }
     }
-    let _ = iteration_cap;
     workers.max(1)
 }
 
@@ -189,6 +300,46 @@ fn split_iterations(total: usize, workers: usize) -> Vec<usize> {
         *slot += 1;
     }
     out
+}
+
+fn choose_round_iters(iteration_cap: usize, workers: usize, confidence_enabled: bool) -> usize {
+    if !confidence_enabled {
+        return iteration_cap;
+    }
+    let base = workers.saturating_mul(25_000).max(workers);
+    base.min(iteration_cap)
+}
+
+fn confidence_cfg(req: &Request) -> ConfidenceCfg {
+    let target = req.confidence_target_pct.unwrap_or(0.0);
+    let enabled = target > 0.0;
+    let level = req.confidence_level.unwrap_or(0.95).clamp(0.80, 0.999);
+    let z = z_for_level(level);
+    let min_iters = req.confidence_min_iters.unwrap_or(25_000).max(1);
+
+    ConfidenceCfg {
+        enabled,
+        target_pct: target,
+        min_iters,
+        level,
+        z,
+    }
+}
+
+fn z_for_level(level: f64) -> f64 {
+    if level >= 0.995 {
+        2.807_034
+    } else if level >= 0.99 {
+        2.575_829
+    } else if level >= 0.98 {
+        2.326_348
+    } else if level >= 0.95 {
+        1.959_964
+    } else if level >= 0.90 {
+        1.644_854
+    } else {
+        1.281_552
+    }
 }
 
 fn build_samplers(req: &Request) -> Result<Vec<Sampler>> {
@@ -218,22 +369,24 @@ fn build_samplers(req: &Request) -> Result<Vec<Sampler>> {
                 if pool.is_empty() {
                     anyhow::bail!("player {} pool is empty", i + 1);
                 }
-                for hand in &pool {
+                for hand in &mut pool {
                     if hand.len() != p.hand_size {
                         anyhow::bail!("player {} pool hand has wrong size", i + 1);
                     }
-                    let mut seen = [false; 52];
-                    for &c in hand {
+                    hand.sort_unstable();
+                    let mut prev = None;
+                    for &c in hand.iter() {
                         if c > 51 {
                             anyhow::bail!("player {} pool hand has invalid card", i + 1);
                         }
-                        let idx = c as usize;
-                        if seen[idx] {
+                        if prev == Some(c) {
                             anyhow::bail!("player {} pool hand has duplicate card", i + 1);
                         }
-                        seen[idx] = true;
+                        prev = Some(c);
                     }
                 }
+                pool.sort_unstable();
+                pool.dedup();
                 pool.shrink_to_fit();
                 Ok(Sampler::Pool {
                     hand_size: p.hand_size,
@@ -246,23 +399,37 @@ fn build_samplers(req: &Request) -> Result<Vec<Sampler>> {
         .collect()
 }
 
-fn simulate_partition(req: &Request, samplers: &[Sampler], iter_cap: usize, seed: u64) -> Partial {
-    let pcount = req.players.len();
-    let mut out = Partial {
+fn new_partial(pcount: usize, combo_space: usize) -> Partial {
+    Partial {
         iterations: 0,
         wins: vec![0; pcount],
         ties: vec![0; pcount],
         losses: vec![0; pcount],
         equity_shares: vec![0.0; pcount],
-        combo_lists: (0..pcount).map(|_| HashSet::new()).collect(),
+        equity_squares: vec![0.0; pcount],
+        combo_sets: (0..pcount).map(|_| ComboSet::new(combo_space)).collect(),
         class_counts: (0..pcount).map(|_| vec![0; 9]).collect(),
-    };
+    }
+}
+
+fn simulate_partition(
+    req: &Request,
+    samplers: &[Sampler],
+    iter_cap: usize,
+    seed: u64,
+    choose: &ChooseTable,
+    combo_space: usize,
+) -> Partial {
+    let pcount = req.players.len();
+    let mut out = new_partial(pcount, combo_space);
 
     let mut rng = StdRng::seed_from_u64(seed);
     let mut blocked = [false; 52];
     for &c in req.board.iter().chain(req.dead.iter()) {
         blocked[c as usize] = true;
     }
+
+    let is_holdem = req.variant == "holdem";
 
     let mut used = [false; 52];
     let mut board5 = [0u8; 5];
@@ -272,7 +439,6 @@ fn simulate_partition(req: &Request, samplers: &[Sampler], iter_cap: usize, seed
     }
     let mut hand_buf: Vec<Vec<u8>> = samplers.iter().map(|s| vec![0u8; sampler_hand_size(s)]).collect();
     let mut score_buf = vec![0u16; pcount];
-    let mut class_buf = vec![0usize; pcount];
     let mut winners = vec![false; pcount];
 
     for _ in 0..iter_cap {
@@ -292,7 +458,7 @@ fn simulate_partition(req: &Request, samplers: &[Sampler], iter_cap: usize, seed
             for &c in hand.iter() {
                 used[c as usize] = true;
             }
-            out.combo_lists[pi].insert(combo_key(hand));
+            out.combo_sets[pi].insert_index(combo_rank_52(hand, choose));
         }
         if failed {
             continue;
@@ -302,15 +468,21 @@ fn simulate_partition(req: &Request, samplers: &[Sampler], iter_cap: usize, seed
             continue;
         }
 
+        let mut board_hand = Hand::new();
+        if !is_holdem {
+            for &c in &board5 {
+                board_hand.insert_unchecked(&CARDS[c as usize]);
+            }
+        }
+
         for pi in 0..pcount {
             let hand = &hand_buf[pi];
-            let (score, class_id) = match req.variant.as_str() {
-                "holdem" => eval_holdem(hand, &board5),
-                "plo4" | "plo5" | "plo6" => eval_omaha(hand, &board5),
-                _ => (0, 0),
+            let (score, class_id) = if is_holdem {
+                eval_holdem(hand, &board5)
+            } else {
+                eval_omaha_with_board(hand, &board_hand)
             };
             score_buf[pi] = score;
-            class_buf[pi] = class_id;
             out.class_counts[pi][class_id] += 1;
         }
 
@@ -328,16 +500,19 @@ fn simulate_partition(req: &Request, samplers: &[Sampler], iter_cap: usize, seed
         }
 
         for i in 0..pcount {
-            if winners[i] {
+            let share = if winners[i] {
                 if winner_count == 1 {
                     out.wins[i] += 1;
                 } else {
                     out.ties[i] += 1;
                 }
-                out.equity_shares[i] += 1.0 / winner_count as f64;
+                1.0 / winner_count as f64
             } else {
                 out.losses[i] += 1;
-            }
+                0.0
+            };
+            out.equity_shares[i] += share;
+            out.equity_squares[i] += share * share;
         }
         out.iterations += 1;
     }
@@ -345,35 +520,46 @@ fn simulate_partition(req: &Request, samplers: &[Sampler], iter_cap: usize, seed
     out
 }
 
-fn merge_partials(parts: Vec<Partial>) -> Partial {
-    let mut it = parts.into_iter();
-    let Some(mut out) = it.next() else {
-        return Partial {
-            iterations: 0,
-            wins: vec![],
-            ties: vec![],
-            losses: vec![],
-            equity_shares: vec![],
-            combo_lists: vec![],
-            class_counts: vec![],
-        };
-    };
-    for p in it {
-        out.iterations += p.iterations;
-        for i in 0..out.wins.len() {
-            out.wins[i] += p.wins[i];
-            out.ties[i] += p.ties[i];
-            out.losses[i] += p.losses[i];
-            out.equity_shares[i] += p.equity_shares[i];
-            for c in 0..9 {
-                out.class_counts[i][c] += p.class_counts[i][c];
-            }
-            for k in p.combo_lists[i].iter() {
-                out.combo_lists[i].insert(*k);
-            }
+fn merge_in_place(out: &mut Partial, p: Partial) {
+    out.iterations += p.iterations;
+    for i in 0..out.wins.len() {
+        out.wins[i] += p.wins[i];
+        out.ties[i] += p.ties[i];
+        out.losses[i] += p.losses[i];
+        out.equity_shares[i] += p.equity_shares[i];
+        out.equity_squares[i] += p.equity_squares[i];
+        for c in 0..9 {
+            out.class_counts[i][c] += p.class_counts[i][c];
+        }
+        out.combo_sets[i].merge_from(&p.combo_sets[i]);
+    }
+}
+
+fn confidence_reached(total: &Partial, cfg: ConfidenceCfg) -> (bool, f64) {
+    if !cfg.enabled {
+        return (false, f64::INFINITY);
+    }
+    if total.iterations < cfg.min_iters || total.iterations < 2 {
+        return (false, f64::INFINITY);
+    }
+
+    let n = total.iterations as f64;
+    let mut max_half = 0.0f64;
+
+    for i in 0..total.equity_shares.len() {
+        let sum = total.equity_shares[i];
+        let sq = total.equity_squares[i];
+        let mean = sum / n;
+        let var_num = sq - (n * mean * mean);
+        let sample_var = (var_num / (n - 1.0)).max(0.0);
+        let se = (sample_var / n).sqrt();
+        let half = cfg.z * se * 100.0;
+        if half > max_half {
+            max_half = half;
         }
     }
-    out
+
+    (max_half <= cfg.target_pct, max_half)
 }
 
 fn sampler_hand_size(s: &Sampler) -> usize {
@@ -473,16 +659,12 @@ fn eval_holdem(hole: &[u8], board5: &[u8; 5]) -> (u16, usize) {
     (rank.0, class_id(rank.rank_category()))
 }
 
-fn eval_omaha(hole: &[u8], board5: &[u8; 5]) -> (u16, usize) {
+fn eval_omaha_with_board(hole: &[u8], board_hand: &Hand) -> (u16, usize) {
     let mut hole_hand = Hand::new();
     for &c in hole {
         hole_hand.insert_unchecked(&CARDS[c as usize]);
     }
-    let mut board_hand = Hand::new();
-    for &c in board5 {
-        board_hand.insert_unchecked(&CARDS[c as usize]);
-    }
-    let rank = omaha_rank(&hole_hand, &board_hand);
+    let rank = omaha_rank(&hole_hand, board_hand);
     (rank.0, class_id(rank.rank_category()))
 }
 
@@ -501,10 +683,33 @@ fn class_id(cat: PokerRankCategory) -> usize {
     }
 }
 
-fn combo_key(cards: &[u8]) -> u64 {
-    let mut key = (cards.len() as u64) << 60;
-    for (i, &c) in cards.iter().enumerate() {
-        key |= (c as u64) << (i * 6);
+fn build_choose_table() -> ChooseTable {
+    let mut table = [[0usize; 7]; 53];
+    for n in 0..=52 {
+        table[n][0] = 1;
+        for k in 1..=6 {
+            if k > n {
+                table[n][k] = 0;
+            } else if k == n {
+                table[n][k] = 1;
+            } else {
+                table[n][k] = table[n - 1][k - 1] + table[n - 1][k];
+            }
+        }
     }
-    key
+    table
+}
+
+fn combo_rank_52(cards: &[u8], choose: &ChooseTable) -> usize {
+    let k = cards.len();
+    let mut rank = 0usize;
+    let mut start = 0usize;
+    for i in 0..k {
+        let ci = cards[i] as usize;
+        for v in start..ci {
+            rank += choose[52 - (v + 1)][k - i - 1];
+        }
+        start = ci + 1;
+    }
+    rank
 }

@@ -16,6 +16,7 @@ let runAbortController = null;
 const el = {
   variant: document.querySelector("#variant"),
   iterationCap: document.querySelector("#iterationCap"),
+  precision: document.querySelector("#precision"),
   board: document.querySelector("#board"),
   dead: document.querySelector("#dead"),
   addPlayer: document.querySelector("#addPlayer"),
@@ -221,6 +222,7 @@ function saveLocal() {
   localStorage.setItem("poker-odds-lab-state", JSON.stringify({
     variant: el.variant.value,
     iterationCap: el.iterationCap.value,
+    precision: el.precision?.value || "cap",
     board: el.board.value,
     dead: el.dead.value,
     players: state.players
@@ -234,6 +236,7 @@ function loadLocal() {
     const s = JSON.parse(raw);
     el.variant.value = s.variant || "holdem";
     el.iterationCap.value = s.iterationCap || "150000";
+    if (el.precision) el.precision.value = s.precision || "cap";
     el.board.value = s.board || "";
     el.dead.value = s.dead || "";
     if (Array.isArray(s.players) && s.players.length >= 2) {
@@ -295,7 +298,13 @@ function renderSummary(result) {
       extra = ` • prep ${(prep / 1000).toFixed(2)}s • sim ${(sim / 1000).toFixed(2)}s`;
     }
   }
-  el.runSummary.textContent = `${result.iterations.toLocaleString()} iterations in ${total}s • ${result.variant.toUpperCase()} • ${String(result.method || "monte").toUpperCase()} • ${engine}${extra}`;
+  let confText = "";
+  if (Number(result.confidenceLevel) > 0 && Number.isFinite(Number(result.confidenceHalfWidthPct))) {
+    const level = Math.round(Number(result.confidenceLevel) * 100);
+    const half = Number(result.confidenceHalfWidthPct);
+    confText = ` • CI${level} ±${half.toFixed(3)}%${result.confidenceReached ? " reached" : ""}`;
+  }
+  el.runSummary.textContent = `${result.iterations.toLocaleString()} iterations in ${total}s • ${result.variant.toUpperCase()} • ${String(result.method || "monte").toUpperCase()} • ${engine}${extra}${confText}`;
 }
 
 function playerOutputRow(row) {
@@ -389,9 +398,20 @@ function renderPlayers() {
 }
 
 function currentConfig() {
+  const iterCap = Number(el.iterationCap.value || 150000);
+  const preset = String(el.precision?.value || "cap");
+  const conf = (() => {
+    if (preset === "ci20") return { target: 0.2, min: 25000 };
+    if (preset === "ci10") return { target: 0.1, min: 60000 };
+    if (preset === "ci05") return { target: 0.05, min: 120000 };
+    return null;
+  })();
   return {
     variant: el.variant.value,
-    iterationCap: Number(el.iterationCap.value || 150000),
+    iterationCap: iterCap,
+    confidenceTargetPct: conf ? conf.target : 0,
+    confidenceMinIterations: conf ? Math.max(1, Math.min(iterCap, conf.min)) : 0,
+    confidenceLevel: conf ? 0.95 : 0,
     board: el.board.value.trim(),
     dead: el.dead.value.trim(),
     players: state.players.map((p, i) => ({
@@ -424,10 +444,11 @@ async function run() {
     renderSummary(result);
     renderPlayers();
     const avgIps = result.iterations / Math.max(0.001, result.elapsedMs / 1000);
+    const ciSuffix = result.confidenceReached ? " CI target reached." : "";
     if (result.aborted || controller.signal.aborted) {
       setStatus(`Stopped at ${result.iterations.toLocaleString()} iterations in ${(result.elapsedMs / 1000).toFixed(2)}s (${Math.round(avgIps).toLocaleString()} it/s avg).`);
     } else {
-      setStatus(`Done. ${result.iterations.toLocaleString()} iterations in ${(result.elapsedMs / 1000).toFixed(2)}s (${Math.round(avgIps).toLocaleString()} it/s avg).`);
+      setStatus(`Done. ${result.iterations.toLocaleString()} iterations in ${(result.elapsedMs / 1000).toFixed(2)}s (${Math.round(avgIps).toLocaleString()} it/s avg).${ciSuffix}`);
     }
   } catch (err) {
     if (runAbortController?.signal?.aborted || err?.name === "AbortError") setStatus("Stopped.");
@@ -538,7 +559,8 @@ function wire() {
     el.importFile.value = "";
   });
 
-  [el.variant, el.iterationCap, el.board, el.dead].forEach((node) => {
+  [el.variant, el.iterationCap, el.precision, el.board, el.dead].forEach((node) => {
+    if (!node) return;
     node.addEventListener("input", saveLocal);
   });
   el.variant.addEventListener("change", () => {

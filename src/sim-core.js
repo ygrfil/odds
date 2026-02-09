@@ -865,7 +865,20 @@ function sampleFromPool(pool, usedFlags, rng) {
 }
 
 export function rawToResult(raw, config) {
-  const { iterations: it, elapsedMs, wins, ties, losses, comboLists, classCounts, equityShares, comboCounts } = raw;
+  const {
+    iterations: it,
+    elapsedMs,
+    wins,
+    ties,
+    losses,
+    comboLists,
+    classCounts,
+    equityShares,
+    comboCounts,
+    confidenceReached,
+    confidenceHalfWidthPct,
+    confidenceLevel
+  } = raw;
   const players = config.players;
   const n = players.length;
   const rows = players.map((p, i) => {
@@ -908,12 +921,41 @@ export function rawToResult(raw, config) {
     aborted: !!raw.aborted,
     method: raw.method || config.method || "monte",
     variant: config.variant,
+    confidenceReached: !!confidenceReached,
+    confidenceHalfWidthPct: Number(confidenceHalfWidthPct || 0),
+    confidenceLevel: Number(confidenceLevel || 0),
     players: rows,
     input: {
       board: config.board,
       dead: config.dead
     }
   };
+}
+
+function zForConfidenceLevel(level) {
+  const x = Number(level);
+  if (!Number.isFinite(x)) return 1.959964;
+  if (x >= 0.995) return 2.807034;
+  if (x >= 0.99) return 2.575829;
+  if (x >= 0.98) return 2.326348;
+  if (x >= 0.95) return 1.959964;
+  if (x >= 0.9) return 1.644854;
+  return 1.281552;
+}
+
+function confidenceHalfWidthPct(it, shares, squares, z) {
+  if (it < 2) return Number.POSITIVE_INFINITY;
+  const n = it;
+  let maxHalf = 0;
+  for (let i = 0; i < shares.length; i++) {
+    const mean = shares[i] / n;
+    const varNum = squares[i] - n * mean * mean;
+    const sampleVar = Math.max(0, varNum / Math.max(1, n - 1));
+    const se = Math.sqrt(sampleVar / n);
+    const half = z * se * 100;
+    if (half > maxHalf) maxHalf = half;
+  }
+  return maxHalf;
 }
 
 export async function runSimulationRaw(config, options = {}) {
@@ -945,6 +987,7 @@ export async function runSimulationRaw(config, options = {}) {
   const ties = players.map(() => 0);
   const losses = players.map(() => 0);
   const equityShares = players.map(() => 0);
+  const equitySquares = players.map(() => 0);
   const comboLists = players.map(() => new Set());
   const classCounts = players.map(() => new Array(CLASS_NAMES.length).fill(0));
 
@@ -952,6 +995,13 @@ export async function runSimulationRaw(config, options = {}) {
   const capMs = Number.isFinite(options.capMs) ? options.capMs : Number.POSITIVE_INFINITY;
   const iterCapRaw = Number(options.iterCap ?? config.iterationCap ?? 100000);
   const iterCap = Number.isFinite(iterCapRaw) ? Math.max(1, Math.floor(iterCapRaw)) : 100000;
+  const confTarget = Number(options.confidenceTargetPct ?? config.confidenceTargetPct ?? 0);
+  const confEnabled = Number.isFinite(confTarget) && confTarget > 0;
+  const confMin = Math.max(1, Math.floor(Number(options.confidenceMinIterations ?? config.confidenceMinIterations ?? 25000)));
+  const confLevel = Number(options.confidenceLevel ?? config.confidenceLevel ?? 0.95);
+  const confZ = zForConfidenceLevel(confLevel);
+  let confHalfWidth = Number.POSITIVE_INFINITY;
+  let confReached = false;
 
   let it = 0;
   let loops = 0;
@@ -1055,7 +1105,9 @@ export async function runSimulationRaw(config, options = {}) {
       if (winners[i]) {
         if (winnerCount === 1) wins[i]++;
         else ties[i]++;
-        equityShares[i] += 1 / winnerCount;
+        const share = 1 / winnerCount;
+        equityShares[i] += share;
+        equitySquares[i] += share * share;
       } else {
         losses[i]++;
       }
@@ -1068,6 +1120,19 @@ export async function runSimulationRaw(config, options = {}) {
       options.onProgress({ iterations: it, elapsed, boardClass: classifyBoard(board5), ips: it / Math.max(0.001, elapsed) });
       lastProgress = performance.now();
     }
+
+    if (confEnabled && it >= confMin && (it & 1023) === 0) {
+      confHalfWidth = confidenceHalfWidthPct(it, equityShares, equitySquares, confZ);
+      if (Number.isFinite(confHalfWidth) && confHalfWidth <= confTarget) {
+        confReached = true;
+        break;
+      }
+    }
+  }
+
+  if (confEnabled && !confReached) {
+    confHalfWidth = confidenceHalfWidthPct(it, equityShares, equitySquares, confZ);
+    confReached = Number.isFinite(confHalfWidth) && it >= confMin && confHalfWidth <= confTarget;
   }
 
   return {
@@ -1077,6 +1142,9 @@ export async function runSimulationRaw(config, options = {}) {
     ties,
     losses,
     equityShares,
+    confidenceReached: confReached,
+    confidenceHalfWidthPct: Number.isFinite(confHalfWidth) ? confHalfWidth : 0,
+    confidenceLevel: confLevel,
     comboLists,
     classCounts
   };

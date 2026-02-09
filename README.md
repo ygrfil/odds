@@ -12,6 +12,7 @@ Desktop-first web app for poker equity calculations:
 - Range vs range, range vs hand (enter exact hand as range)
 - Preflop / flop / turn / river (board input 0-5 cards)
 - Stop button for manual run control
+- Optional confidence-based early stop (95% CI) with iteration cap as hard upper bound
 - Always uses maximum available browser workers automatically
 - Automatic mode selection:
   - Exhaustive (exact) when all players are exact suited hands
@@ -80,4 +81,5 @@ Notes:
 
 ## Performance notes
 - Native mode uses all available CPU cores by default.
+- Native mode supports confidence-stop and reports actual iterations completed.
 - Browser mode remains available as fallback and is slower for wide PLO range-vs-range workloads.

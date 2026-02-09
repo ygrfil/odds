@@ -23,11 +23,14 @@ type playerConfig struct {
 }
 
 type runConfig struct {
-	Variant      string         `json:"variant"`
-	IterationCap int            `json:"iterationCap"`
-	Board        string         `json:"board"`
-	Dead         string         `json:"dead"`
-	Players      []playerConfig `json:"players"`
+	Variant               string         `json:"variant"`
+	IterationCap          int            `json:"iterationCap"`
+	Board                 string         `json:"board"`
+	Dead                  string         `json:"dead"`
+	Players               []playerConfig `json:"players"`
+	ConfidenceTargetPct   float64        `json:"confidenceTargetPct,omitempty"`
+	ConfidenceMinIters    int            `json:"confidenceMinIterations,omitempty"`
+	ConfidenceLevel       float64        `json:"confidenceLevel,omitempty"`
 }
 
 type runRequest struct {

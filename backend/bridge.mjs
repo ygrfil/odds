@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import {
   runSimulationRaw,
   runExhaustiveRaw,
@@ -18,8 +19,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const NATIVE_SIM_MANIFEST = path.join(PROJECT_ROOT, "native-sim", "Cargo.toml");
 const NATIVE_SIM_BIN_DEFAULT = path.join(PROJECT_ROOT, "native-sim", "target", "release", "native-sim");
+const NATIVE_SIM_SOURCE_MAIN = path.join(PROJECT_ROOT, "native-sim", "src", "main.rs");
+const NATIVE_SIM_BUILD_STAMP = path.join(PROJECT_ROOT, "native-sim", "target", "release", ".build-stamp.json");
+const NATIVE_SIM_BUILD_STAMP_VERSION = 2;
 const PLAYER_SAMPLER_CACHE = new Map();
 const PLAYER_SAMPLER_CACHE_MAX = 48;
+const SAMPLER_CACHE_VERSION = 2;
+const SAMPLER_DISK_DIR = path.join(PROJECT_ROOT, "backend", ".cache", `samplers-v${SAMPLER_CACHE_VERSION}`);
+const SAMPLER_MAX_POOL_TO_CACHE = 30_000;
+const SAMPLER_MAX_FILE_BYTES = 14 * 1024 * 1024;
 
 function variantHandSize(variant) {
   if (variant === "holdem") return 2;
@@ -61,7 +69,10 @@ function serializeRaw(raw) {
     equityShares: raw.equityShares || [],
     comboCounts,
     comboLists,
-    classCounts: raw.classCounts || []
+    classCounts: raw.classCounts || [],
+    confidenceReached: !!raw.confidenceReached,
+    confidenceHalfWidthPct: Number(raw.confidenceHalfWidthPct || 0),
+    confidenceLevel: Number(raw.confidenceLevel || 0)
   };
 }
 
@@ -81,6 +92,45 @@ function comboKey(hand) {
   return hand.slice().sort((a, b) => a - b).join("-");
 }
 
+function hashKey(text) {
+  const h = crypto.createHash("sha256");
+  if (Buffer.isBuffer(text)) h.update(text);
+  else h.update(String(text));
+  return h.digest("hex");
+}
+
+function ensureSamplerDiskDir() {
+  try {
+    fs.mkdirSync(SAMPLER_DISK_DIR, { recursive: true });
+  } catch {
+    // ignore cache directory failures, in-memory cache still works
+  }
+}
+
+function samplerCachePath(cacheKey) {
+  return path.join(SAMPLER_DISK_DIR, `${hashKey(cacheKey)}.json`);
+}
+
+function isValidSamplerShape(obj) {
+  if (!obj || typeof obj !== "object") return false;
+  if (obj.mode === "all" && Number.isFinite(obj.hand_size) && obj.hand_size >= 2) return true;
+  if (obj.mode !== "pool") return false;
+  if (!Number.isFinite(obj.hand_size) || obj.hand_size < 2) return false;
+  if (!Array.isArray(obj.pool) || obj.pool.length === 0 || obj.pool.length > SAMPLER_MAX_POOL_TO_CACHE) return false;
+  for (let i = 0; i < obj.pool.length; i++) {
+    const hand = obj.pool[i];
+    if (!Array.isArray(hand) || hand.length !== obj.hand_size) return false;
+    let prev = -1;
+    for (let j = 0; j < hand.length; j++) {
+      const c = hand[j];
+      if (!Number.isFinite(c) || c < 0 || c > 51 || c !== Math.floor(c)) return false;
+      if (c <= prev) return false;
+      prev = c;
+    }
+  }
+  return true;
+}
+
 function getCachedSampler(key) {
   if (!PLAYER_SAMPLER_CACHE.has(key)) return null;
   const value = PLAYER_SAMPLER_CACHE.get(key);
@@ -92,13 +142,47 @@ function getCachedSampler(key) {
 function putCachedSampler(key, sampler) {
   if (!key || !sampler) return;
   // Avoid caching very large pools to keep memory bounded.
-  if (Array.isArray(sampler.pool) && sampler.pool.length > 30_000) return;
+  if (Array.isArray(sampler.pool) && sampler.pool.length > SAMPLER_MAX_POOL_TO_CACHE) return;
+  if (!isValidSamplerShape(sampler)) return;
   if (PLAYER_SAMPLER_CACHE.has(key)) PLAYER_SAMPLER_CACHE.delete(key);
   PLAYER_SAMPLER_CACHE.set(key, sampler);
   while (PLAYER_SAMPLER_CACHE.size > PLAYER_SAMPLER_CACHE_MAX) {
     const first = PLAYER_SAMPLER_CACHE.keys().next();
     if (first?.done) break;
     PLAYER_SAMPLER_CACHE.delete(first.value);
+  }
+
+  try {
+    ensureSamplerDiskDir();
+    const payload = JSON.stringify({
+      v: SAMPLER_CACHE_VERSION,
+      key,
+      createdAt: Date.now(),
+      sampler
+    });
+    if (Buffer.byteLength(payload, "utf8") > SAMPLER_MAX_FILE_BYTES) return;
+    fs.writeFileSync(samplerCachePath(key), payload, "utf8");
+  } catch {
+    // disk cache is best-effort
+  }
+}
+
+function getCachedSamplerWithDisk(key) {
+  const inMem = getCachedSampler(key);
+  if (inMem) return inMem;
+  try {
+    const p = samplerCachePath(key);
+    if (!fs.existsSync(p)) return null;
+    const text = fs.readFileSync(p, "utf8");
+    if (!text) return null;
+    const parsed = JSON.parse(text);
+    if (!parsed || parsed.v !== SAMPLER_CACHE_VERSION || parsed.key !== key) return null;
+    const sampler = parsed.sampler;
+    if (!isValidSamplerShape(sampler)) return null;
+    PLAYER_SAMPLER_CACHE.set(key, sampler);
+    return sampler;
+  } catch {
+    return null;
   }
 }
 
@@ -206,7 +290,13 @@ function maybeExpandPureTagRange(rangeText, variant, boardCards) {
   return combos.join(",");
 }
 
-function buildPlayerSampler(config, baseDeck, boardCards, player, idx, rng) {
+function cardsKey(cards, ordered = true) {
+  if (!Array.isArray(cards) || cards.length === 0) return "-";
+  const arr = ordered ? cards.slice() : cards.slice().sort((a, b) => a - b);
+  return arr.map((c) => cardToText(c)).join("");
+}
+
+function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx, rng) {
   const handSize = variantHandSize(config.variant);
   const rawRangeText = String(player.range || "*").trim() || "*";
   const rangeText = maybeExpandPureTagRange(rawRangeText, config.variant, boardCards);
@@ -225,8 +315,15 @@ function buildPlayerSampler(config, baseDeck, boardCards, player, idx, rng) {
   }
 
   const normalizedRange = rangeText.toLowerCase().replace(/\s+/g, "");
-  const cacheKey = `${config.variant}|${baseDeck.join(",")}|${normalizedRange}|${handSize}`;
-  const cached = getCachedSampler(cacheKey);
+  const cacheKey = [
+    `v${SAMPLER_CACHE_VERSION}`,
+    String(config.variant || ""),
+    `b:${cardsKey(boardCards, true)}`,
+    `d:${cardsKey(deadCards, false)}`,
+    `h:${handSize}`,
+    `r:${normalizedRange}`
+  ].join("|");
+  const cached = getCachedSamplerWithDisk(cacheKey);
   if (cached) return cached;
 
   const compiled = compileRange(rangeText, config.variant, boardCards);
@@ -321,7 +418,7 @@ function prepareNativeRequest(config, req) {
 
   const seed = Number(req.seed || 0x9e3779b9) >>> 0;
   const rng = makeRng(seed || 1);
-  const preparedPlayers = players.map((p, i) => buildPlayerSampler(config, baseDeck, board, p, i, rng));
+  const preparedPlayers = players.map((p, i) => buildPlayerSampler(config, baseDeck, board, dead, p, i, rng));
 
   return {
     variant,
@@ -330,6 +427,11 @@ function prepareNativeRequest(config, req) {
     dead,
     players: preparedPlayers,
     workers: Number.isFinite(Number(req.workers)) ? Math.max(1, Math.floor(Number(req.workers))) : undefined,
+    confidence_target_pct: Number(config.confidenceTargetPct) > 0 ? Number(config.confidenceTargetPct) : undefined,
+    confidence_min_iters: Number(config.confidenceMinIterations) > 0
+      ? Math.max(1, Math.floor(Number(config.confidenceMinIterations)))
+      : undefined,
+    confidence_level: Number(config.confidenceLevel) > 0 ? Number(config.confidenceLevel) : undefined,
     seed: Number(seed || 1)
   };
 }
@@ -364,29 +466,67 @@ async function runCommandWithJson(command, args, payload, cwd) {
 async function ensureNativeBinary() {
   const forced = process.env.NATIVE_SIM_BIN ? path.resolve(process.env.NATIVE_SIM_BIN) : "";
   const candidate = forced || NATIVE_SIM_BIN_DEFAULT;
-  if (fs.existsSync(candidate)) return candidate;
+  if (forced) return fs.existsSync(candidate) ? candidate : null;
+
+  const runCargo = async (args) => {
+    await new Promise((resolve, reject) => {
+      const child = spawn("cargo", args, {
+        cwd: PROJECT_ROOT,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      let stderr = "";
+      child.stderr.on("data", (d) => {
+        stderr += String(d);
+      });
+      child.on("error", (err) => reject(err));
+      child.on("close", (code) => {
+        if (code !== 0) {
+          reject(new Error(stderr.trim() || `cargo ${args.join(" ")} failed`));
+          return;
+        }
+        resolve();
+      });
+    });
+  };
+
+  const sourceHash = hashKey(
+    [
+      fs.existsSync(NATIVE_SIM_MANIFEST) ? fs.readFileSync(NATIVE_SIM_MANIFEST, "utf8") : "",
+      fs.existsSync(NATIVE_SIM_SOURCE_MAIN) ? fs.readFileSync(NATIVE_SIM_SOURCE_MAIN, "utf8") : ""
+    ].join("\n---\n")
+  );
+  if (fs.existsSync(candidate) && fs.existsSync(NATIVE_SIM_BUILD_STAMP)) {
+    try {
+      const stamp = JSON.parse(fs.readFileSync(NATIVE_SIM_BUILD_STAMP, "utf8"));
+      const binaryHash = hashKey(fs.readFileSync(candidate));
+      if (
+        stamp?.version === NATIVE_SIM_BUILD_STAMP_VERSION
+        && stamp?.sourceHash === sourceHash
+        && stamp?.binaryHash === binaryHash
+      ) return candidate;
+    } catch {
+      // fall through to rebuild
+    }
+  }
   if (!fs.existsSync(NATIVE_SIM_MANIFEST)) return null;
 
-  await new Promise((resolve, reject) => {
-    const child = spawn("cargo", ["build", "--release", "--manifest-path", NATIVE_SIM_MANIFEST], {
-      cwd: PROJECT_ROOT,
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-    let stderr = "";
-    child.stderr.on("data", (d) => {
-      stderr += String(d);
-    });
-    child.on("error", (err) => reject(err));
-    child.on("close", (code) => {
-      if (code !== 0) {
-        reject(new Error(stderr.trim() || "cargo build failed"));
-        return;
-      }
-      resolve();
-    });
-  });
+  // Target artifacts are tracked in this repository. A clean rebuild avoids stale fingerprint issues.
+  await runCargo(["clean", "--manifest-path", NATIVE_SIM_MANIFEST]);
+  await runCargo(["build", "--release", "--manifest-path", NATIVE_SIM_MANIFEST]);
 
   if (!fs.existsSync(candidate)) return null;
+  try {
+    const binaryHash = hashKey(fs.readFileSync(candidate));
+    fs.mkdirSync(path.dirname(NATIVE_SIM_BUILD_STAMP), { recursive: true });
+    fs.writeFileSync(NATIVE_SIM_BUILD_STAMP, JSON.stringify({
+      version: NATIVE_SIM_BUILD_STAMP_VERSION,
+      sourceHash,
+      binaryHash,
+      builtAt: Date.now()
+    }), "utf8");
+  } catch {
+    // stamp is best-effort
+  }
   return candidate;
 }
 
@@ -400,7 +540,10 @@ function mapNativeRaw(nativeRaw) {
     equityShares: nativeRaw?.equity_shares || [],
     comboCounts: nativeRaw?.combo_counts || [],
     comboLists: nativeRaw?.combo_lists || [],
-    classCounts: nativeRaw?.class_counts || []
+    classCounts: nativeRaw?.class_counts || [],
+    confidenceReached: !!nativeRaw?.confidence_reached,
+    confidenceHalfWidthPct: Number(nativeRaw?.confidence_half_width_pct || 0),
+    confidenceLevel: Number(nativeRaw?.confidence_level || 0)
   };
 }
 

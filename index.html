@@ -31,6 +31,15 @@
             Iteration cap
             <input id="iterationCap" type="number" min="500" max="5000000" step="500" value="150000" />
           </label>
+          <label>
+            Precision stop
+            <select id="precision">
+              <option value="cap">Cap only</option>
+              <option value="ci20">CI95 ±0.20%</option>
+              <option value="ci10">CI95 ±0.10%</option>
+              <option value="ci05">CI95 ±0.05%</option>
+            </select>
+          </label>
           <div class="spacer"></div>
           <button id="helpOpen" type="button">Help</button>
         </div>
@@ -124,7 +133,7 @@
               <li><code>@sd13</code> accepted as legacy alias of <code>@sd12</code></li>
               <li><code>@flush</code> made flush now</li>
               <li><code>@straight</code> made straight now</li>
-              <li><code>@tpplus</code> pair or better now</li>
+              <li><code>@tpplus</code> top pair or better now</li>
               <li><code>@overpair</code> hold'em only pocket overpair vs board</li>
             </ul>
 
