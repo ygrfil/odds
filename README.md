@@ -55,6 +55,18 @@ Open:
 
 In this mode, calculations run fully in the browser.
 
+Rebuild PLO4/PLO5 true-equity percentile tables (native Monte Carlo vs random hand):
+
+```bash
+node scripts/precompute-percentiles-equity.mjs --variants=plo4,plo5 --iterations=500000000
+```
+
+Legacy heuristic-only precompute (faster, less accurate for `%`):
+
+```bash
+node scripts/precompute-percentiles.mjs plo4,plo5
+```
+
 ## Native backend API
 - `GET /api/health`
 - `POST /api/sim/run`
@@ -71,11 +83,13 @@ Implemented:
 - Weighted atoms (`@N`)
 - Core macros: `$s`, `$o`, `$ds`, `$ss`, `$np`, `$op`, `$tp`, `$nt`, `$B`, `$M`, `$Z`, `$L`, `$N`, `$F`, `$R`, `$W`, `$0g`, `$1g`, `$2g`
 - Simple spans and `+`/`-` rank progression forms
-- Percentile forms (`15%`, `30%-50%`) via fast heuristic strength model
+- Percentile forms (`15%`, `30%-50%`)
+- PLO4/PLO5 `%` ranges use precomputed true-equity-vs-random top-% cutoffs (Monte Carlo native precompute, deterministic exact-by-count selection, 0.001% resolution)
 
 Notes:
 - This is a practical compatibility engine for PPT-like workflows, not a byte-for-byte PPT parser clone yet.
-- Percentile ranges are heuristic in v1 (not PPT exact percentile tables).
+- PLO4/PLO5 true-equity tables are Monte Carlo estimates (not exhaustive exact equities).
+- Hold'em/PLO6 percentiles currently use sampled heuristic fallback unless you precompute dedicated true-equity tables for them.
 - Stud-specific syntax (`|` streets) is not included because this app targets Hold'em/PLO only.
 - Exhaustive auto-mode requires exact suited hands for all players (e.g. `AsKdQsTd`). It is mathematically exact for those inputs.
 

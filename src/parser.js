@@ -1,4 +1,5 @@
 import { RANKS, SUITS, rankOf, suitOf } from "./cards.js";
+import { PRECOMPUTED_PERCENTILE_TABLES } from "./percentile-tables.js";
 
 const RANK_ORDER = [...RANKS];
 const ALL_RANKS = new Set(RANK_ORDER);
@@ -31,6 +32,79 @@ const SUIT_VARS = new Set(["x", "y", "z", "w"]);
 const CATEGORY_TAGS = new Set(["@set", "@2p", "@fd", "@sd", "@sd4", "@sd8", "@sd12", "@sd13", "@flush", "@straight", "@tpplus", "@overpair"]);
 
 const percentileCache = new Map();
+const CHOOSE_52 = buildChooseTable52();
+
+function buildChooseTable52() {
+  const t = Array.from({ length: 53 }, () => new Array(7).fill(0));
+  for (let n = 0; n <= 52; n++) {
+    t[n][0] = 1;
+    for (let k = 1; k <= 6; k++) {
+      if (k > n) t[n][k] = 0;
+      else if (k === n) t[n][k] = 1;
+      else t[n][k] = t[n - 1][k - 1] + t[n - 1][k];
+    }
+  }
+  return t;
+}
+
+function comboRank52(handCards) {
+  const cards = handCards.slice().sort((a, b) => a - b);
+  const k = cards.length;
+  let rank = 0;
+  let start = 0;
+  for (let i = 0; i < k; i++) {
+    const ci = cards[i];
+    for (let v = start; v < ci; v++) {
+      rank += CHOOSE_52[52 - (v + 1)][k - i - 1];
+    }
+    start = ci + 1;
+  }
+  return rank;
+}
+
+function heuristicScoreKey(hand, variant) {
+  return Math.round(evaluateHeuristic(hand, variant) * 10);
+}
+
+function exactPercentileTable(variant) {
+  const pre = PRECOMPUTED_PERCENTILE_TABLES?.[variant];
+  if (!pre) return null;
+  const basis = Number(pre.basis || 0);
+  const sampleSize = Number(pre.sampleSize || 0);
+  if (!(basis > 0) || !(sampleSize > 0)) return null;
+  const steps = 100 * basis;
+  if (!Array.isArray(pre.topScoreKeys) || !Array.isArray(pre.topRanks)) return null;
+  if (pre.topScoreKeys.length < steps + 1 || pre.topRanks.length < steps + 1) return null;
+  const scoreKeysByComboRank = Array.isArray(pre.scoreKeysByComboRank)
+    && pre.scoreKeysByComboRank.length >= sampleSize
+    ? pre.scoreKeysByComboRank
+    : null;
+  return {
+    basis,
+    steps,
+    sampleSize,
+    topScoreKeys: pre.topScoreKeys,
+    topRanks: pre.topRanks,
+    scoreKeysByComboRank
+  };
+}
+
+function inTopExactByPercent(table, variant, p, hand) {
+  const clampedP = Math.max(0, Math.min(100, Number(p)));
+  const idx = Math.max(0, Math.min(table.steps, Math.round(clampedP * table.basis)));
+  const count = Math.floor((idx / table.steps) * table.sampleSize);
+  if (count <= 0) return false;
+  if (count >= table.sampleSize) return true;
+  const bScore = table.topScoreKeys[idx];
+  const bRank = Number(table.topRanks[idx]);
+  const hRank = comboRank52(hand);
+  const sKey = table.scoreKeysByComboRank
+    ? Number(table.scoreKeysByComboRank[hRank] ?? 0)
+    : heuristicScoreKey(hand, variant);
+  if (sKey > bScore) return true;
+  if (sKey < bScore) return false;
+  return hRank <= bRank;
+}
 
 function stripSpaces(s) {
   return s.replace(/\s+/g, "").replaceAll("&", ":");
@@ -288,7 +362,7 @@ function expandSpan(atom) {
   return [atom];
 }
 
-function evaluateHeuristic(hand, variant) {
+export function evaluateHeuristic(hand, variant) {
   const ranks = hand.map(rankOf).sort((a, b) => b - a);
   const suits = hand.map(suitOf);
   const counts = new Map();
@@ -323,6 +397,19 @@ function evaluateHeuristic(hand, variant) {
 }
 
 function percentileThreshold(variant, p) {
+  const clampedP = Math.max(0, Math.min(100, Number(p)));
+  const pre = PRECOMPUTED_PERCENTILE_TABLES?.[variant];
+  if (pre && Array.isArray(pre.thresholds) && pre.thresholds.length) {
+    const basis = Number(pre.basis || 100);
+    const pos = clampedP * basis;
+    const maxIdx = pre.thresholds.length - 1;
+    const lo = Math.max(0, Math.min(maxIdx, Math.floor(pos)));
+    const hi = Math.max(0, Math.min(maxIdx, Math.ceil(pos)));
+    if (lo === hi) return pre.thresholds[lo];
+    const w = pos - Math.floor(pos);
+    return pre.thresholds[lo] * (1 - w) + pre.thresholds[hi] * w;
+  }
+
   const key = `${variant}`;
   if (!percentileCache.has(key)) {
     const handSize = variant === "holdem" ? 2 : variant === "plo4" ? 4 : variant === "plo5" ? 5 : 6;
@@ -341,7 +428,7 @@ function percentileThreshold(variant, p) {
     percentileCache.set(key, sample);
   }
   const arr = percentileCache.get(key);
-  const idx = Math.max(0, Math.min(arr.length - 1, Math.floor((p / 100) * arr.length)));
+  const idx = Math.max(0, Math.min(arr.length - 1, Math.floor((clampedP / 100) * arr.length)));
   return arr[idx];
 }
 
@@ -367,6 +454,13 @@ function atomCompiler(rawAtom, variant, contextBoard) {
   if (pctRange) {
     const low = Number(pctRange[1]);
     const high = Number(pctRange[2]);
+    const exact = exactPercentileTable(variant);
+    if (exact) {
+      return {
+        weight,
+        predicate: (hand) => inTopExactByPercent(exact, variant, high, hand) && !inTopExactByPercent(exact, variant, low, hand)
+      };
+    }
     const tHi = percentileThreshold(variant, low);
     const tLo = percentileThreshold(variant, high);
     return {
@@ -381,6 +475,13 @@ function atomCompiler(rawAtom, variant, contextBoard) {
   const pctTop = atom.match(/^([0-9]{1,2}(?:\.[0-9]+)?)%$/);
   if (pctTop) {
     const p = Number(pctTop[1]);
+    const exact = exactPercentileTable(variant);
+    if (exact) {
+      return {
+        weight,
+        predicate: (hand) => inTopExactByPercent(exact, variant, p, hand)
+      };
+    }
     const threshold = percentileThreshold(variant, p);
     return {
       weight,

@@ -13,10 +13,15 @@ type ChooseTable = [[usize; 7]; 53];
 
 #[derive(Debug, Deserialize)]
 struct Request {
+    #[serde(default)]
+    mode: String,
     variant: String,
     iteration_cap: usize,
+    #[serde(default)]
     board: Vec<u8>,
+    #[serde(default)]
     dead: Vec<u8>,
+    #[serde(default)]
     players: Vec<PlayerReq>,
     workers: Option<usize>,
     seed: Option<u64>,
@@ -37,6 +42,7 @@ struct Response {
     ok: bool,
     error: Option<String>,
     raw: Option<RawOut>,
+    equity_rank: Option<EquityRankOut>,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,6 +59,25 @@ struct RawOut {
     confidence_reached: bool,
     confidence_half_width_pct: f64,
     confidence_level: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct EquityRankOut {
+    variant: String,
+    hand_size: usize,
+    combo_space: usize,
+    iteration_cap: usize,
+    observations: usize,
+    elapsed_ms: f64,
+    basis: usize,
+    score_scale: usize,
+    zero_sample_combos: usize,
+    min_samples: u32,
+    max_samples: u32,
+    mean_samples_per_combo: f64,
+    score_keys_by_combo_rank: Vec<u16>,
+    top_score_keys: Vec<u16>,
+    top_ranks: Vec<u32>,
 }
 
 #[derive(Clone)]
@@ -113,6 +138,11 @@ struct Partial {
     class_counts: Vec<Vec<usize>>,
 }
 
+struct EquityRankPartial {
+    counts: Vec<u32>,
+    shares: Vec<f32>,
+}
+
 #[derive(Clone, Copy)]
 struct ConfidenceCfg {
     enabled: bool,
@@ -128,6 +158,7 @@ fn main() {
             ok: false,
             error: Some(err.to_string()),
             raw: None,
+            equity_rank: None,
         };
         let _ = serde_json::to_writer(io::stdout(), &out);
     }
@@ -140,12 +171,29 @@ fn real_main() -> Result<()> {
         .context("failed to read stdin")?;
     let req: Request = serde_json::from_str(&input).context("invalid input json")?;
 
-    validate_request(&req)?;
+    let mode = request_mode(&req);
+    match mode {
+        "sim" => run_sim_mode(&req),
+        "equity-rank" => run_equity_rank_mode(&req),
+        _ => anyhow::bail!("unsupported mode '{}'", mode),
+    }
+}
 
-    let samplers = build_samplers(&req)?;
+fn request_mode(req: &Request) -> &str {
+    if req.mode.trim().is_empty() {
+        "sim"
+    } else {
+        req.mode.as_str()
+    }
+}
+
+fn run_sim_mode(req: &Request) -> Result<()> {
+    validate_request(req)?;
+
+    let samplers = build_samplers(req)?;
     let workers = choose_workers(req.workers, req.iteration_cap);
     let seed = req.seed.unwrap_or(0x9E37_79B9_A5A5_1234);
-    let conf = confidence_cfg(&req);
+    let conf = confidence_cfg(req);
     let choose = build_choose_table();
     let combo_space = choose[52][variant_hand_size(&req.variant)];
     let start = std::time::Instant::now();
@@ -180,7 +228,7 @@ fn real_main() -> Result<()> {
                     let worker_seed = seed
                         .wrapping_add(((idx as u64) + 1) * 0x9E37_79B9_7F4A_7C15)
                         .wrapping_add((round as u64) * 0xBF58_476D_1CE4_E5B9);
-                    simulate_partition(&req, &samplers, iters, worker_seed, &choose, combo_space)
+                    simulate_partition(req, &samplers, iters, worker_seed, &choose, combo_space)
                 })
                 .collect()
         });
@@ -232,9 +280,281 @@ fn real_main() -> Result<()> {
             },
             confidence_level: conf.level,
         }),
+        equity_rank: None,
     };
     serde_json::to_writer(io::stdout(), &out).context("failed to write output json")?;
     Ok(())
+}
+
+const EQUITY_PERCENT_BASIS: usize = 1000;
+const EQUITY_SCORE_SCALE: usize = 10_000;
+
+fn run_equity_rank_mode(req: &Request) -> Result<()> {
+    validate_equity_rank_request(req)?;
+    let hand_size = variant_hand_size(&req.variant);
+    let combo_space = n_choose_k(52, hand_size);
+    let workers = choose_workers(req.workers, req.iteration_cap);
+    let seed = req.seed.unwrap_or(0x7E57_EA10_1234_5678);
+    let choose = build_choose_table();
+
+    let thread_pool = ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .build()
+        .context("failed to build rayon thread pool")?;
+    let start = std::time::Instant::now();
+
+    let parts = split_iterations(req.iteration_cap, workers);
+    let partials: Vec<EquityRankPartial> = thread_pool.install(|| {
+        parts
+            .into_par_iter()
+            .enumerate()
+            .map(|(idx, iters)| {
+                let worker_seed = seed
+                    .wrapping_add(((idx as u64) + 1) * 0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add(0xBF58_476D_1CE4_E5B9);
+                simulate_equity_rank_partition(
+                    &req.variant,
+                    hand_size,
+                    iters,
+                    worker_seed,
+                    &choose,
+                    combo_space,
+                )
+            })
+            .collect()
+    });
+
+    let mut total = new_equity_rank_partial(combo_space);
+    for p in partials {
+        merge_equity_rank_in_place(&mut total, p);
+    }
+
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let stats = build_equity_rank_stats(&total, combo_space);
+
+    let out = Response {
+        ok: true,
+        error: None,
+        raw: None,
+        equity_rank: Some(EquityRankOut {
+            variant: req.variant.clone(),
+            hand_size,
+            combo_space,
+            iteration_cap: req.iteration_cap,
+            observations: stats.observations,
+            elapsed_ms,
+            basis: EQUITY_PERCENT_BASIS,
+            score_scale: EQUITY_SCORE_SCALE,
+            zero_sample_combos: stats.zero_sample_combos,
+            min_samples: stats.min_samples,
+            max_samples: stats.max_samples,
+            mean_samples_per_combo: stats.mean_samples_per_combo,
+            score_keys_by_combo_rank: stats.score_keys_by_combo_rank,
+            top_score_keys: stats.top_score_keys,
+            top_ranks: stats.top_ranks,
+        }),
+    };
+    serde_json::to_writer(io::stdout(), &out).context("failed to write output json")?;
+    Ok(())
+}
+
+fn validate_equity_rank_request(req: &Request) -> Result<()> {
+    let hand_size = variant_hand_size(&req.variant);
+    if hand_size == 0 {
+        anyhow::bail!("unsupported variant '{}'", req.variant);
+    }
+    if req.iteration_cap == 0 {
+        anyhow::bail!("iteration_cap must be > 0");
+    }
+    Ok(())
+}
+
+fn new_equity_rank_partial(combo_space: usize) -> EquityRankPartial {
+    EquityRankPartial {
+        counts: vec![0u32; combo_space],
+        shares: vec![0.0f32; combo_space],
+    }
+}
+
+fn merge_equity_rank_in_place(out: &mut EquityRankPartial, p: EquityRankPartial) {
+    for i in 0..out.counts.len() {
+        out.counts[i] = out.counts[i].saturating_add(p.counts[i]);
+        out.shares[i] += p.shares[i];
+    }
+}
+
+fn simulate_equity_rank_partition(
+    variant: &str,
+    hand_size: usize,
+    iter_cap: usize,
+    seed: u64,
+    choose: &ChooseTable,
+    combo_space: usize,
+) -> EquityRankPartial {
+    let mut out = new_equity_rank_partial(combo_space);
+    let mut rng = StdRng::seed_from_u64(seed);
+    let is_holdem = variant == "holdem";
+
+    let mut used = [false; 52];
+    let mut hero = vec![0u8; hand_size];
+    let mut villain = vec![0u8; hand_size];
+    let mut board5 = [0u8; 5];
+
+    for _ in 0..iter_cap {
+        used.fill(false);
+
+        if !sample_random_hand(hand_size, &used, &mut rng, &mut hero) {
+            continue;
+        }
+        for &c in &hero {
+            used[c as usize] = true;
+        }
+
+        if !sample_random_hand(hand_size, &used, &mut rng, &mut villain) {
+            continue;
+        }
+        for &c in &villain {
+            used[c as usize] = true;
+        }
+
+        if !complete_board_runout(&mut board5, 0, &used, &mut rng) {
+            continue;
+        }
+
+        let (hero_score, villain_score) = if is_holdem {
+            let (hs, _) = eval_holdem(&hero, &board5);
+            let (vs, _) = eval_holdem(&villain, &board5);
+            (hs, vs)
+        } else {
+            let mut board_hand = Hand::new();
+            for &c in &board5 {
+                board_hand.insert_unchecked(&CARDS[c as usize]);
+            }
+            let (hs, _) = eval_omaha_with_board(&hero, &board_hand);
+            let (vs, _) = eval_omaha_with_board(&villain, &board_hand);
+            (hs, vs)
+        };
+
+        let (hero_share, villain_share) = if hero_score > villain_score {
+            (1.0f32, 0.0f32)
+        } else if hero_score < villain_score {
+            (0.0f32, 1.0f32)
+        } else {
+            (0.5f32, 0.5f32)
+        };
+
+        let hero_idx = combo_rank_52(&hero, choose);
+        let villain_idx = combo_rank_52(&villain, choose);
+        out.counts[hero_idx] = out.counts[hero_idx].saturating_add(1);
+        out.shares[hero_idx] += hero_share;
+        out.counts[villain_idx] = out.counts[villain_idx].saturating_add(1);
+        out.shares[villain_idx] += villain_share;
+    }
+    out
+}
+
+struct EquityRankStats {
+    observations: usize,
+    zero_sample_combos: usize,
+    min_samples: u32,
+    max_samples: u32,
+    mean_samples_per_combo: f64,
+    score_keys_by_combo_rank: Vec<u16>,
+    top_score_keys: Vec<u16>,
+    top_ranks: Vec<u32>,
+}
+
+fn build_equity_rank_stats(total: &EquityRankPartial, combo_space: usize) -> EquityRankStats {
+    let mut score_keys = vec![0u16; combo_space];
+    let mut score_counts = vec![0usize; EQUITY_SCORE_SCALE + 1];
+
+    let mut observations = 0usize;
+    let mut zero_sample_combos = 0usize;
+    let mut min_samples = u32::MAX;
+    let mut max_samples = 0u32;
+
+    for i in 0..combo_space {
+        let c = total.counts[i];
+        observations += c as usize;
+        if c == 0 {
+            zero_sample_combos += 1;
+        } else {
+            if c < min_samples {
+                min_samples = c;
+            }
+            if c > max_samples {
+                max_samples = c;
+            }
+        }
+        let eq = if c > 0 {
+            total.shares[i] as f64 / c as f64
+        } else {
+            0.5
+        };
+        let scaled = (eq * EQUITY_SCORE_SCALE as f64).round();
+        let clamped = scaled.max(0.0).min(EQUITY_SCORE_SCALE as f64) as u16;
+        score_keys[i] = clamped;
+        score_counts[clamped as usize] += 1;
+    }
+
+    if min_samples == u32::MAX {
+        min_samples = 0;
+    }
+
+    let mut starts = vec![0usize; EQUITY_SCORE_SCALE + 1];
+    let mut cursor = 0usize;
+    for key in (0..=EQUITY_SCORE_SCALE).rev() {
+        starts[key] = cursor;
+        cursor += score_counts[key];
+    }
+
+    let mut write_pos = starts.clone();
+    let mut sorted_ranks = vec![0u32; combo_space];
+    for rank in 0..combo_space {
+        let key = score_keys[rank] as usize;
+        let pos = write_pos[key];
+        sorted_ranks[pos] = rank as u32;
+        write_pos[key] += 1;
+    }
+
+    let steps = 100 * EQUITY_PERCENT_BASIS;
+    let mut top_score_keys = vec![0u16; steps + 1];
+    let mut top_ranks = vec![0u32; steps + 1];
+    for i in 0..=steps {
+        let count = (i * combo_space) / steps;
+        if count == 0 {
+            top_score_keys[i] = 0;
+            top_ranks[i] = u32::MAX;
+            continue;
+        }
+        let boundary = count - 1;
+        let rank = sorted_ranks[boundary] as usize;
+        top_score_keys[i] = score_keys[rank];
+        top_ranks[i] = rank as u32;
+    }
+
+    EquityRankStats {
+        observations,
+        zero_sample_combos,
+        min_samples,
+        max_samples,
+        mean_samples_per_combo: observations as f64 / combo_space as f64,
+        score_keys_by_combo_rank: score_keys,
+        top_score_keys,
+        top_ranks,
+    }
+}
+
+fn n_choose_k(n: usize, k: usize) -> usize {
+    if k > n {
+        return 0;
+    }
+    let kk = k.min(n - k);
+    let mut out = 1usize;
+    for i in 1..=kk {
+        out = (out * (n - kk + i)) / i;
+    }
+    out
 }
 
 fn validate_request(req: &Request) -> Result<()> {
