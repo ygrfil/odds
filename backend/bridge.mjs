@@ -14,6 +14,7 @@ import {
 import { cardToText, parseCards, fullDeck } from "../src/cards.js";
 import { compileRange } from "../src/parser.js";
 import { makeRng } from "../src/rng.js";
+import { normalizePureTagToken, splitTagToken } from "../src/tag-utils.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, "..");
@@ -277,15 +278,35 @@ function simpleExactIfAny(rangeText, handSize) {
 }
 
 function maybeExpandPureTagRange(rangeText, variant, boardCards) {
-  const normalized = String(rangeText || "").trim().toLowerCase().replace(/\s+/g, "");
-  const tag = normalized === "@sd13" ? "@sd12" : normalized;
-  const holdEmExpandable = new Set(["@sd", "@sd4", "@sd8", "@sd12", "@2p", "@set", "@fd", "@flush", "@straight", "@tpplus", "@overpair"]);
+  const tag = normalizePureTagToken(rangeText);
+  if (!tag) return rangeText;
+  const tagInfo = splitTagToken(tag);
+  if (!tagInfo) return rangeText;
+  const holdEmExpandable = new Set([
+    "@tp",
+    "@tp+",
+    "@overpair",
+    "@overpair+",
+    "@2p",
+    "@2p+",
+    "@set",
+    "@set+",
+    "@s",
+    "@s+",
+    "@f",
+    "@f+",
+    "@fd",
+    "@sd",
+    "@sd4",
+    "@sd8",
+    "@sd12"
+  ]);
   const omahaExpandable = new Set(["@sd", "@sd4", "@sd8", "@sd12"]);
-  const allowed = variant === "holdem" ? holdEmExpandable : omahaExpandable;
-  if (!allowed.has(tag)) return rangeText;
+  if (variant === "holdem" && !holdEmExpandable.has(tagInfo.token)) return rangeText;
+  if (variant !== "holdem" && !omahaExpandable.has(tagInfo.base)) return rangeText;
   if (!Array.isArray(boardCards) || boardCards.length < 3 || boardCards.length > 5) return rangeText;
   const boardText = boardCards.map((c) => cardToText(c)).join("");
-  const combos = previewTagCoreCombos(boardText, variant, tag);
+  const combos = previewTagCoreCombos(boardText, variant, tagInfo.token);
   if (!Array.isArray(combos) || combos.length === 0) return rangeText;
   return combos.join(",");
 }

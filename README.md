@@ -17,11 +17,11 @@ Desktop-first web app for poker equity calculations:
 - Automatic mode selection:
   - Exhaustive (exact) when all players are exact suited hands
   - Monte Carlo for any real range input
-- Adaptive candidate-pool sampling for restrictive postflop filters (e.g. `@flush`, `@fd`, `@set`)
+- Adaptive candidate-pool sampling for restrictive postflop filters (e.g. `@f`, `@fd`, `@set`)
 - Outputs: equity, win/tie/loss, combo counts, hand class breakdown
 - Local persistence (`localStorage`)
 - Export/import setup+results as `.json`
-- Quick-pick filters (`@set`, `@2p`, `@fd`, `@flush`, etc.)
+- Quick-pick filters (`@tp`, `@2p`, `@set`, `@fd`, `@f`, etc.)
 - Native backend mode (Go + Rust simulator) with automatic frontend fallback to browser engine when backend is not running
 
 ## Run locally (recommended)

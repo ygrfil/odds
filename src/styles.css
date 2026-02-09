@@ -331,14 +331,40 @@ pre {
   flex-wrap: wrap;
   max-height: 58px;
   overflow: hidden;
+  align-items: center;
+}
+
+.range-pick-sep {
+  width: 1px;
+  height: 18px;
+  background: #2a3a52;
+  margin: 0 1px;
 }
 
 .range-picks button {
-  background: #221b0f;
-  border-color: #5c4514;
-  color: #f8d99a;
+  background: #1e1f24;
+  border-color: #434f66;
+  color: #d6e0f3;
   padding: 4px 7px;
   font-size: 12px;
+}
+
+.range-picks button.pick-ready {
+  background: #211c13;
+  border-color: #645226;
+  color: #f5ddab;
+}
+
+.range-picks button.pick-draw {
+  background: #172129;
+  border-color: #335d72;
+  color: #c8e5ff;
+}
+
+.range-picks button.pick-macro {
+  background: #1a1f2b;
+  border-color: #3f4d68;
+  color: #d8dff2;
 }
 
 .table-wrap {

@@ -1,5 +1,6 @@
 import { RANKS, SUITS, rankOf, suitOf } from "./cards.js";
 import { normalizePercentileProfile, resolvePercentileTable } from "./percentile-profiles.js";
+import { normalizeTagToken } from "./tag-utils.js";
 
 const RANK_ORDER = [...RANKS];
 const ALL_RANKS = new Set(RANK_ORDER);
@@ -29,7 +30,6 @@ const MACRO_REPLACEMENTS = {
 
 const RANK_VARS = new Set(["R", "O", "N"]);
 const SUIT_VARS = new Set(["x", "y", "z", "w"]);
-const CATEGORY_TAGS = new Set(["@set", "@2p", "@fd", "@sd", "@sd4", "@sd8", "@sd12", "@sd13", "@flush", "@straight", "@tpplus", "@overpair"]);
 
 const percentileCache = new Map();
 const CHOOSE_52 = buildChooseTable52();
@@ -446,10 +446,11 @@ function atomCompiler(rawAtom, variant, contextBoard, options = {}) {
   }
 
   const lowAtom = atom.toLowerCase();
-  if (CATEGORY_TAGS.has(lowAtom)) {
+  const normalizedTag = normalizeTagToken(lowAtom);
+  if (normalizedTag) {
     return {
       weight,
-      predicate: (hand, _meta, helpers) => helpers.categoryMatch(lowAtom, hand, contextBoard)
+      predicate: (hand, _meta, helpers) => helpers.categoryMatch(normalizedTag, hand, contextBoard)
     };
   }
 

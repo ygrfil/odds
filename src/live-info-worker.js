@@ -1,29 +1,12 @@
 import { previewTagCoreCombos, previewTagCoverage, previewRangeCoverage } from "./sim-core.js";
-
-const KNOWN_TAGS = new Set([
-  "@set",
-  "@2p",
-  "@fd",
-  "@sd",
-  "@sd4",
-  "@sd8",
-  "@sd12",
-  "@sd13",
-  "@flush",
-  "@straight",
-  "@tpplus",
-  "@overpair"
-]);
+import { extractNormalizedTags, normalizePureTagToken, splitTagToken } from "./tag-utils.js";
 
 function atTagsInRange(rangeText) {
-  const tags = String(rangeText || "").toLowerCase().match(/@[a-z0-9_]+/g) || [];
-  return [...new Set(tags)].filter((t) => KNOWN_TAGS.has(t));
+  return extractNormalizedTags(rangeText);
 }
 
 function normalizedPureTag(rangeText) {
-  const s = String(rangeText || "").replace(/\s+/g, "").toLowerCase();
-  if (!/^@[a-z0-9_]+$/.test(s)) return "";
-  return s === "@sd13" ? "@sd12" : s;
+  return normalizePureTagToken(rangeText);
 }
 
 function extractPercentAtoms(rangeText) {
@@ -128,7 +111,9 @@ function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "") 
   const pureTag = normalizedPureTag(expr);
 
   for (const tag of tags) {
-    if (tag === "@overpair" && !isHoldem) {
+    const tagInfo = splitTagToken(tag);
+    if (!tagInfo) continue;
+    if (tagInfo.base === "@overpair" && !isHoldem) {
       parts.push({ tone: "warn", text: "@overpair: Hold'em only." });
       continue;
     }
@@ -141,12 +126,11 @@ function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "") 
       const cov = previewTagCoverage(boardText, variant, tag);
       const stat = coverageText(cov);
       let extra = "";
-      if (!isHoldem && tag === "@sd") {
+      if (!isHoldem && tagInfo.base === "@sd") {
         const c4 = previewTagCoverage(boardText, variant, "@sd4");
         if (cov.pct > c4.pct + 0.2) extra = " + blocker-only <4 out draws";
       }
-      const tagNorm = tag === "@sd13" ? "@sd12" : tag;
-      if (pureTag && pureTag === tagNorm) {
+      if (pureTag && pureTag === tag) {
         parts.push({ tone: "tag", text: `${tag}: ${combos.length ? combos.join(",") : "-"} (${stat})${extra}` });
       } else if (isHoldem && combos.length > 0 && combos.length <= 8) {
         parts.push({ tone: "tag", text: `${tag}: ${combos.join(",")} (${stat})${extra}` });

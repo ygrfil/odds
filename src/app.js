@@ -1,5 +1,6 @@
 import { runSimulation } from "./engine.js";
 import { previewTagCoreCombos, previewTagCoverage, previewRangeCoverage } from "./sim-core.js";
+import { extractNormalizedTags, normalizePureTagToken, splitTagToken } from "./tag-utils.js";
 import {
   normalizePercentileProfile,
   percentileProfileOptionsForVariant,
@@ -50,35 +51,50 @@ const el = {
 };
 
 const quickPicks = [
-  { label: "Set", token: "@set" },
-  { label: "2 Pair", token: "@2p" },
-  { label: "Flush Draw", token: "@fd" },
-  { label: "Straight Draw", token: "@sd" },
-  { label: "SD 8+ Outs", token: "@sd8" },
-  { label: "SD 12+ Outs", token: "@sd12" },
-  { label: "Flush", token: "@flush" },
-  { label: "Straight", token: "@straight" },
-  { label: "Top Pair+", token: "@tpplus" },
-  { label: "Overpair", token: "@overpair" },
-  { label: "Double Suited", token: "$ds" },
-  { label: "Single Suited", token: "$ss" },
-  { label: "No Pair", token: "$np" }
+  { label: "Top Pair", token: "@tp", group: "ready" },
+  { label: "Overpair", token: "@overpair", group: "ready" },
+  { label: "2 Pair", token: "@2p", group: "ready" },
+  { label: "Set", token: "@set", group: "ready" },
+  { label: "Straight", token: "@s", group: "ready" },
+  { label: "Flush", token: "@f", group: "ready" },
+  { label: "Flush Draw", token: "@fd", group: "draw" },
+  { label: "Straight Draw", token: "@sd", group: "draw" },
+  { label: "SD 8+ Outs", token: "@sd8", group: "draw" },
+  { label: "SD 12+ Outs", token: "@sd12", group: "draw" },
+  { label: "Double Suited", token: "$ds", group: "macro" },
+  { label: "Single Suited", token: "$ss", group: "macro" },
+  { label: "No Pair", token: "$np", group: "macro" }
 ];
 
-const TAG_HINTS = {
-  "@set": "Set/Trips made now. Hold'em: trips from hole+board. Omaha: must be formed with exactly 2 hole + 3 board.",
+const TAG_BASE_HINTS = {
+  "@tp": "Top pair now only (pair rank equals top board rank).",
+  "@overpair": "Hold'em only: pocket pair higher than top board rank.",
   "@2p": "Exactly two pair made now.",
+  "@set": "Set/trips made now. Hold'em: trips from hole+board. Omaha: exactly 2 hole + 3 board.",
+  "@s": "Made straight now only (not straight flush).",
+  "@f": "Made flush now only (not full house/quads/straight flush). Omaha: exactly 2 hole + 3 board.",
   "@fd": "Flush draw (4 to a flush, not yet made). Omaha requires 2 suited hole cards + 2 suited board cards.",
   "@sd": "Straight draw with 1+ outs (includes rare <4 out cases). Uses street-correct rules.",
   "@sd4": "Straight draw with 4+ outs.",
   "@sd8": "Straight draw with 8 outs or more.",
-  "@sd12": "Straight draw with 12 outs or more.",
-  "@sd13": "Legacy alias for @sd12 (12+ outs).",
-  "@flush": "Made flush now. Omaha requires exactly 2 hole + 3 board.",
-  "@straight": "Made straight now only. Hold'em can use any 5-card combo; Omaha uses exactly 2 hole + 3 board.",
-  "@tpplus": "Top pair or better (top pair / overpair / two-pair+). Not middle or bottom pair.",
-  "@overpair": "Hold'em only: pocket pair higher than top board rank."
+  "@sd12": "Straight draw with 12 outs or more."
 };
+
+const TAG_PLUS_HINTS = {
+  "@tp": "Top pair or better (top pair, overpair, or any 2-pair+ hand).",
+  "@overpair": "Overpair or any stronger made hand (2-pair+).",
+  "@2p": "Two pair or better (set, straight, flush, full house, quads, straight flush).",
+  "@set": "Set/trips or better (straight, flush, full house, quads, straight flush).",
+  "@s": "Straight or better (flush, full house, quads, straight flush).",
+  "@f": "Flush or better (full house, quads, straight flush)."
+};
+
+function tagHintText(tagToken) {
+  const tagInfo = splitTagToken(tagToken);
+  if (!tagInfo) return "";
+  if (tagInfo.plus) return TAG_PLUS_HINTS[tagInfo.base] || "";
+  return TAG_BASE_HINTS[tagInfo.base] || "";
+}
 
 const PRECISION_PRESETS = {
   ci30: { target: 0.3, min: 12000, iterationCap: 500000 },
@@ -135,25 +151,22 @@ function syncOrderingProfileControl() {
 }
 
 function rangeTagHints(rangeText, variant) {
-  const tags = String(rangeText || "").toLowerCase().match(/@[a-z0-9_]+/g) || [];
-  const uniq = [...new Set(tags)].filter((t) => TAG_HINTS[t]);
+  const uniq = extractNormalizedTags(rangeText).filter((t) => !!tagHintText(t));
   if (!uniq.length) return "";
   const gameRule = variant === "holdem"
     ? "Game rule: Hold'em hand evaluation can use any 5-card combination."
     : "Game rule: Omaha hand evaluation always uses exactly 2 hole cards + 3 board cards.";
-  const lines = uniq.map((t) => `${t}: ${TAG_HINTS[t]}`);
-  return `${lines.join("\n")}\n${gameRule}`;
+  const plusRule = "Tip: use '+' only on ready-hand tags (@tp, @overpair, @2p, @set, @s, @f) to include stronger made hands.";
+  const lines = uniq.map((t) => `${t}: ${tagHintText(t)}`);
+  return `${lines.join("\n")}\n${plusRule}\n${gameRule}`;
 }
 
 function atTagsInRange(rangeText) {
-  const tags = String(rangeText || "").toLowerCase().match(/@[a-z0-9_]+/g) || [];
-  return [...new Set(tags)];
+  return extractNormalizedTags(rangeText);
 }
 
 function normalizedPureTag(rangeText) {
-  const s = String(rangeText || "").replace(/\s+/g, "").toLowerCase();
-  if (!/^@[a-z0-9_]+$/.test(s)) return "";
-  return s === "@sd13" ? "@sd12" : s;
+  return normalizePureTagToken(rangeText);
 }
 
 function extractPercentAtoms(rangeText) {
@@ -218,7 +231,7 @@ function rangeLiveInfo(
   const expr = String(rangeText || "").trim();
   if (!expr) return [];
 
-  const tags = atTagsInRange(expr).filter((t) => TAG_HINTS[t]);
+  const tags = atTagsInRange(expr);
   const boardCards = Math.floor(String(boardText).replace(/\s+/g, "").length / 2);
   const isHoldem = variant === "holdem";
   const pctSpec = parseSimplePercentSpec(expr);
@@ -264,7 +277,9 @@ function rangeLiveInfo(
   const pureTag = normalizedPureTag(expr);
 
   for (const tag of tags) {
-    if (tag === "@overpair" && !isHoldem) {
+    const tagInfo = splitTagToken(tag);
+    if (!tagInfo) continue;
+    if (tagInfo.base === "@overpair" && !isHoldem) {
       parts.push({ tone: "warn", text: "@overpair: Hold'em only." });
       continue;
     }
@@ -276,14 +291,13 @@ function rangeLiveInfo(
         const cov = previewTagCoverage(boardText, variant, tag);
         const stat = coverageText(cov);
         let extra = "";
-        if (!isHoldem && tag === "@sd") {
+        if (!isHoldem && tagInfo.base === "@sd") {
           const c4 = previewTagCoverage(boardText, variant, "@sd4");
           if (cov.pct > c4.pct + 0.2) {
             extra = " + blocker-only <4 out draws";
           }
         }
-        const tagNorm = tag === "@sd13" ? "@sd12" : tag;
-        if (pureTag && pureTag === tagNorm) {
+        if (pureTag && pureTag === tag) {
           parts.push({ tone: "tag", text: `${tag}: ${combos.length ? combos.join(",") : "-"} (${stat})${extra}` });
         } else if (isHoldem && combos.length > 0 && combos.length <= 8) {
           parts.push({ tone: "tag", text: `${tag}: ${combos.join(",")} (${stat})${extra}` });
@@ -437,10 +451,19 @@ function loadLocal() {
 
 function renderQuickPicks() {
   el.rangePicks.innerHTML = "";
+  let lastGroup = "";
   for (const p of quickPicks) {
+    if (lastGroup && p.group !== lastGroup) {
+      const sep = document.createElement("span");
+      sep.className = "range-pick-sep";
+      sep.setAttribute("aria-hidden", "true");
+      el.rangePicks.appendChild(sep);
+    }
+    lastGroup = p.group;
     const b = document.createElement("button");
     b.type = "button";
     b.textContent = p.label;
+    if (p.group) b.classList.add(`pick-${p.group}`);
     b.addEventListener("click", () => applyQuickPick(p.token));
     el.rangePicks.appendChild(b);
   }
