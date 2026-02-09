@@ -563,6 +563,14 @@ export function previewRangeCoverage(boardText, variant, rangeText) {
       return out;
     }
 
+    // Precision path: for PLO4/PLO5 non-tag expressions, run exact counting so
+    // helper combo counts always match real range definitions.
+    if (!hasTagExpr && handSize <= 5) {
+      const out = exactCoverage(deck, handSize, (hand) => compiled.predicate(hand, null, helpers));
+      RANGE_COVERAGE_CACHE.set(cacheKey, out);
+      return out;
+    }
+
     const exactLimit = hasTagExpr
       ? OMAHA_EXACT_COVERAGE_MAX
       : (handSize <= 4 ? 300000 : 90000);

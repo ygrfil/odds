@@ -383,6 +383,25 @@ function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx
 
   const hasTag = /@[a-z0-9_]+/i.test(rangeText);
   const hasSdTag = /@sd(?:\d+)?/i.test(rangeText);
+  const totalSpace = nChooseK(baseDeck.length, handSize);
+  if (!hasTag && handSize === 5) {
+    // Accuracy path for PLO5 non-tag ranges:
+    // Build an exact pool when range is moderate; otherwise keep a bounded uniform reservoir.
+    const acceptance = estimateRangeAcceptance(baseDeck, handSize, predicate, rng, 220);
+    const estimatedMatched = Math.round(totalSpace * acceptance);
+    const exactCap = 320_000;
+    if (estimatedMatched <= Math.round(exactCap * 1.2)) {
+      const { pool, matched } = enumerateRangePool(baseDeck, handSize, predicate, exactCap, rng);
+      if (!matched || pool.length === 0) {
+        throw new Error(`Player ${idx + 1} range appears empty on this board/dead-card setup`);
+      }
+      if (matched === totalSpace) return { mode: "all", hand_size: handSize };
+      const sampler = { mode: "pool", hand_size: handSize, pool };
+      putCachedSampler(cacheKey, sampler);
+      return sampler;
+    }
+  }
+
   let target = handSize === 5 ? 14_000 : 10_000;
   let maxTrials = handSize === 5 ? 280_000 : 320_000;
   let maxMs = 900;
