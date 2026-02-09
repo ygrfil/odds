@@ -196,12 +196,73 @@ button.primary {
 }
 
 .player-output {
-  font-size: 11px;
-  color: var(--muted);
+  font-size: 13px;
+  color: #d4e4ff;
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
-  line-height: 1.25;
+  line-height: 1.35;
+}
+
+.result-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 8px;
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.result-chip strong {
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+.chip-win {
+  color: #0f2b20;
+  background: #7ce7b4;
+  border-color: #69d5a3;
+}
+
+.chip-tie {
+  color: #0d2940;
+  background: #8fd3ff;
+  border-color: #76c2f4;
+}
+
+.chip-loss {
+  color: #3f1416;
+  background: #f6a6ab;
+  border-color: #e89198;
+}
+
+.chip-combos {
+  color: #f0e3c0;
+  background: #2a2415;
+  border-color: #685632;
+}
+
+.chip-eq.eq-high {
+  color: #062720;
+  background: #5cf0cb;
+  border-color: #45d9b4;
+  font-weight: 700;
+}
+
+.chip-eq.eq-mid {
+  color: #0f2942;
+  background: #90c2ff;
+  border-color: #73acee;
+}
+
+.chip-eq.eq-low {
+  color: #3f1416;
+  background: #f3a4ab;
+  border-color: #e18e95;
 }
 
 .player-live-note {
@@ -249,10 +310,6 @@ button.primary {
   color: #f7b2b2;
   background: #2b1212;
   border-color: #6e2d2d;
-}
-
-.player-output strong {
-  color: var(--text);
 }
 
 .player-classes {

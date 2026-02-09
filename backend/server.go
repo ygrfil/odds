@@ -23,14 +23,15 @@ type playerConfig struct {
 }
 
 type runConfig struct {
-	Variant               string         `json:"variant"`
-	IterationCap          int            `json:"iterationCap"`
-	Board                 string         `json:"board"`
-	Dead                  string         `json:"dead"`
-	Players               []playerConfig `json:"players"`
-	ConfidenceTargetPct   float64        `json:"confidenceTargetPct,omitempty"`
-	ConfidenceMinIters    int            `json:"confidenceMinIterations,omitempty"`
-	ConfidenceLevel       float64        `json:"confidenceLevel,omitempty"`
+	Variant             string         `json:"variant"`
+	PercentileProfile   string         `json:"percentileProfile,omitempty"`
+	IterationCap        int            `json:"iterationCap"`
+	Board               string         `json:"board"`
+	Dead                string         `json:"dead"`
+	Players             []playerConfig `json:"players"`
+	ConfidenceTargetPct float64        `json:"confidenceTargetPct,omitempty"`
+	ConfidenceMinIters  int            `json:"confidenceMinIterations,omitempty"`
+	ConfidenceLevel     float64        `json:"confidenceLevel,omitempty"`
 }
 
 type runRequest struct {
@@ -70,9 +71,10 @@ type previewTagRequest struct {
 }
 
 type previewRangeRequest struct {
-	BoardText string `json:"boardText"`
-	Variant   string `json:"variant"`
-	RangeText string `json:"rangeText"`
+	BoardText         string `json:"boardText"`
+	Variant           string `json:"variant"`
+	RangeText         string `json:"rangeText"`
+	PercentileProfile string `json:"percentileProfile,omitempty"`
 }
 
 type bridgeResponse struct {
@@ -224,10 +226,11 @@ func makePreviewRangeHandler(projectRoot, bridgePath string) http.HandlerFunc {
 			return
 		}
 		payload := map[string]any{
-			"action":    "preview-range",
-			"boardText": req.BoardText,
-			"variant":   req.Variant,
-			"rangeText": req.RangeText,
+			"action":            "preview-range",
+			"boardText":         req.BoardText,
+			"variant":           req.Variant,
+			"rangeText":         req.RangeText,
+			"percentileProfile": req.PercentileProfile,
 		}
 		var out map[string]any
 		if err := callBridge(r.Context(), projectRoot, bridgePath, payload, &out); err != nil {

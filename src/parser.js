@@ -1,5 +1,5 @@
 import { RANKS, SUITS, rankOf, suitOf } from "./cards.js";
-import { PRECOMPUTED_PERCENTILE_TABLES } from "./percentile-tables.js";
+import { normalizePercentileProfile, resolvePercentileTable } from "./percentile-profiles.js";
 
 const RANK_ORDER = [...RANKS];
 const ALL_RANKS = new Set(RANK_ORDER);
@@ -66,8 +66,9 @@ function heuristicScoreKey(hand, variant) {
   return Math.round(evaluateHeuristic(hand, variant) * 10);
 }
 
-function exactPercentileTable(variant) {
-  const pre = PRECOMPUTED_PERCENTILE_TABLES?.[variant];
+function exactPercentileTable(variant, percentileProfile) {
+  const profile = normalizePercentileProfile(variant, percentileProfile);
+  const pre = resolvePercentileTable(variant, profile);
   if (!pre) return null;
   const basis = Number(pre.basis || 0);
   const sampleSize = Number(pre.sampleSize || 0);
@@ -396,9 +397,10 @@ export function evaluateHeuristic(hand, variant) {
   return score;
 }
 
-function percentileThreshold(variant, p) {
+function percentileThreshold(variant, p, percentileProfile) {
   const clampedP = Math.max(0, Math.min(100, Number(p)));
-  const pre = PRECOMPUTED_PERCENTILE_TABLES?.[variant];
+  const profile = normalizePercentileProfile(variant, percentileProfile);
+  const pre = resolvePercentileTable(variant, profile);
   if (pre && Array.isArray(pre.thresholds) && pre.thresholds.length) {
     const basis = Number(pre.basis || 100);
     const pos = clampedP * basis;
@@ -410,7 +412,7 @@ function percentileThreshold(variant, p) {
     return pre.thresholds[lo] * (1 - w) + pre.thresholds[hi] * w;
   }
 
-  const key = `${variant}`;
+  const key = `${variant}|${profile}`;
   if (!percentileCache.has(key)) {
     const handSize = variant === "holdem" ? 2 : variant === "plo4" ? 4 : variant === "plo5" ? 5 : 6;
     const sample = [];
@@ -432,8 +434,9 @@ function percentileThreshold(variant, p) {
   return arr[idx];
 }
 
-function atomCompiler(rawAtom, variant, contextBoard) {
+function atomCompiler(rawAtom, variant, contextBoard, options = {}) {
   let atom = expandShortcuts(stripSpaces(rawAtom), variant);
+  const percentileProfile = options.percentileProfile;
 
   let weight = 100;
   const w = atom.match(/@([0-9]{1,3})$/);
@@ -455,15 +458,15 @@ function atomCompiler(rawAtom, variant, contextBoard) {
   if (pctRange) {
     const low = Number(pctRange[1]);
     const high = Number(pctRange[2]);
-    const exact = exactPercentileTable(variant);
+    const exact = exactPercentileTable(variant, percentileProfile);
     if (exact) {
       return {
         weight,
         predicate: (hand) => inTopExactByPercent(exact, variant, high, hand) && !inTopExactByPercent(exact, variant, low, hand)
       };
     }
-    const tHi = percentileThreshold(variant, low);
-    const tLo = percentileThreshold(variant, high);
+    const tHi = percentileThreshold(variant, low, percentileProfile);
+    const tLo = percentileThreshold(variant, high, percentileProfile);
     return {
       weight,
       predicate: (hand) => {
@@ -476,14 +479,14 @@ function atomCompiler(rawAtom, variant, contextBoard) {
   const pctTop = atom.match(new RegExp(`^(${PCT_TOKEN_RE})%$`));
   if (pctTop) {
     const p = Number(pctTop[1]);
-    const exact = exactPercentileTable(variant);
+    const exact = exactPercentileTable(variant, percentileProfile);
     if (exact) {
       return {
         weight,
         predicate: (hand) => inTopExactByPercent(exact, variant, p, hand)
       };
     }
-    const threshold = percentileThreshold(variant, p);
+    const threshold = percentileThreshold(variant, p, percentileProfile);
     return {
       weight,
       predicate: (hand) => evaluateHeuristic(hand, variant) >= threshold
@@ -593,12 +596,12 @@ function matchSpecs(specsRaw, hand, handSize) {
   return rec(0);
 }
 
-function compileAst(ast, variant, board) {
+function compileAst(ast, variant, board, options = {}) {
   if (ast.kind === "atom") {
-    return atomCompiler(ast.value, variant, board);
+    return atomCompiler(ast.value, variant, board, options);
   }
-  const left = compileAst(ast.left, variant, board);
-  const right = compileAst(ast.right, variant, board);
+  const left = compileAst(ast.left, variant, board, options);
+  const right = compileAst(ast.right, variant, board, options);
   if (ast.kind === "or") {
     return {
       weight: 100,
@@ -617,7 +620,7 @@ function compileAst(ast, variant, board) {
   };
 }
 
-export function compileRange(rawExpr, variant, boardCards = []) {
+export function compileRange(rawExpr, variant, boardCards = [], options = {}) {
   const expr = expandExprMacros(stripSpaces(rawExpr || "*"));
   if (!expr) {
     const ok = { predicate: () => true, weight: 100 };
@@ -625,5 +628,5 @@ export function compileRange(rawExpr, variant, boardCards = []) {
   }
   const tokens = tokenizeExpr(expr);
   const ast = parser(tokens);
-  return compileAst(ast, variant, boardCards);
+  return compileAst(ast, variant, boardCards, options);
 }

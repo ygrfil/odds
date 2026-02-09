@@ -28,16 +28,19 @@
             </select>
           </label>
           <label>
-            Iteration cap
-            <input id="iterationCap" type="number" min="500" max="5000000" step="500" value="150000" />
-          </label>
-          <label>
             Precision stop
             <select id="precision">
-              <option value="cap">Cap only</option>
-              <option value="ci20">CI95 ±0.20%</option>
+              <option value="ci30">CI95 ±0.30% (faster)</option>
+              <option value="ci20" selected>CI95 ±0.20%</option>
               <option value="ci10">CI95 ±0.10%</option>
               <option value="ci05">CI95 ±0.05%</option>
+            </select>
+          </label>
+          <label>
+            Hand ordering
+            <select id="orderingProfile">
+              <option value="ours">Ours (equity vs random)</option>
+              <option value="ppt6max">PPT 6-max (evolution)</option>
             </select>
           </label>
           <div class="spacer"></div>
@@ -119,6 +122,13 @@
             <h3>5) Weighting</h3>
             <ul>
               <li><code>AA-KK@100,QQ@50</code> means QQ appears half as often as AA/KK.</li>
+            </ul>
+
+            <h3>5.1) Percentile Profile</h3>
+            <ul>
+              <li><code>%</code> ranges use the selected <strong>Hand ordering</strong> profile.</li>
+              <li><strong>Ours</strong> = equity-vs-random combo ordering.</li>
+              <li><strong>PPT 6-max</strong> = ProPokerTools 6-max evolution ordering (PLO4/PLO5 only).</li>
             </ul>
 
             <h3>6) Draw/Hand Filter Tags</h3>

@@ -1,5 +1,11 @@
 import { runSimulation } from "./engine.js";
 import { previewTagCoreCombos, previewTagCoverage, previewRangeCoverage } from "./sim-core.js";
+import {
+  normalizePercentileProfile,
+  percentileProfileOptionsForVariant,
+  percentileProfileLabel,
+  PERCENTILE_PROFILE_OURS
+} from "./percentile-profiles.js";
 
 const state = {
   players: [
@@ -23,8 +29,8 @@ const liveInfoState = {
 
 const el = {
   variant: document.querySelector("#variant"),
-  iterationCap: document.querySelector("#iterationCap"),
   precision: document.querySelector("#precision"),
+  orderingProfile: document.querySelector("#orderingProfile"),
   board: document.querySelector("#board"),
   dead: document.querySelector("#dead"),
   addPlayer: document.querySelector("#addPlayer"),
@@ -73,6 +79,60 @@ const TAG_HINTS = {
   "@tpplus": "Top pair or better (top pair / overpair / two-pair+). Not middle or bottom pair.",
   "@overpair": "Hold'em only: pocket pair higher than top board rank."
 };
+
+const PRECISION_PRESETS = {
+  ci30: { target: 0.3, min: 12000, iterationCap: 500000 },
+  ci20: { target: 0.2, min: 25000, iterationCap: 900000 },
+  ci10: { target: 0.1, min: 60000, iterationCap: 1800000 },
+  ci05: { target: 0.05, min: 120000, iterationCap: 3600000 }
+};
+const DEFAULT_PRECISION_PRESET = "ci20";
+const DEFAULT_PERCENTILE_PROFILE = PERCENTILE_PROFILE_OURS;
+
+function normalizePrecisionPreset(value) {
+  const key = String(value || "").trim().toLowerCase();
+  if (Object.prototype.hasOwnProperty.call(PRECISION_PRESETS, key)) return key;
+  if (key === "cap") return DEFAULT_PRECISION_PRESET;
+  return DEFAULT_PRECISION_PRESET;
+}
+
+function precisionPresetFromTarget(targetPct) {
+  const target = Number(targetPct);
+  if (!Number.isFinite(target) || target <= 0) return DEFAULT_PRECISION_PRESET;
+  const keys = Object.keys(PRECISION_PRESETS);
+  let best = keys[0] || DEFAULT_PRECISION_PRESET;
+  let bestDiff = Number.POSITIVE_INFINITY;
+  for (const k of keys) {
+    const diff = Math.abs(PRECISION_PRESETS[k].target - target);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = k;
+    }
+  }
+  return best;
+}
+
+function currentOrderingProfile(variant = el.variant.value) {
+  return normalizePercentileProfile(variant, el.orderingProfile?.value || DEFAULT_PERCENTILE_PROFILE);
+}
+
+function syncOrderingProfileControl() {
+  if (!el.orderingProfile) return;
+  const variant = el.variant.value;
+  const options = percentileProfileOptionsForVariant(variant);
+  const requested = el.orderingProfile.value || DEFAULT_PERCENTILE_PROFILE;
+  const normalized = normalizePercentileProfile(variant, requested);
+  el.orderingProfile.innerHTML = "";
+  for (const opt of options) {
+    const node = document.createElement("option");
+    node.value = opt.id;
+    node.textContent = opt.label;
+    el.orderingProfile.appendChild(node);
+  }
+  el.orderingProfile.value = normalized;
+  el.orderingProfile.disabled = options.length <= 1;
+  el.orderingProfile.title = percentileProfileLabel(normalized);
+}
 
 function rangeTagHints(rangeText, variant) {
   const tags = String(rangeText || "").toLowerCase().match(/@[a-z0-9_]+/g) || [];
@@ -149,7 +209,12 @@ function coverageText(cov) {
   return `${cov.pct.toFixed(1)}%, ${cov.matched.toLocaleString()}/${cov.total.toLocaleString()} combos`;
 }
 
-function rangeLiveInfo(rangeText, boardText = el.board.value.trim(), variant = el.variant.value) {
+function rangeLiveInfo(
+  rangeText,
+  boardText = el.board.value.trim(),
+  variant = el.variant.value,
+  percentileProfile = currentOrderingProfile(variant)
+) {
   const expr = String(rangeText || "").trim();
   if (!expr) return [];
 
@@ -161,7 +226,7 @@ function rangeLiveInfo(rangeText, boardText = el.board.value.trim(), variant = e
   let covExpr = null;
 
   try {
-    covExpr = previewRangeCoverage(boardText, variant, expr);
+    covExpr = previewRangeCoverage(boardText, variant, expr, { percentileProfile });
     const statExpr = coverageText(covExpr);
     if (statExpr) parts.push({ tone: "primary", text: `Range: ${statExpr}` });
   } catch {
@@ -179,7 +244,7 @@ function rangeLiveInfo(rangeText, boardText = el.board.value.trim(), variant = e
   if (covExpr && pctAtoms.length && !pctSpec) {
     try {
       const baseExpr = pctAtoms.join(",");
-      const baseCov = previewRangeCoverage(boardText, variant, baseExpr);
+      const baseCov = previewRangeCoverage(boardText, variant, baseExpr, { percentileProfile });
       const exprCnt = coverageCounts(covExpr);
       const baseCnt = coverageCounts(baseCov);
       if (baseCnt.matched > 0) {
@@ -305,6 +370,7 @@ function dispatchLiveInfoUpdate(playerIndex) {
       requestId,
       boardText: ctx.boardText,
       variant: ctx.variant,
+      percentileProfile: ctx.percentileProfile,
       rangeText: ctx.rangeText
     });
     return;
@@ -312,7 +378,7 @@ function dispatchLiveInfoUpdate(playerIndex) {
 
   setTimeout(() => {
     if (liveInfoState.latestRequestByPlayer.get(playerIndex) !== requestId) return;
-    const parts = rangeLiveInfo(ctx.rangeText, ctx.boardText, ctx.variant);
+    const parts = rangeLiveInfo(ctx.rangeText, ctx.boardText, ctx.variant, ctx.percentileProfile);
     const latestNode = liveInfoState.nodeByPlayer.get(playerIndex);
     if (!latestNode) return;
     renderLiveInfo(latestNode, parts);
@@ -320,10 +386,12 @@ function dispatchLiveInfoUpdate(playerIndex) {
 }
 
 function queueLiveInfoUpdate(playerIndex, rangeText, immediate = false) {
+  const variant = el.variant.value;
   liveInfoState.contextByPlayer.set(playerIndex, {
     rangeText: String(rangeText || ""),
     boardText: el.board.value.trim(),
-    variant: el.variant.value
+    variant,
+    percentileProfile: currentOrderingProfile(variant)
   });
   const prevTimer = liveInfoState.timers.get(playerIndex);
   if (prevTimer) clearTimeout(prevTimer);
@@ -333,10 +401,13 @@ function queueLiveInfoUpdate(playerIndex, rangeText, immediate = false) {
 }
 
 function saveLocal() {
+  const precision = normalizePrecisionPreset(el.precision?.value);
+  if (el.precision) el.precision.value = precision;
+  const percentileProfile = currentOrderingProfile(el.variant.value);
   localStorage.setItem("poker-odds-lab-state", JSON.stringify({
     variant: el.variant.value,
-    iterationCap: el.iterationCap.value,
-    precision: el.precision?.value || "cap",
+    precision,
+    percentileProfile,
     board: el.board.value,
     dead: el.dead.value,
     players: state.players
@@ -349,8 +420,8 @@ function loadLocal() {
     if (!raw) return;
     const s = JSON.parse(raw);
     el.variant.value = s.variant || "holdem";
-    el.iterationCap.value = s.iterationCap || "150000";
-    if (el.precision) el.precision.value = s.precision || "cap";
+    if (el.precision) el.precision.value = normalizePrecisionPreset(s.precision);
+    if (el.orderingProfile) el.orderingProfile.value = s.percentileProfile || DEFAULT_PERCENTILE_PROFILE;
     el.board.value = s.board || "";
     el.dead.value = s.dead || "";
     if (Array.isArray(s.players) && s.players.length >= 2) {
@@ -418,10 +489,37 @@ function renderSummary(result) {
     const half = Number(result.confidenceHalfWidthPct);
     confText = ` • CI${level} ±${half.toFixed(3)}%${result.confidenceReached ? " reached" : ""}`;
   }
-  el.runSummary.textContent = `${result.iterations.toLocaleString()} iterations in ${total}s • ${result.variant.toUpperCase()} • ${String(result.method || "monte").toUpperCase()} • ${engine}${extra}${confText}`;
+  const profileText = result.percentileProfile ? ` • ${percentileProfileLabel(result.percentileProfile)}` : "";
+  el.runSummary.textContent = `${result.iterations.toLocaleString()} iterations in ${total}s • ${result.variant.toUpperCase()}${profileText} • ${String(result.method || "monte").toUpperCase()} • ${engine}${extra}${confText}`;
 }
 
-function playerOutputRow(row) {
+function numericPercent(value) {
+  const n = Number(String(value || "").replace("%", ""));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function equityTier(index, allRows) {
+  if (!Array.isArray(allRows) || allRows.length < 2) return "eq-mid";
+  const ranked = allRows
+    .map((r, i) => ({ i, equity: numericPercent(r?.equity) }))
+    .sort((a, b) => b.equity - a.equity);
+  const pos = ranked.findIndex((x) => x.i === index);
+  if (pos === 0) return "eq-high";
+  if (pos === ranked.length - 1) return "eq-low";
+  return "eq-mid";
+}
+
+function appendMetricChip(parent, label, value, className) {
+  const chip = document.createElement("span");
+  chip.className = className;
+  const strong = document.createElement("strong");
+  strong.textContent = label;
+  chip.appendChild(strong);
+  chip.append(document.createTextNode(` ${value}`));
+  parent.appendChild(chip);
+}
+
+function playerOutputRow(row, rowIndex, allRows) {
   const wrap = document.createElement("div");
   wrap.className = "player-output";
 
@@ -430,11 +528,12 @@ function playerOutputRow(row) {
     return wrap;
   }
 
-  wrap.innerHTML = `<span><strong>Eq</strong> ${row.equity}</span>
-    <span><strong>W</strong> ${row.win}</span>
-    <span><strong>T</strong> ${row.tie}</span>
-    <span><strong>L</strong> ${row.loss}</span>
-    <span><strong>Combos</strong> ${row.comboLabel || row.combos}</span>`;
+  const eqClass = `result-chip chip-eq ${equityTier(rowIndex, allRows)}`;
+  appendMetricChip(wrap, "Eq", row.equity, eqClass);
+  appendMetricChip(wrap, "W", row.win, "result-chip chip-win");
+  appendMetricChip(wrap, "T", row.tie, "result-chip chip-tie");
+  appendMetricChip(wrap, "L", row.loss, "result-chip chip-loss");
+  appendMetricChip(wrap, "Combos", row.comboLabel || row.combos, "result-chip chip-combos");
 
   const classes = document.createElement("div");
   classes.className = "player-classes";
@@ -446,9 +545,10 @@ function playerOutputRow(row) {
 function buildRangeCoverageSnapshot(config) {
   const boardText = String(config.board || "");
   const variant = String(config.variant || "");
+  const percentileProfile = String(config.percentileProfile || "");
   return (config.players || []).map((p) => {
     try {
-      return previewRangeCoverage(boardText, variant, String(p?.range || "*"));
+      return previewRangeCoverage(boardText, variant, String(p?.range || "*"), { percentileProfile });
     } catch {
       return null;
     }
@@ -475,7 +575,7 @@ function renderPlayers() {
     range.className = "player-range-input";
     range.type = "text";
     range.value = p.range;
-    range.placeholder = "Range syntax (PPT-style), e.g. AA,AK$s,15%";
+    range.placeholder = "Range syntax, e.g. AA,AK$s,15%";
     range.addEventListener("focus", () => {
       state.focusedPlayer = i;
     });
@@ -519,27 +619,27 @@ function renderPlayers() {
       refreshDerived(false);
     });
     refreshDerived(false);
-    row.appendChild(playerOutputRow(results[i]));
+    row.appendChild(playerOutputRow(results[i], i, results));
     el.players.appendChild(row);
   });
   pruneLiveInfoState();
 }
 
 function currentConfig() {
-  const iterCap = Number(el.iterationCap.value || 150000);
-  const preset = String(el.precision?.value || "cap");
-  const conf = (() => {
-    if (preset === "ci20") return { target: 0.2, min: 25000 };
-    if (preset === "ci10") return { target: 0.1, min: 60000 };
-    if (preset === "ci05") return { target: 0.05, min: 120000 };
-    return null;
-  })();
+  const preset = normalizePrecisionPreset(el.precision?.value);
+  if (el.precision) el.precision.value = preset;
+  const variant = el.variant.value;
+  const percentileProfile = currentOrderingProfile(variant);
+  if (el.orderingProfile) el.orderingProfile.value = percentileProfile;
+  const conf = PRECISION_PRESETS[preset] || PRECISION_PRESETS[DEFAULT_PRECISION_PRESET];
   return {
-    variant: el.variant.value,
-    iterationCap: iterCap,
-    confidenceTargetPct: conf ? conf.target : 0,
-    confidenceMinIterations: conf ? Math.max(1, Math.min(iterCap, conf.min)) : 0,
-    confidenceLevel: conf ? 0.95 : 0,
+    variant,
+    percentileProfile,
+    precision: preset,
+    iterationCap: conf.iterationCap,
+    confidenceTargetPct: conf.target,
+    confidenceMinIterations: conf.min,
+    confidenceLevel: 0.95,
     board: el.board.value.trim(),
     dead: el.dead.value.trim(),
     players: state.players.map((p, i) => ({
@@ -621,7 +721,13 @@ function importSetup(file) {
       if (!setup.players || setup.players.length < 2) throw new Error("Invalid setup file");
 
       el.variant.value = setup.variant || "holdem";
-      el.iterationCap.value = setup.iterationCap || 150000;
+      if (el.precision) {
+        el.precision.value = normalizePrecisionPreset(setup.precision || precisionPresetFromTarget(setup.confidenceTargetPct));
+      }
+      if (el.orderingProfile) {
+        el.orderingProfile.value = setup.percentileProfile || DEFAULT_PERCENTILE_PROFILE;
+      }
+      syncOrderingProfileControl();
       el.board.value = setup.board || "";
       el.dead.value = setup.dead || "";
       state.players = setup.players.slice(0, 6).map((p, i) => ({
@@ -688,18 +794,27 @@ function wire() {
     el.importFile.value = "";
   });
 
-  [el.variant, el.iterationCap, el.precision, el.board, el.dead].forEach((node) => {
+  [el.variant, el.precision, el.orderingProfile, el.board, el.dead].forEach((node) => {
     if (!node) return;
     node.addEventListener("input", saveLocal);
   });
   el.variant.addEventListener("change", () => {
+    syncOrderingProfileControl();
     saveLocal();
     renderPlayers();
   });
+  if (el.orderingProfile) {
+    el.orderingProfile.addEventListener("change", () => {
+      syncOrderingProfileControl();
+      saveLocal();
+      renderPlayers();
+    });
+  }
   el.board.addEventListener("input", renderPlayers);
 }
 
 loadLocal();
+syncOrderingProfileControl();
 initLiveInfoWorker();
 renderQuickPicks();
 renderSummary(state.lastResult);

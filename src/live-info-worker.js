@@ -79,7 +79,7 @@ function coverageText(cov) {
   return `${cov.pct.toFixed(1)}%, ${cov.matched.toLocaleString()}/${cov.total.toLocaleString()} combos`;
 }
 
-function computeLiveInfo(rangeText, boardText, variant) {
+function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "") {
   const expr = String(rangeText || "").trim();
   if (!expr) return [];
 
@@ -91,7 +91,7 @@ function computeLiveInfo(rangeText, boardText, variant) {
   let covExpr = null;
 
   try {
-    covExpr = previewRangeCoverage(boardText, variant, expr);
+    covExpr = previewRangeCoverage(boardText, variant, expr, { percentileProfile });
     const statExpr = coverageText(covExpr);
     if (statExpr) parts.push({ tone: "primary", text: `Range: ${statExpr}` });
   } catch {
@@ -108,7 +108,7 @@ function computeLiveInfo(rangeText, boardText, variant) {
   if (covExpr && pctAtoms.length && !pctSpec) {
     try {
       const baseExpr = pctAtoms.join(",");
-      const baseCov = previewRangeCoverage(boardText, variant, baseExpr);
+      const baseCov = previewRangeCoverage(boardText, variant, baseExpr, { percentileProfile });
       const exprCnt = coverageCounts(covExpr);
       const baseCnt = coverageCounts(baseCov);
       if (baseCnt.matched > 0) {
@@ -166,7 +166,7 @@ self.onmessage = (event) => {
 
   let parts = [];
   try {
-    parts = computeLiveInfo(msg.rangeText, msg.boardText, msg.variant);
+    parts = computeLiveInfo(msg.rangeText, msg.boardText, msg.variant, msg.percentileProfile);
   } catch {
     parts = [];
   }

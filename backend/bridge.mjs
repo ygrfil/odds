@@ -315,18 +315,20 @@ function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx
   }
 
   const normalizedRange = rangeText.toLowerCase().replace(/\s+/g, "");
+  const percentileProfile = String(config.percentileProfile || "").trim().toLowerCase();
   const cacheKey = [
     `v${SAMPLER_CACHE_VERSION}`,
     String(config.variant || ""),
     `b:${cardsKey(boardCards, true)}`,
     `d:${cardsKey(deadCards, false)}`,
     `h:${handSize}`,
+    `pp:${percentileProfile || "-"}`,
     `r:${normalizedRange}`
   ].join("|");
   const cached = getCachedSamplerWithDisk(cacheKey);
   if (cached) return cached;
 
-  const compiled = compileRange(rangeText, config.variant, boardCards);
+  const compiled = compileRange(rangeText, config.variant, boardCards, { percentileProfile });
   if ((compiled.weight || 0) <= 0) {
     throw new Error(`Player ${idx + 1} range appears empty on this board/dead-card setup`);
   }
@@ -659,7 +661,8 @@ async function main() {
     const boardText = String(req.boardText || "");
     const variant = String(req.variant || "");
     const rangeText = String(req.rangeText || "");
-    const coverage = previewRangeCoverage(boardText, variant, rangeText);
+    const percentileProfile = String(req.percentileProfile || "").trim().toLowerCase();
+    const coverage = previewRangeCoverage(boardText, variant, rangeText, { percentileProfile });
     writeJson({ ok: true, coverage });
     return;
   }

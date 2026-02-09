@@ -522,8 +522,9 @@ export function previewTagCoverage(boardText, variant, tag) {
   return out;
 }
 
-export function previewRangeCoverage(boardText, variant, rangeText) {
-  const cacheKey = `${variant}|${String(boardText || "").trim()}|${String(rangeText || "").replace(/\s+/g, "")}`;
+export function previewRangeCoverage(boardText, variant, rangeText, options = {}) {
+  const percentileProfile = String(options?.percentileProfile || "").trim().toLowerCase();
+  const cacheKey = `${variant}|${percentileProfile}|${String(boardText || "").trim()}|${String(rangeText || "").replace(/\s+/g, "")}`;
   if (RANGE_COVERAGE_CACHE.has(cacheKey)) return RANGE_COVERAGE_CACHE.get(cacheKey);
 
   const board = parseCards(boardText || "");
@@ -534,7 +535,7 @@ export function previewRangeCoverage(boardText, variant, rangeText) {
   }
   const handSize = variantCardCount(variant);
   const hasTagExpr = /@[a-z0-9_]+/i.test(String(rangeText || ""));
-  const compiled = compileRange(rangeText || "*", variant, board);
+  const compiled = compileRange(rangeText || "*", variant, board, { percentileProfile });
   const helpers = { categoryMatch };
 
   if (variant !== "holdem") {
@@ -579,7 +580,7 @@ export function previewRangeCoverage(boardText, variant, rangeText) {
       RANGE_COVERAGE_CACHE.set(cacheKey, out);
       return out;
     }
-    const sampleSeed = hash32(`${variant}|${board.join(",")}|expr:${String(rangeText || "*")}|${handSize}`) || 1;
+    const sampleSeed = hash32(`${variant}|${percentileProfile}|${board.join(",")}|expr:${String(rangeText || "*")}|${handSize}`) || 1;
     const rng = makeRng(sampleSeed);
     const scratch = [];
     let matched = 0;
@@ -978,6 +979,7 @@ export function rawToResult(raw, config) {
     aborted: !!raw.aborted,
     method: raw.method || config.method || "monte",
     variant: config.variant,
+    percentileProfile: String(config.percentileProfile || ""),
     confidenceReached: !!confidenceReached,
     confidenceHalfWidthPct: Number(confidenceHalfWidthPct || 0),
     confidenceLevel: Number(confidenceLevel || 0),
@@ -1032,7 +1034,8 @@ export async function runSimulationRaw(config, options = {}) {
   const baseDeck = ALL_CARDS.filter((c) => !blocked.has(c));
   const baseMask = new Uint8Array(52);
   for (let i = 0; i < baseDeck.length; i++) baseMask[baseDeck[i]] = 1;
-  const ranges = players.map((p) => compileRange((p.range || "*").trim() || "*", variant, board));
+  const percentileProfile = String(config.percentileProfile || "").trim().toLowerCase();
+  const ranges = players.map((p) => compileRange((p.range || "*").trim() || "*", variant, board, { percentileProfile }));
   const poolScale = Number.isFinite(options.poolScale) ? Math.max(0.1, Math.min(1, options.poolScale)) : 1;
   const samplerPlans = players.map((p, i) => ({
     rangeText: (p.range || "*").trim() || "*",
