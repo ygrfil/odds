@@ -64,7 +64,7 @@ function coverageText(cov) {
 
 function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "") {
   const expr = String(rangeText || "").trim();
-  if (!expr) return [];
+  if (!expr) return { parts: [], coverage: null };
 
   const tags = atTagsInRange(expr);
   const isHoldem = variant === "holdem";
@@ -78,7 +78,7 @@ function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "") 
     const statExpr = coverageText(covExpr);
     if (statExpr) parts.push({ tone: "primary", text: `Range: ${statExpr}` });
   } catch {
-    return [{ tone: "error", text: "Range: invalid expression" }];
+    return { parts: [{ tone: "error", text: "Range: invalid expression" }], coverage: null };
   }
 
   const pctAtoms = extractPercentAtoms(expr);
@@ -107,7 +107,7 @@ function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "") 
     }
   }
 
-  if (!tags.length) return parts;
+  if (!tags.length) return { parts, coverage: covExpr };
   const pureTag = normalizedPureTag(expr);
 
   for (const tag of tags) {
@@ -123,7 +123,9 @@ function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "") 
     }
     try {
       const combos = previewTagCoreCombos(boardText, variant, tag);
-      const cov = previewTagCoverage(boardText, variant, tag);
+      const cov = (pureTag && pureTag === tag && covExpr && typeof covExpr === "object")
+        ? covExpr
+        : previewTagCoverage(boardText, variant, tag);
       const stat = coverageText(cov);
       let extra = "";
       if (!isHoldem && tagInfo.base === "@sd") {
@@ -141,7 +143,7 @@ function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "") 
       parts.push({ tone: "warn", text: `${tag}: invalid board input` });
     }
   }
-  return parts;
+  return { parts, coverage: covExpr };
 }
 
 self.onmessage = (event) => {
@@ -149,16 +151,21 @@ self.onmessage = (event) => {
   if (!msg || msg.type !== "range-live-info") return;
 
   let parts = [];
+  let coverage = null;
   try {
-    parts = computeLiveInfo(msg.rangeText, msg.boardText, msg.variant, msg.percentileProfile);
+    const out = computeLiveInfo(msg.rangeText, msg.boardText, msg.variant, msg.percentileProfile);
+    parts = Array.isArray(out?.parts) ? out.parts : [];
+    coverage = out?.coverage || null;
   } catch {
     parts = [];
+    coverage = null;
   }
 
   self.postMessage({
     type: "range-live-info-result",
     playerIndex: msg.playerIndex,
     requestId: msg.requestId,
-    parts
+    parts,
+    coverage
   });
 };

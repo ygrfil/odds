@@ -19,16 +19,6 @@ const OMAHA_SD_PREVIEW_CACHE = new Map();
 const TAG_COVERAGE_CACHE = new Map();
 const RANGE_COVERAGE_CACHE = new Map();
 const SD_TAG_MEMO = new Map();
-const OMAHA_EXACT_COVERAGE_MAX = 60_000;
-
-function hash32(str) {
-  let h = 2166136261 >>> 0;
-  for (let i = 0; i < str.length; i++) {
-    h ^= str.charCodeAt(i);
-    h = Math.imul(h, 16777619) >>> 0;
-  }
-  return h >>> 0;
-}
 
 function nChooseK(n, k) {
   if (k < 0 || k > n) return 0;
@@ -473,30 +463,7 @@ export function previewTagCoverage(boardText, variant, tag) {
     const blocked = new Set(board);
     const deck = ALL_CARDS.filter((c) => !blocked.has(c));
     const handSize = variantCardCount(variant);
-    const population = nChooseK(deck.length, handSize);
-    if (population <= OMAHA_EXACT_COVERAGE_MAX) {
-      const out = exactCoverage(deck, handSize, (hand) => categoryMatch(normalized, hand, board));
-      TAG_COVERAGE_CACHE.set(k, out);
-      return out;
-    }
-    const sampleN = handSize === 4 ? 5000 : handSize === 5 ? 4000 : 3000;
-    const sampleSeed = hash32(`${variant}|${board.join(",")}|${handSize}`) || 1;
-    const rng = makeRng(sampleSeed);
-    const scratch = [];
-    let matched = 0;
-    for (let i = 0; i < sampleN; i++) {
-      if (!pickDistinct(deck, handSize, rng, scratch)) break;
-      if (categoryMatch(normalized, scratch, board)) matched++;
-    }
-    const estMatched = sampleN > 0 ? Math.round((matched / sampleN) * population) : 0;
-    const out = {
-      matched,
-      total: sampleN,
-      pct: sampleN > 0 ? (matched * 100) / sampleN : 0,
-      approx: true,
-      population,
-      estimatedMatched: estMatched
-    };
+    const out = exactCoverage(deck, handSize, (hand) => categoryMatch(normalized, hand, board));
     TAG_COVERAGE_CACHE.set(k, out);
     return out;
   }
@@ -520,8 +487,17 @@ export function previewTagCoverage(boardText, variant, tag) {
 
 export function previewRangeCoverage(boardText, variant, rangeText, options = {}) {
   const percentileProfile = String(options?.percentileProfile || "").trim().toLowerCase();
-  const cacheKey = `${variant}|${percentileProfile}|${String(boardText || "").trim()}|${String(rangeText || "").replace(/\s+/g, "")}`;
+  const normalizedRange = String(rangeText || "").replace(/\s+/g, "");
+  const cacheKey = `${variant}|${percentileProfile}|${String(boardText || "").trim()}|${normalizedRange}`;
   if (RANGE_COVERAGE_CACHE.has(cacheKey)) return RANGE_COVERAGE_CACHE.get(cacheKey);
+  if (/^@[a-z0-9_]+\+?$/i.test(normalizedRange)) {
+    const pureTag = normalizeTagToken(normalizedRange);
+    if (pureTag) {
+      const out = previewTagCoverage(boardText, variant, pureTag);
+      RANGE_COVERAGE_CACHE.set(cacheKey, out);
+      return out;
+    }
+  }
 
   const board = parseCards(boardText || "");
   if (board.length > 5) {
@@ -530,7 +506,6 @@ export function previewRangeCoverage(boardText, variant, rangeText, options = {}
     return out;
   }
   const handSize = variantCardCount(variant);
-  const hasTagExpr = /@[a-z0-9_]+/i.test(String(rangeText || ""));
   const compiled = compileRange(rangeText || "*", variant, board, { percentileProfile });
   const helpers = { categoryMatch };
 
@@ -539,14 +514,17 @@ export function previewRangeCoverage(boardText, variant, rangeText, options = {}
     const deck = ALL_CARDS.filter((c) => !blocked.has(c));
     const baseMask = new Uint8Array(52);
     for (let i = 0; i < deck.length; i++) baseMask[deck[i]] = 1;
-    const hasSdTag = /@sd(?:\d+)?\+?/i.test(String(rangeText || ""));
-    const compactExpr = String(rangeText || "").replace(/\s+/g, "").toLowerCase();
-    const pctToken = "(?:100(?:\\.0+)?|[0-9]{1,2}(?:\\.[0-9]+)?)";
-    const simpleTagExpr = new RegExp(`^@[a-z0-9_]+\\+?(?::(?:${pctToken}%|${pctToken}%-${pctToken}%))?$`).test(compactExpr);
-    const sampleN = hasTagExpr
-      ? (handSize === 4 ? 5000 : handSize === 5 ? 5500 : 3500)
-      : (handSize === 4 ? 12000 : handSize === 5 ? 9000 : 7000);
     const population = nChooseK(deck.length, handSize);
+    if (!normalizedRange || normalizedRange === "*") {
+      const out = { matched: population, total: population, pct: 100, approx: false };
+      RANGE_COVERAGE_CACHE.set(cacheKey, out);
+      return out;
+    }
+    if ((compiled.weight || 0) <= 0) {
+      const out = { matched: 0, total: population, pct: 0, approx: false };
+      RANGE_COVERAGE_CACHE.set(cacheKey, out);
+      return out;
+    }
 
     // Exact fast-path for plain fixed-pattern ranges (e.g. K9678, AsKdQhJcT).
     // This avoids high-variance sampling noise on narrow PLO ranges.
@@ -564,50 +542,7 @@ export function previewRangeCoverage(boardText, variant, rangeText, options = {}
       return out;
     }
 
-    // Precision path: for PLO4/PLO5 non-tag expressions, run exact counting so
-    // helper combo counts always match real range definitions.
-    if (!hasTagExpr && handSize <= 5) {
-      const out = exactCoverage(deck, handSize, (hand) => compiled.predicate(hand, null, helpers));
-      RANGE_COVERAGE_CACHE.set(cacheKey, out);
-      return out;
-    }
-
-    // Accuracy path for simple single-tag PLO4/PLO5 expressions that do not
-    // use SD outs logic: exact counting keeps helper output consistent with
-    // equivalent explicit-rank expressions (e.g. @s vs K9,98,AK on QsJhTs).
-    if (hasTagExpr && simpleTagExpr && !hasSdTag && handSize <= 5 && population <= 2_700_000) {
-      const out = exactCoverage(deck, handSize, (hand) => compiled.predicate(hand, null, helpers));
-      RANGE_COVERAGE_CACHE.set(cacheKey, out);
-      return out;
-    }
-
-    const exactLimit = hasTagExpr
-      ? OMAHA_EXACT_COVERAGE_MAX
-      : (handSize <= 4 ? 300000 : 90000);
-    if (population <= exactLimit) {
-      const out = exactCoverage(deck, handSize, (hand) => compiled.predicate(hand, null, helpers));
-      RANGE_COVERAGE_CACHE.set(cacheKey, out);
-      return out;
-    }
-    // Use one deterministic sample stream per board/variant/profile so
-    // logically related expressions (e.g. @s vs @s+) stay comparable.
-    const sampleSeed = hash32(`${variant}|${percentileProfile}|${board.join(",")}|${handSize}|coverage-sample`) || 1;
-    const rng = makeRng(sampleSeed);
-    const scratch = [];
-    let matched = 0;
-    for (let i = 0; i < sampleN; i++) {
-      if (!pickDistinct(deck, handSize, rng, scratch)) break;
-      if (compiled.predicate(scratch, null, helpers)) matched++;
-    }
-    const estMatched = sampleN > 0 ? Math.round((matched / sampleN) * population) : 0;
-    const out = {
-      matched,
-      total: sampleN,
-      pct: sampleN > 0 ? (matched * 100) / sampleN : 0,
-      approx: true,
-      population,
-      estimatedMatched: estMatched
-    };
+    const out = exactCoverage(deck, handSize, (hand) => compiled.predicate(hand, null, helpers));
     RANGE_COVERAGE_CACHE.set(cacheKey, out);
     return out;
   }
@@ -949,7 +884,7 @@ export function rawToResult(raw, config) {
     }
     const displayComboCount = Number.isFinite(rangeComboCount) ? rangeComboCount : comboCount;
     const comboLabel = Number.isFinite(rangeComboCount)
-      ? `${rangeComboApprox ? "~" : ""}${displayComboCount.toLocaleString()}${comboCount !== displayComboCount ? ` (seen ${comboCount.toLocaleString()})` : ""}`
+      ? `${rangeComboApprox ? "~" : ""}${displayComboCount.toLocaleString()}`
       : comboCount.toLocaleString();
 
     const classes = classCounts[i]

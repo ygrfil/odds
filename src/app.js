@@ -25,7 +25,9 @@ const liveInfoState = {
   timers: new Map(),
   latestRequestByPlayer: new Map(),
   nodeByPlayer: new Map(),
-  contextByPlayer: new Map()
+  contextByPlayer: new Map(),
+  coverageByPlayer: new Map(),
+  coverageReadyByPlayer: new Map()
 };
 
 const el = {
@@ -288,7 +290,9 @@ function rangeLiveInfo(
     } else {
       try {
         const combos = previewTagCoreCombos(boardText, variant, tag);
-        const cov = previewTagCoverage(boardText, variant, tag);
+        const cov = (pureTag && pureTag === tag && covExpr && typeof covExpr === "object")
+          ? covExpr
+          : previewTagCoverage(boardText, variant, tag);
         const stat = coverageText(cov);
         let extra = "";
         if (!isHoldem && tagInfo.base === "@sd") {
@@ -341,6 +345,12 @@ function initLiveInfoWorker() {
       const node = liveInfoState.nodeByPlayer.get(playerIndex);
       if (!node) return;
       renderLiveInfo(node, Array.isArray(msg.parts) ? msg.parts : []);
+      if (msg.coverage && typeof msg.coverage === "object") {
+        liveInfoState.coverageByPlayer.set(playerIndex, msg.coverage);
+      } else {
+        liveInfoState.coverageByPlayer.delete(playerIndex);
+      }
+      liveInfoState.coverageReadyByPlayer.set(playerIndex, requestId);
     };
     worker.onerror = () => {
       worker.terminate();
@@ -365,6 +375,12 @@ function pruneLiveInfoState() {
   }
   for (const idx of liveInfoState.contextByPlayer.keys()) {
     if (idx >= maxPlayers) liveInfoState.contextByPlayer.delete(idx);
+  }
+  for (const idx of liveInfoState.coverageByPlayer.keys()) {
+    if (idx >= maxPlayers) liveInfoState.coverageByPlayer.delete(idx);
+  }
+  for (const idx of liveInfoState.coverageReadyByPlayer.keys()) {
+    if (idx >= maxPlayers) liveInfoState.coverageReadyByPlayer.delete(idx);
   }
 }
 
@@ -407,6 +423,8 @@ function queueLiveInfoUpdate(playerIndex, rangeText, immediate = false) {
     variant,
     percentileProfile: currentOrderingProfile(variant)
   });
+  liveInfoState.coverageByPlayer.delete(playerIndex);
+  liveInfoState.coverageReadyByPlayer.delete(playerIndex);
   const prevTimer = liveInfoState.timers.get(playerIndex);
   if (prevTimer) clearTimeout(prevTimer);
   const delay = immediate ? 0 : 180;
@@ -565,17 +583,101 @@ function playerOutputRow(row, rowIndex, allRows) {
   return wrap;
 }
 
-function buildRangeCoverageSnapshot(config) {
-  const boardText = String(config.board || "");
+function coverageForConfigPlayer(config, playerIndex) {
+  const boardText = String(config.board || "").trim();
   const variant = String(config.variant || "");
   const percentileProfile = String(config.percentileProfile || "");
-  return (config.players || []).map((p) => {
-    try {
-      return previewRangeCoverage(boardText, variant, String(p?.range || "*"), { percentileProfile });
-    } catch {
-      return null;
+  const players = Array.isArray(config.players) ? config.players : [];
+  const rangeText = String(players[playerIndex]?.range || "*");
+  const ctx = liveInfoState.contextByPlayer.get(playerIndex);
+  const cov = liveInfoState.coverageByPlayer.get(playerIndex);
+  const contextMatches = !!ctx
+    && String(ctx.rangeText || "").trim() === rangeText
+    && String(ctx.boardText || "") === boardText
+    && String(ctx.variant || "") === variant
+    && String(ctx.percentileProfile || "") === percentileProfile;
+  if (contextMatches && cov && typeof cov === "object") return cov;
+  return null;
+}
+
+function buildRangeCoverageSnapshot(config) {
+  const players = Array.isArray(config.players) ? config.players : [];
+  const out = [];
+  for (let i = 0; i < players.length; i++) {
+    const cached = coverageForConfigPlayer(config, i);
+    if (cached) {
+      out.push(cached);
+      continue;
     }
+    // Keep run button responsive: if worker is available, avoid heavy sync
+    // exact recomputation on the main thread.
+    if (liveInfoState.worker) {
+      out.push(null);
+      continue;
+    }
+    try {
+      const boardText = String(config.board || "").trim();
+      const variant = String(config.variant || "");
+      const percentileProfile = String(config.percentileProfile || "");
+      const rangeText = String(players[i]?.range || "*");
+      out.push(previewRangeCoverage(boardText, variant, rangeText, { percentileProfile }));
+    } catch {
+      out.push(null);
+    }
+  }
+  return out;
+}
+
+function waitForCoverage(config, playerIndex, signal, baselineReadyId = 0, timeoutMs = 0) {
+  const started = performance.now();
+  return new Promise((resolve) => {
+    const poll = () => {
+      if (signal?.aborted) {
+        resolve(null);
+        return;
+      }
+      const cov = coverageForConfigPlayer(config, playerIndex);
+      if (cov) {
+        resolve(cov);
+        return;
+      }
+      const readyId = Number(liveInfoState.coverageReadyByPlayer.get(playerIndex) || 0);
+      if (readyId && readyId !== baselineReadyId) {
+        resolve(null);
+        return;
+      }
+      if (timeoutMs > 0 && performance.now() - started >= timeoutMs) {
+        resolve(null);
+        return;
+      }
+      setTimeout(poll, 40);
+    };
+    poll();
   });
+}
+
+async function collectRangeCoverageSnapshot(config, signal) {
+  const snapshot = buildRangeCoverageSnapshot(config);
+  if (!liveInfoState.worker) return snapshot;
+  if (signal?.aborted) return snapshot;
+  const players = Array.isArray(config.players) ? config.players : [];
+  const missing = [];
+  for (let i = 0; i < players.length; i++) {
+    if (!snapshot[i]) missing.push(i);
+  }
+  if (!missing.length) return snapshot;
+  const readyBaseline = new Map();
+  for (const i of missing) {
+    readyBaseline.set(i, Number(liveInfoState.coverageReadyByPlayer.get(i) || 0));
+    queueLiveInfoUpdate(i, players[i]?.range || "*", true);
+  }
+  const resolved = await Promise.all(
+    missing.map((i) => waitForCoverage(config, i, signal, readyBaseline.get(i) || 0, 0))
+  );
+  for (let j = 0; j < missing.length; j++) {
+    snapshot[missing[j]] = resolved[j];
+  }
+  return snapshot;
 }
 
 function renderPlayers() {
@@ -674,16 +776,18 @@ function currentConfig() {
 
 async function run() {
   if (state.isRunning) return;
-  const config = currentConfig();
-  config.rangeCoverage = buildRangeCoverageSnapshot(config);
-  runAbortController = new AbortController();
   state.isRunning = true;
-  setStatus("Running simulation...");
   el.run.disabled = true;
   el.stop.disabled = false;
+  runAbortController = new AbortController();
 
   try {
+    const config = currentConfig();
     const controller = runAbortController;
+    setStatus("Preparing exact range coverage...");
+    config.rangeCoverage = await collectRangeCoverageSnapshot(config, controller?.signal);
+    if (!controller || controller.signal.aborted) throw new DOMException("Aborted", "AbortError");
+    setStatus("Running simulation...");
     const result = await runSimulation(config, (p) => {
       const ips = Number(p.ips);
       if (Number.isFinite(ips) && ips > 0 && Number(p.iterations) > 0) {

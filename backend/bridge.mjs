@@ -317,6 +317,25 @@ function cardsKey(cards, ordered = true) {
   return arr.map((c) => cardToText(c)).join("");
 }
 
+function exactCoverageHint(config, playerIndex, totalSpace) {
+  const entries = Array.isArray(config?.rangeCoverage) ? config.rangeCoverage : null;
+  if (!entries || playerIndex < 0 || playerIndex >= entries.length) return null;
+  const cov = entries[playerIndex];
+  if (!cov || typeof cov !== "object" || cov.approx) return null;
+  const matchedNum = Number(cov.matched);
+  const totalNum = Number(cov.total);
+  if (!Number.isFinite(matchedNum) || !Number.isFinite(totalNum) || totalNum <= 0) return null;
+  const totalRounded = Math.round(totalNum);
+  const spaceRounded = Math.round(Number(totalSpace) || 0);
+  if (totalRounded <= 0 || spaceRounded <= 0 || totalRounded !== spaceRounded) return null;
+  const matched = Math.max(0, Math.min(totalRounded, Math.round(matchedNum)));
+  return {
+    matched,
+    total: totalRounded,
+    acceptance: matched / totalRounded
+  };
+}
+
 function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx, rng) {
   const handSize = variantHandSize(config.variant);
   const rawRangeText = String(player.range || "*").trim() || "*";
@@ -355,12 +374,23 @@ function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx
   }
   const helpers = { categoryMatch: (tag, hand, board) => categoryMatchTag(tag, hand, board) };
   const predicate = (hand) => compiled.predicate(hand, null, helpers);
+  const totalSpace = nChooseK(baseDeck.length, handSize);
+  const covHint = exactCoverageHint(config, idx, totalSpace);
+  if (covHint) {
+    if (covHint.matched <= 0) {
+      throw new Error(`Player ${idx + 1} range appears empty on this board/dead-card setup`);
+    }
+    if (covHint.matched >= totalSpace) {
+      return { mode: "all", hand_size: handSize };
+    }
+  }
 
   if (handSize <= 4) {
-    const totalSpace = nChooseK(baseDeck.length, handSize);
     const hasTag = /@[a-z0-9_]+/i.test(rangeText);
     const hasSdTag = /@sd(?:\d+)?/i.test(rangeText);
-    const acceptance = estimateRangeAcceptance(baseDeck, handSize, predicate, rng, hasTag ? 96 : 320);
+    const acceptance = covHint
+      ? covHint.acceptance
+      : estimateRangeAcceptance(baseDeck, handSize, predicate, rng, hasTag ? 96 : 320);
 
     // Full 4-card enumeration is very expensive for dynamic tags like @sd.
     // In Monte Carlo mode, a large random pool is enough and much faster.
@@ -406,11 +436,12 @@ function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx
 
   const hasTag = /@[a-z0-9_]+/i.test(rangeText);
   const hasSdTag = /@sd(?:\d+)?/i.test(rangeText);
-  const totalSpace = nChooseK(baseDeck.length, handSize);
   if (!hasTag && handSize === 5) {
     // Accuracy path for PLO5 non-tag ranges:
     // Build an exact pool when range is moderate; otherwise keep a bounded uniform reservoir.
-    const acceptance = estimateRangeAcceptance(baseDeck, handSize, predicate, rng, 220);
+    const acceptance = covHint
+      ? covHint.acceptance
+      : estimateRangeAcceptance(baseDeck, handSize, predicate, rng, 220);
     const estimatedMatched = Math.round(totalSpace * acceptance);
     const exactCap = 320_000;
     if (estimatedMatched <= Math.round(exactCap * 1.2)) {
