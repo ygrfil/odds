@@ -107,7 +107,14 @@ func main() {
 	mux.HandleFunc("/api/sim/run", makeRunHandler(projectRoot, bridgePath))
 	mux.HandleFunc("/api/sim/preview/tag", makePreviewTagHandler(projectRoot, bridgePath))
 	mux.HandleFunc("/api/sim/preview/range", makePreviewRangeHandler(projectRoot, bridgePath))
-	mux.Handle("/", http.FileServer(http.Dir(projectRoot)))
+	staticFS := http.FileServer(http.Dir(projectRoot))
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Keep frontend assets fresh during active development.
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+		staticFS.ServeHTTP(w, r)
+	}))
 
 	server := &http.Server{
 		Addr:              ":" + port,

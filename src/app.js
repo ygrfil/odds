@@ -320,13 +320,25 @@ function playerOutputRow(row) {
     <span><strong>W</strong> ${row.win}</span>
     <span><strong>T</strong> ${row.tie}</span>
     <span><strong>L</strong> ${row.loss}</span>
-    <span><strong>Combos</strong> ${row.combos}</span>`;
+    <span><strong>Combos</strong> ${row.comboLabel || row.combos}</span>`;
 
   const classes = document.createElement("div");
   classes.className = "player-classes";
   classes.textContent = row.classes || "";
   wrap.appendChild(classes);
   return wrap;
+}
+
+function buildRangeCoverageSnapshot(config) {
+  const boardText = String(config.board || "");
+  const variant = String(config.variant || "");
+  return (config.players || []).map((p) => {
+    try {
+      return previewRangeCoverage(boardText, variant, String(p?.range || "*"));
+    } catch {
+      return null;
+    }
+  });
 }
 
 function renderPlayers() {
@@ -424,6 +436,7 @@ function currentConfig() {
 async function run() {
   if (state.isRunning) return;
   const config = currentConfig();
+  config.rangeCoverage = buildRangeCoverageSnapshot(config);
   runAbortController = new AbortController();
   state.isRunning = true;
   setStatus("Running simulation...");

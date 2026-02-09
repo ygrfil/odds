@@ -540,10 +540,29 @@ export function previewRangeCoverage(boardText, variant, rangeText) {
   if (variant !== "holdem") {
     const blocked = new Set(board);
     const deck = ALL_CARDS.filter((c) => !blocked.has(c));
+    const baseMask = new Uint8Array(52);
+    for (let i = 0; i < deck.length; i++) baseMask[deck[i]] = 1;
     const sampleN = hasTagExpr
       ? (handSize === 4 ? 5000 : handSize === 5 ? 4000 : 3000)
       : (handSize === 4 ? 12000 : handSize === 5 ? 9000 : 7000);
     const population = nChooseK(deck.length, handSize);
+
+    // Exact fast-path for plain fixed-pattern ranges (e.g. K9678, AsKdQhJcT).
+    // This avoids high-variance sampling noise on narrow PLO ranges.
+    const fixed = tryParseFixedPattern(rangeText || "*", handSize);
+    if (fixed) {
+      const pool = buildPoolFromFixedPattern(fixed, baseMask);
+      const matched = pool.length;
+      const out = {
+        matched,
+        total: population,
+        pct: population > 0 ? (matched * 100) / population : 0,
+        approx: false
+      };
+      RANGE_COVERAGE_CACHE.set(cacheKey, out);
+      return out;
+    }
+
     const exactLimit = hasTagExpr
       ? OMAHA_EXACT_COVERAGE_MAX
       : (handSize <= 4 ? 300000 : 90000);
@@ -895,6 +914,33 @@ export function rawToResult(raw, config) {
       else if (Array.isArray(cl)) comboCount = cl.length;
       else comboCount = 0;
     }
+    comboCount = Math.max(0, Math.round(Number(comboCount) || 0));
+
+    let rangeComboCount = null;
+    let rangeComboApprox = false;
+    const cov = Array.isArray(config.rangeCoverage) ? config.rangeCoverage[i] : null;
+    if (cov && typeof cov === "object") {
+      if (cov.approx) {
+        const est = Number(cov.estimatedMatched);
+        const matched = Number(cov.matched);
+        if (Number.isFinite(est) && est >= 0) {
+          rangeComboCount = Math.round(est);
+          rangeComboApprox = true;
+        } else if (Number.isFinite(matched) && matched >= 0) {
+          rangeComboCount = Math.round(matched);
+          rangeComboApprox = true;
+        }
+      } else {
+        const matched = Number(cov.matched);
+        if (Number.isFinite(matched) && matched >= 0) {
+          rangeComboCount = Math.round(matched);
+        }
+      }
+    }
+    const displayComboCount = Number.isFinite(rangeComboCount) ? rangeComboCount : comboCount;
+    const comboLabel = Number.isFinite(rangeComboCount)
+      ? `${rangeComboApprox ? "~" : ""}${displayComboCount.toLocaleString()}${comboCount !== displayComboCount ? ` (seen ${comboCount.toLocaleString()})` : ""}`
+      : comboCount.toLocaleString();
 
     const classes = classCounts[i]
       .map((v, idx) => ({ name: CLASS_NAMES[idx], v }))
@@ -910,7 +956,10 @@ export function rawToResult(raw, config) {
       win: `${winPct.toFixed(2)}%`,
       tie: `${tiePct.toFixed(2)}%`,
       loss: `${lossPct.toFixed(2)}%`,
-      combos: comboCount,
+      combos: displayComboCount,
+      combosSeen: comboCount,
+      combosApprox: rangeComboApprox,
+      comboLabel,
       classes
     };
   });

@@ -450,7 +450,8 @@ function atomCompiler(rawAtom, variant, contextBoard) {
     };
   }
 
-  const pctRange = atom.match(/^([0-9]{1,2}(?:\.[0-9]+)?)%-([0-9]{1,2}(?:\.[0-9]+)?)%$/);
+  const PCT_TOKEN_RE = "(?:100(?:\\.0+)?|[0-9]{1,2}(?:\\.[0-9]+)?)";
+  const pctRange = atom.match(new RegExp(`^(${PCT_TOKEN_RE})%-(${PCT_TOKEN_RE})%$`));
   if (pctRange) {
     const low = Number(pctRange[1]);
     const high = Number(pctRange[2]);
@@ -472,7 +473,7 @@ function atomCompiler(rawAtom, variant, contextBoard) {
     };
   }
 
-  const pctTop = atom.match(/^([0-9]{1,2}(?:\.[0-9]+)?)%$/);
+  const pctTop = atom.match(new RegExp(`^(${PCT_TOKEN_RE})%$`));
   if (pctTop) {
     const p = Number(pctTop[1]);
     const exact = exactPercentileTable(variant);
