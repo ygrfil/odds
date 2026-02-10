@@ -1,6 +1,8 @@
 import { previewTagCoverage, previewRangeCoverage } from "./sim-core.js";
 import { extractNormalizedTags, normalizePureTagToken, splitTagToken } from "./tag-utils.js";
 
+const REMOTE_COVERAGE_CACHE = new Map();
+
 function atTagsInRange(rangeText) {
   return extractNormalizedTags(rangeText);
 }
@@ -62,7 +64,54 @@ function coverageText(cov) {
   return `${cov.pct.toFixed(1)}%, ${cov.matched.toLocaleString()}/${cov.total.toLocaleString()} combos`;
 }
 
-function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "") {
+function canUseBackendPreview() {
+  if (typeof fetch !== "function") return false;
+  const proto = String(self?.location?.protocol || "");
+  return proto.startsWith("http");
+}
+
+function shouldUseBackendPreview(rangeText) {
+  const compact = String(rangeText || "").replace(/\s+/g, "");
+  if (!compact) return false;
+  if (/@[a-z0-9_]+/i.test(compact)) return false;
+  const hasPct = compact.includes("%");
+  const hasBooleanOps = /[!:()]/.test(compact);
+  return (hasPct && hasBooleanOps) || compact.length >= 28;
+}
+
+async function previewRangeCoverageFast(boardText, variant, rangeText, percentileProfile = "") {
+  const key = `${variant}|${percentileProfile}|${String(boardText || "").trim()}|${String(rangeText || "").replace(/\s+/g, "")}`;
+  if (REMOTE_COVERAGE_CACHE.has(key)) return REMOTE_COVERAGE_CACHE.get(key);
+  if (canUseBackendPreview() && shouldUseBackendPreview(rangeText)) {
+    try {
+      const res = await fetch("/api/sim/preview-range", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          boardText,
+          variant,
+          rangeText,
+          percentileProfile
+        })
+      });
+      if (res.ok) {
+        const payload = await res.json();
+        const cov = payload?.coverage;
+        if (cov && typeof cov === "object") {
+          REMOTE_COVERAGE_CACHE.set(key, cov);
+          return cov;
+        }
+      }
+    } catch {
+      // fallback to local path below
+    }
+  }
+  const local = previewRangeCoverage(boardText, variant, rangeText, { percentileProfile });
+  REMOTE_COVERAGE_CACHE.set(key, local);
+  return local;
+}
+
+async function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "") {
   const expr = String(rangeText || "").trim();
   if (!expr) return { parts: [], coverage: null };
 
@@ -74,7 +123,7 @@ function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "") 
   let covExpr = null;
 
   try {
-    covExpr = previewRangeCoverage(boardText, variant, expr, { percentileProfile });
+    covExpr = await previewRangeCoverageFast(boardText, variant, expr, percentileProfile);
     const statExpr = coverageText(covExpr);
     if (statExpr) parts.push({ tone: "primary", text: `Range: ${statExpr}` });
   } catch {
@@ -91,7 +140,7 @@ function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "") 
   if (covExpr && pctAtoms.length && !pctSpec) {
     try {
       const baseExpr = pctAtoms.join(",");
-      const baseCov = previewRangeCoverage(boardText, variant, baseExpr, { percentileProfile });
+      const baseCov = await previewRangeCoverageFast(boardText, variant, baseExpr, percentileProfile);
       const exprCnt = coverageCounts(covExpr);
       const baseCnt = coverageCounts(baseCov);
       if (baseCnt.matched > 0) {
@@ -145,23 +194,24 @@ function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "") 
 self.onmessage = (event) => {
   const msg = event.data;
   if (!msg || msg.type !== "range-live-info") return;
+  (async () => {
+    let parts = [];
+    let coverage = null;
+    try {
+      const out = await computeLiveInfo(msg.rangeText, msg.boardText, msg.variant, msg.percentileProfile);
+      parts = Array.isArray(out?.parts) ? out.parts : [];
+      coverage = out?.coverage || null;
+    } catch {
+      parts = [];
+      coverage = null;
+    }
 
-  let parts = [];
-  let coverage = null;
-  try {
-    const out = computeLiveInfo(msg.rangeText, msg.boardText, msg.variant, msg.percentileProfile);
-    parts = Array.isArray(out?.parts) ? out.parts : [];
-    coverage = out?.coverage || null;
-  } catch {
-    parts = [];
-    coverage = null;
-  }
-
-  self.postMessage({
-    type: "range-live-info-result",
-    playerIndex: msg.playerIndex,
-    requestId: msg.requestId,
-    parts,
-    coverage
-  });
+    self.postMessage({
+      type: "range-live-info-result",
+      playerIndex: msg.playerIndex,
+      requestId: msg.requestId,
+      parts,
+      coverage
+    });
+  })();
 };

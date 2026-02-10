@@ -3,6 +3,8 @@ use std::io::{self, Read};
 use anyhow::{Context, Result};
 use aya_poker::base::{Hand, CARDS};
 use aya_poker::{omaha_rank, poker_rank, PokerRankCategory};
+use base64::engine::general_purpose::STANDARD as B64_STANDARD;
+use base64::Engine as _;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
@@ -29,6 +31,10 @@ struct Request {
     confidence_target_pct: Option<f64>,
     confidence_min_iters: Option<usize>,
     confidence_level: Option<f64>,
+    #[serde(default)]
+    hand_size: usize,
+    pool_cap: Option<usize>,
+    plan: Option<PlanNodeReq>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,6 +50,7 @@ struct Response {
     error: Option<String>,
     raw: Option<RawOut>,
     equity_rank: Option<EquityRankOut>,
+    pool_build: Option<PoolBuildOut>,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +86,72 @@ struct EquityRankOut {
     score_keys_by_combo_rank: Vec<u16>,
     top_score_keys: Vec<u16>,
     top_ranks: Vec<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct PoolBuildOut {
+    variant: String,
+    hand_size: usize,
+    total: usize,
+    matched: usize,
+    pool: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind")]
+enum PlanNodeReq {
+    #[serde(rename = "or")]
+    Or {
+        left: Box<PlanNodeReq>,
+        right: Box<PlanNodeReq>,
+    },
+    #[serde(rename = "and")]
+    And {
+        left: Box<PlanNodeReq>,
+        right: Box<PlanNodeReq>,
+    },
+    #[serde(rename = "not")]
+    Not {
+        left: Box<PlanNodeReq>,
+        right: Box<PlanNodeReq>,
+    },
+    #[serde(rename = "specs")]
+    Specs {
+        entries: Vec<Vec<SpecReq>>,
+    },
+    #[serde(rename = "pct_bits")]
+    PctBits {
+        bits_b64: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct SpecReq {
+    ranks_mask: u16,
+    rank_var: i8,
+    suit_mode: u8,
+    suit_value: i8,
+}
+
+#[derive(Clone)]
+enum PlanNode {
+    Or(Box<PlanNode>, Box<PlanNode>),
+    And(Box<PlanNode>, Box<PlanNode>),
+    Not(Box<PlanNode>, Box<PlanNode>),
+    Specs {
+        entries: Vec<Vec<Spec>>,
+    },
+    PctBits {
+        bits: Vec<u8>,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct Spec {
+    ranks_mask: u16,
+    rank_var: i8,
+    suit_mode: u8,
+    suit_value: i8,
 }
 
 #[derive(Clone)]
@@ -160,6 +233,7 @@ fn main() {
             error: Some(err.to_string()),
             raw: None,
             equity_rank: None,
+            pool_build: None,
         };
         let _ = serde_json::to_writer(io::stdout(), &out);
     }
@@ -176,6 +250,7 @@ fn real_main() -> Result<()> {
     match mode {
         "sim" => run_sim_mode(&req),
         "equity-rank" => run_equity_rank_mode(&req),
+        "build-pool" => run_build_pool_mode(&req),
         _ => anyhow::bail!("unsupported mode '{}'", mode),
     }
 }
@@ -282,6 +357,7 @@ fn run_sim_mode(req: &Request) -> Result<()> {
             confidence_level: conf.level,
         }),
         equity_rank: None,
+        pool_build: None,
     };
     serde_json::to_writer(io::stdout(), &out).context("failed to write output json")?;
     Ok(())
@@ -354,9 +430,366 @@ fn run_equity_rank_mode(req: &Request) -> Result<()> {
             top_score_keys: stats.top_score_keys,
             top_ranks: stats.top_ranks,
         }),
+        pool_build: None,
     };
     serde_json::to_writer(io::stdout(), &out).context("failed to write output json")?;
     Ok(())
+}
+
+fn run_build_pool_mode(req: &Request) -> Result<()> {
+    let expected = variant_hand_size(&req.variant);
+    if expected == 0 {
+        anyhow::bail!("unsupported variant '{}'", req.variant);
+    }
+    validate_board_and_dead(&req.board, &req.dead)?;
+
+    let hand_size = if req.hand_size > 0 {
+        req.hand_size
+    } else {
+        expected
+    };
+    if hand_size != expected {
+        anyhow::bail!(
+            "hand_size {} does not match variant {} ({})",
+            hand_size,
+            req.variant,
+            expected
+        );
+    }
+
+    let cap = req.pool_cap.unwrap_or(320_000).max(1);
+    let plan_req = req.plan.as_ref().context("missing plan for build-pool mode")?;
+    let plan = compile_plan_node(plan_req)?;
+    let choose = build_choose_table();
+    let seed = req.seed.unwrap_or(0xC0DE_F00D_9E37_79B9);
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    let mut blocked = [false; 52];
+    for &c in req.board.iter().chain(req.dead.iter()) {
+        blocked[c as usize] = true;
+    }
+    let mut base_deck = Vec::with_capacity(52 - req.board.len() - req.dead.len());
+    for c in 0u8..52u8 {
+        if !blocked[c as usize] {
+            base_deck.push(c);
+        }
+    }
+    if base_deck.len() < hand_size {
+        anyhow::bail!("not enough available cards for hand_size {}", hand_size);
+    }
+
+    let total = n_choose_k(base_deck.len(), hand_size);
+    let mut hand = vec![0u8; hand_size];
+    let mut pool: Vec<Vec<u8>> = Vec::with_capacity(cap.min(total));
+    let mut matched = 0usize;
+    enumerate_pool_with_plan(
+        0,
+        0,
+        &base_deck,
+        hand_size,
+        &mut hand,
+        &plan,
+        &choose,
+        cap,
+        &mut rng,
+        &mut pool,
+        &mut matched,
+    );
+
+    let out = Response {
+        ok: true,
+        error: None,
+        raw: None,
+        equity_rank: None,
+        pool_build: Some(PoolBuildOut {
+            variant: req.variant.clone(),
+            hand_size,
+            total,
+            matched,
+            pool,
+        }),
+    };
+    serde_json::to_writer(io::stdout(), &out).context("failed to write output json")?;
+    Ok(())
+}
+
+fn compile_plan_node(req: &PlanNodeReq) -> Result<PlanNode> {
+    match req {
+        PlanNodeReq::Or { left, right } => Ok(PlanNode::Or(
+            Box::new(compile_plan_node(left)?),
+            Box::new(compile_plan_node(right)?),
+        )),
+        PlanNodeReq::And { left, right } => Ok(PlanNode::And(
+            Box::new(compile_plan_node(left)?),
+            Box::new(compile_plan_node(right)?),
+        )),
+        PlanNodeReq::Not { left, right } => Ok(PlanNode::Not(
+            Box::new(compile_plan_node(left)?),
+            Box::new(compile_plan_node(right)?),
+        )),
+        PlanNodeReq::Specs { entries } => {
+            let mut out = Vec::with_capacity(entries.len());
+            for entry in entries {
+                if entry.is_empty() {
+                    continue;
+                }
+                let mut specs = Vec::with_capacity(entry.len());
+                for s in entry {
+                    if s.rank_var < -1 || s.rank_var > 2 {
+                        anyhow::bail!("invalid rank_var {}", s.rank_var);
+                    }
+                    if s.suit_mode > 2 {
+                        anyhow::bail!("invalid suit_mode {}", s.suit_mode);
+                    }
+                    if s.suit_mode > 0 && (s.suit_value < 0 || s.suit_value > 3) {
+                        anyhow::bail!("invalid suit_value {}", s.suit_value);
+                    }
+                    specs.push(Spec {
+                        ranks_mask: s.ranks_mask & 0x1fff,
+                        rank_var: s.rank_var,
+                        suit_mode: s.suit_mode,
+                        suit_value: s.suit_value,
+                    });
+                }
+                out.push(specs);
+            }
+            if out.is_empty() {
+                anyhow::bail!("spec plan has no entries");
+            }
+            Ok(PlanNode::Specs { entries: out })
+        }
+        PlanNodeReq::PctBits { bits_b64 } => {
+            let bits = B64_STANDARD
+                .decode(bits_b64.as_bytes())
+                .context("failed to decode pct_bits")?;
+            if bits.is_empty() {
+                anyhow::bail!("pct_bits payload is empty");
+            }
+            Ok(PlanNode::PctBits { bits })
+        }
+    }
+}
+
+fn enumerate_pool_with_plan(
+    start: usize,
+    depth: usize,
+    base_deck: &[u8],
+    hand_size: usize,
+    hand: &mut [u8],
+    plan: &PlanNode,
+    choose: &ChooseTable,
+    cap: usize,
+    rng: &mut StdRng,
+    pool: &mut Vec<Vec<u8>>,
+    matched: &mut usize,
+) {
+    if depth == hand_size {
+        if !eval_plan(plan, hand, choose) {
+            return;
+        }
+        *matched += 1;
+        let copy = hand.to_vec();
+        if pool.len() < cap {
+            pool.push(copy);
+        } else {
+            let j = rng.gen_range(0..*matched);
+            if j < cap {
+                pool[j] = copy;
+            }
+        }
+        return;
+    }
+    for i in start..=base_deck.len() - (hand_size - depth) {
+        hand[depth] = base_deck[i];
+        enumerate_pool_with_plan(
+            i + 1,
+            depth + 1,
+            base_deck,
+            hand_size,
+            hand,
+            plan,
+            choose,
+            cap,
+            rng,
+            pool,
+            matched,
+        );
+    }
+}
+
+fn eval_plan(node: &PlanNode, hand: &[u8], choose: &ChooseTable) -> bool {
+    match node {
+        PlanNode::Or(left, right) => eval_plan(left, hand, choose) || eval_plan(right, hand, choose),
+        PlanNode::And(left, right) => eval_plan(left, hand, choose) && eval_plan(right, hand, choose),
+        PlanNode::Not(left, right) => eval_plan(left, hand, choose) && !eval_plan(right, hand, choose),
+        PlanNode::Specs { entries } => entries.iter().any(|specs| match_specs(specs, hand)),
+        PlanNode::PctBits { bits } => {
+            let idx = combo_rank_52(hand, choose);
+            bit_is_set(bits, idx)
+        }
+    }
+}
+
+fn bit_is_set(bits: &[u8], idx: usize) -> bool {
+    let byte = idx >> 3;
+    if byte >= bits.len() {
+        return false;
+    }
+    ((bits[byte] >> (idx & 7)) & 1) != 0
+}
+
+fn card_rank_idx(c: u8) -> usize {
+    (c as usize) / 4
+}
+
+fn card_suit_idx(c: u8) -> i8 {
+    (c % 4) as i8
+}
+
+fn rank_mask_has(mask: u16, rank_idx: usize) -> bool {
+    if rank_idx >= 13 {
+        return false;
+    }
+    (mask & (1u16 << rank_idx)) != 0
+}
+
+fn match_specs(specs_input: &[Spec], hand: &[u8]) -> bool {
+    if specs_input.len() > hand.len() {
+        return false;
+    }
+
+    const ALL_RANKS_MASK: u16 = 0x1fff;
+    let wildcard = Spec {
+        ranks_mask: ALL_RANKS_MASK,
+        rank_var: -1,
+        suit_mode: 0,
+        suit_value: -1,
+    };
+    let mut specs = Vec::with_capacity(hand.len());
+    specs.extend_from_slice(specs_input);
+    while specs.len() < hand.len() {
+        specs.push(wildcard);
+    }
+
+    let mut used = vec![false; hand.len()];
+    let mut rank_bindings = [-1i8; 3];
+    let mut suit_bindings = [-1i8; 4];
+    let mut fixed_ranks = [false; 13];
+    for spec in &specs {
+        if spec.rank_var < 0 && spec.ranks_mask.count_ones() == 1 {
+            let idx = spec.ranks_mask.trailing_zeros() as usize;
+            if idx < fixed_ranks.len() {
+                fixed_ranks[idx] = true;
+            }
+        }
+    }
+    match_specs_rec(
+        0,
+        &specs,
+        hand,
+        &mut used,
+        &mut rank_bindings,
+        &mut suit_bindings,
+        &fixed_ranks,
+    )
+}
+
+fn match_specs_rec(
+    i: usize,
+    specs: &[Spec],
+    hand: &[u8],
+    used: &mut [bool],
+    rank_bindings: &mut [i8; 3],
+    suit_bindings: &mut [i8; 4],
+    fixed_ranks: &[bool; 13],
+) -> bool {
+    if i >= specs.len() {
+        return true;
+    }
+
+    let spec = specs[i];
+    for j in 0..hand.len() {
+        if used[j] {
+            continue;
+        }
+        let c = hand[j];
+        let rank_idx = card_rank_idx(c);
+        if !rank_mask_has(spec.ranks_mask, rank_idx) {
+            continue;
+        }
+
+        let mut bound_rank_key: Option<usize> = None;
+        if spec.rank_var >= 0 {
+            let key = spec.rank_var as usize;
+            let cur = rank_bindings[key];
+            if cur >= 0 {
+                if cur != rank_idx as i8 {
+                    continue;
+                }
+            } else {
+                if fixed_ranks[rank_idx] {
+                    continue;
+                }
+                rank_bindings[key] = rank_idx as i8;
+                bound_rank_key = Some(key);
+            }
+        }
+
+        let suit = card_suit_idx(c);
+        let mut bound_suit_key: Option<usize> = None;
+        let suit_ok = match spec.suit_mode {
+            0 => true,
+            1 => suit == spec.suit_value,
+            2 => {
+                let key = spec.suit_value as usize;
+                let cur = suit_bindings[key];
+                if cur >= 0 {
+                    cur == suit
+                } else {
+                    if suit_bindings.iter().any(|&v| v == suit) {
+                        false
+                    } else {
+                        suit_bindings[key] = suit;
+                        bound_suit_key = Some(key);
+                        true
+                    }
+                }
+            }
+            _ => false,
+        };
+
+        if !suit_ok {
+            if let Some(k) = bound_rank_key {
+                rank_bindings[k] = -1;
+            }
+            if let Some(k) = bound_suit_key {
+                suit_bindings[k] = -1;
+            }
+            continue;
+        }
+
+        used[j] = true;
+        if match_specs_rec(
+            i + 1,
+            specs,
+            hand,
+            used,
+            rank_bindings,
+            suit_bindings,
+            fixed_ranks,
+        ) {
+            return true;
+        }
+        used[j] = false;
+
+        if let Some(k) = bound_rank_key {
+            rank_bindings[k] = -1;
+        }
+        if let Some(k) = bound_suit_key {
+            suit_bindings[k] = -1;
+        }
+    }
+    false
 }
 
 fn validate_equity_rank_request(req: &Request) -> Result<()> {
@@ -562,33 +995,38 @@ fn validate_request(req: &Request) -> Result<()> {
     if req.players.len() < 2 || req.players.len() > 6 {
         anyhow::bail!("players must be 2..6");
     }
-    if req.board.len() > 5 {
-        anyhow::bail!("board must have at most 5 cards");
-    }
-    for &c in &req.board {
-        if c > 51 {
-            anyhow::bail!("invalid board card id {}", c);
-        }
-    }
-    for &c in &req.dead {
-        if c > 51 {
-            anyhow::bail!("invalid dead card id {}", c);
-        }
-    }
-    let mut seen = [false; 52];
-    for &c in req.board.iter().chain(req.dead.iter()) {
-        let idx = c as usize;
-        if seen[idx] {
-            anyhow::bail!("duplicate board/dead card {}", c);
-        }
-        seen[idx] = true;
-    }
+    validate_board_and_dead(&req.board, &req.dead)?;
     match req.variant.as_str() {
         "holdem" | "plo4" | "plo5" | "plo6" => {}
         _ => anyhow::bail!("unsupported variant '{}'", req.variant),
     }
     if req.iteration_cap == 0 {
         anyhow::bail!("iteration_cap must be > 0");
+    }
+    Ok(())
+}
+
+fn validate_board_and_dead(board: &[u8], dead: &[u8]) -> Result<()> {
+    if board.len() > 5 {
+        anyhow::bail!("board must have at most 5 cards");
+    }
+    for &c in board {
+        if c > 51 {
+            anyhow::bail!("invalid board card id {}", c);
+        }
+    }
+    for &c in dead {
+        if c > 51 {
+            anyhow::bail!("invalid dead card id {}", c);
+        }
+    }
+    let mut seen = [false; 52];
+    for &c in board.iter().chain(dead.iter()) {
+        let idx = c as usize;
+        if seen[idx] {
+            anyhow::bail!("duplicate board/dead card {}", c);
+        }
+        seen[idx] = true;
     }
     Ok(())
 }

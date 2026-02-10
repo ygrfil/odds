@@ -12,7 +12,7 @@ import {
   categoryMatchTag
 } from "../src/sim-core.js";
 import { cardToText, parseCards, fullDeck } from "../src/cards.js";
-import { compileRange } from "../src/parser.js";
+import { compileRange, tryCompileRangeNativePlan } from "../src/parser.js";
 import { makeRng } from "../src/rng.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -321,7 +321,17 @@ function exactCoverageHint(config, playerIndex, totalSpace) {
   };
 }
 
-function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx, rng, requestSamplerCache = null) {
+async function buildPlayerSampler(
+  config,
+  baseDeck,
+  boardCards,
+  deadCards,
+  player,
+  idx,
+  rng,
+  requestSamplerCache = null,
+  nativeBin = ""
+) {
   const handSize = variantHandSize(config.variant);
   const rawRangeText = String(player.range || "*").trim() || "*";
   const rangeText = maybeExpandPureTagRange(rawRangeText, config.variant, boardCards);
@@ -374,8 +384,38 @@ function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx
     }
   }
 
+  const hasTag = /@[a-z0-9_]+/i.test(rangeText);
+  const nativePlan = (!hasTag && nativeBin)
+    ? tryCompileRangeNativePlan(rangeText, config.variant, boardCards, { percentileProfile })
+    : null;
+  const buildPoolViaNative = async (cap) => {
+    if (!nativeBin || !nativePlan) return null;
+    try {
+      const seed = Math.max(1, Math.floor(rng() * 0xffff_ffff)) >>> 0;
+      const payload = {
+        mode: "build-pool",
+        variant: String(config.variant || ""),
+        iteration_cap: 1,
+        board: boardCards,
+        dead: deadCards,
+        hand_size: handSize,
+        pool_cap: Math.max(1, Math.floor(Number(cap) || 1)),
+        seed,
+        plan: nativePlan
+      };
+      const resp = await runCommandWithJson(nativeBin, [], payload, PROJECT_ROOT);
+      if (!resp?.ok || !resp?.pool_build) return null;
+      const built = resp.pool_build;
+      const pool = Array.isArray(built.pool) ? built.pool : [];
+      const matched = Math.max(0, Math.floor(Number(built.matched) || 0));
+      if (!pool.length || matched <= 0) return null;
+      return { pool, matched };
+    } catch {
+      return null;
+    }
+  };
+
   if (handSize <= 4) {
-    const hasTag = /@[a-z0-9_]+/i.test(rangeText);
     const hasSdTag = /@sd(?:\d+)?/i.test(rangeText);
     const acceptance = covHint
       ? covHint.acceptance
@@ -414,7 +454,9 @@ function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx
     }
 
     const cap = handSize === 2 ? 15000 : 140000;
-    const { pool, matched } = enumerateRangePool(baseDeck, handSize, predicate, cap, rng);
+    const nativeBuilt = await buildPoolViaNative(cap);
+    const enumerated = nativeBuilt || enumerateRangePool(baseDeck, handSize, predicate, cap, rng);
+    const { pool, matched } = enumerated;
     if (!matched || pool.length === 0) {
       throw new Error(`Player ${idx + 1} range appears empty on this board/dead-card setup`);
     }
@@ -425,7 +467,6 @@ function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx
     return sampler;
   }
 
-  const hasTag = /@[a-z0-9_]+/i.test(rangeText);
   const hasSdTag = /@sd(?:\d+)?/i.test(rangeText);
   if (!hasTag && handSize === 5) {
     // Accuracy path for PLO5 non-tag ranges:
@@ -436,7 +477,9 @@ function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx
     const estimatedMatched = Math.round(totalSpace * acceptance);
     const exactCap = 320_000;
     if (estimatedMatched <= Math.round(exactCap * 1.2)) {
-      const { pool, matched } = enumerateRangePool(baseDeck, handSize, predicate, exactCap, rng);
+      const nativeBuilt = await buildPoolViaNative(exactCap);
+      const enumerated = nativeBuilt || enumerateRangePool(baseDeck, handSize, predicate, exactCap, rng);
+      const { pool, matched } = enumerated;
       if (!matched || pool.length === 0) {
         throw new Error(`Player ${idx + 1} range appears empty on this board/dead-card setup`);
       }
@@ -470,7 +513,7 @@ function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx
   return sampler;
 }
 
-function prepareNativeRequest(config, req) {
+async function prepareNativeRequest(config, req, nativeBin = "") {
   const variant = String(config.variant || "");
   const handSize = variantHandSize(variant);
   if (!handSize) throw new Error(`Unsupported variant: ${variant}`);
@@ -485,9 +528,12 @@ function prepareNativeRequest(config, req) {
   const seed = Number(req.seed || 0x9e3779b9) >>> 0;
   const rng = makeRng(seed || 1);
   const requestSamplerCache = new Map();
-  const preparedPlayers = players.map((p, i) =>
-    buildPlayerSampler(config, baseDeck, board, dead, p, i, rng, requestSamplerCache)
-  );
+  const preparedPlayers = [];
+  for (let i = 0; i < players.length; i++) {
+    preparedPlayers.push(
+      await buildPlayerSampler(config, baseDeck, board, dead, players[i], i, rng, requestSamplerCache, nativeBin)
+    );
+  }
 
   return {
     variant,
@@ -616,6 +662,42 @@ function mapNativeRaw(nativeRaw) {
   };
 }
 
+async function tryPreviewRangeCoverageNative(boardText, variant, rangeText, percentileProfile) {
+  const handSize = variantHandSize(variant);
+  if (!handSize) return null;
+  const board = parseCards(String(boardText || ""));
+  if (board.length > 5) return null;
+
+  const plan = tryCompileRangeNativePlan(rangeText, variant, board, { percentileProfile });
+  if (!plan) return null;
+
+  const nativeBin = await ensureNativeBinary();
+  if (!nativeBin) return null;
+
+  const payload = {
+    mode: "build-pool",
+    variant,
+    iteration_cap: 1,
+    board,
+    dead: [],
+    hand_size: handSize,
+    pool_cap: 1,
+    seed: 1,
+    plan
+  };
+
+  const resp = await runCommandWithJson(nativeBin, [], payload, PROJECT_ROOT);
+  if (!resp?.ok || !resp?.pool_build) return null;
+  const total = Math.max(0, Math.floor(Number(resp.pool_build.total) || 0));
+  const matched = Math.max(0, Math.floor(Number(resp.pool_build.matched) || 0));
+  return {
+    matched,
+    total,
+    pct: total > 0 ? (matched * 100) / total : 0,
+    approx: false
+  };
+}
+
 async function runNativeSimulation(config, req) {
   const totalStart = performance.now();
   if (canUseExhaustive(config)) {
@@ -632,12 +714,12 @@ async function runNativeSimulation(config, req) {
     };
   }
 
-  const prepStart = performance.now();
-  const payload = prepareNativeRequest(config, req);
-  const prepareMs = performance.now() - prepStart;
-
   const nativeBin = await ensureNativeBinary();
   if (!nativeBin) throw new Error("native simulator binary not found");
+
+  const prepStart = performance.now();
+  const payload = await prepareNativeRequest(config, req, nativeBin);
+  const prepareMs = performance.now() - prepStart;
   const nativeStart = performance.now();
   const resp = await runCommandWithJson(nativeBin, [], payload, PROJECT_ROOT);
   const nativeMs = performance.now() - nativeStart;
@@ -710,7 +792,13 @@ async function main() {
     const variant = String(req.variant || "");
     const rangeText = String(req.rangeText || "");
     const percentileProfile = String(req.percentileProfile || "").trim().toLowerCase();
-    const coverage = previewRangeCoverage(boardText, variant, rangeText, { percentileProfile });
+    let coverage = null;
+    try {
+      coverage = await tryPreviewRangeCoverageNative(boardText, variant, rangeText, percentileProfile);
+    } catch {
+      coverage = null;
+    }
+    if (!coverage) coverage = previewRangeCoverage(boardText, variant, rangeText, { percentileProfile });
     writeJson({ ok: true, coverage });
     return;
   }

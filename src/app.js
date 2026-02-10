@@ -121,6 +121,7 @@ const PRECISION_PRESETS = {
 };
 const DEFAULT_PRECISION_PRESET = "ci20";
 const DEFAULT_PERCENTILE_PROFILE = PERCENTILE_PROFILE_OURS;
+const RUN_COVERAGE_WAIT_BUDGET_MS = 220;
 
 function normalizePrecisionPreset(value) {
   const key = String(value || "").trim().toLowerCase();
@@ -528,13 +529,26 @@ function renderSummary(result) {
     return;
   }
   const engine = result.backend ? "NATIVE BACKEND" : "BROWSER";
-  const total = (result.elapsedMs / 1000).toFixed(2);
+  const totalMs = result.backend && result.timings && Number(result.timings.endToEndMs) > 0
+    ? Number(result.timings.endToEndMs)
+    : Number(result.elapsedMs || 0);
+  const total = (Math.max(0, totalMs) / 1000).toFixed(2);
   let extra = "";
   if (result.backend && result.timings) {
+    const coverage = Number(result.timings.coverageMs || 0);
     const prep = Number(result.timings.prepareMs || 0);
     const sim = Number(result.timings.nativeMs || result.backendComputeMs || 0);
+    const backendTotal = Number(result.timings.totalMs || 0);
+    const backendInit = Math.max(0, backendTotal - prep - sim);
+    const parts = [];
+    if (coverage > 0.5) parts.push(`coverage ${(coverage / 1000).toFixed(2)}s`);
+    if (backendInit > 0.5) parts.push(`backend init ${(backendInit / 1000).toFixed(2)}s`);
     if (prep > 0 || sim > 0) {
-      extra = ` • prep ${(prep / 1000).toFixed(2)}s • sim ${(sim / 1000).toFixed(2)}s`;
+      parts.push(`prep ${(prep / 1000).toFixed(2)}s`);
+      parts.push(`sim ${(sim / 1000).toFixed(2)}s`);
+    }
+    if (parts.length) {
+      extra = ` • ${parts.join(" • ")}`;
     }
   }
   let confText = "";
@@ -685,7 +699,7 @@ async function collectRangeCoverageSnapshot(config, signal) {
     queueLiveInfoUpdate(i, players[i]?.range || "*", true);
   }
   const resolved = await Promise.all(
-    missing.map((i) => waitForCoverage(config, i, signal, readyBaseline.get(i) || 0, 0))
+    missing.map((i) => waitForCoverage(config, i, signal, readyBaseline.get(i) || 0, RUN_COVERAGE_WAIT_BUDGET_MS))
   );
   for (let j = 0; j < missing.length; j++) {
     snapshot[missing[j]] = resolved[j];
@@ -793,12 +807,15 @@ async function run() {
   el.run.disabled = true;
   el.stop.disabled = false;
   runAbortController = new AbortController();
+  const endToEndStarted = performance.now();
 
   try {
     const config = currentConfig();
     const controller = runAbortController;
     setStatus("Preparing exact range coverage...");
+    const coverageStarted = performance.now();
     config.rangeCoverage = await collectRangeCoverageSnapshot(config, controller?.signal);
+    const coverageMs = performance.now() - coverageStarted;
     if (!controller || controller.signal.aborted) throw new DOMException("Aborted", "AbortError");
     setStatus("Running simulation...");
     const result = await runSimulation(config, (p) => {
@@ -809,15 +826,36 @@ async function run() {
         setStatus(`Running... preparing/evaluating ranges | ${p.elapsed.toFixed(2)}s`);
       }
     }, controller.signal);
+    result.timings = result.timings || {};
+    result.timings.coverageMs = coverageMs;
+    result.timings.endToEndMs = performance.now() - endToEndStarted;
     state.lastResult = result;
     renderSummary(result);
     renderPlayers();
-    const avgIps = result.iterations / Math.max(0.001, result.elapsedMs / 1000);
-    const ciSuffix = result.confidenceReached ? " CI target reached." : "";
+    const simMs = result.backend
+      ? Number(result.timings.nativeMs || result.backendComputeMs || result.elapsedMs || 0)
+      : Number(result.elapsedMs || 0);
+    const prepMs = result.backend ? Number(result.timings.prepareMs || 0) : 0;
+    const coverageMsShown = Number(result.timings.coverageMs || 0);
+    const backendTotalMs = result.backend ? Number(result.timings.totalMs || 0) : 0;
+    const backendInitMs = result.backend ? Math.max(0, backendTotalMs - prepMs - simMs) : 0;
+    const totalMs = result.backend
+      ? Number(result.timings.endToEndMs || result.elapsedMs || 0)
+      : Number(result.elapsedMs || 0);
+    const avgIps = result.iterations / Math.max(0.001, simMs / 1000);
+    const detailParts = [];
+    if (result.backend && coverageMsShown > 500) detailParts.push(`coverage ${(coverageMsShown / 1000).toFixed(2)}s`);
+    if (result.backend && backendInitMs > 500) detailParts.push(`backend init ${(backendInitMs / 1000).toFixed(2)}s`);
+    if (result.backend && prepMs > 0.5) detailParts.push(`prep ${(prepMs / 1000).toFixed(2)}s`);
+    const detailSuffix = detailParts.length ? ` • ${detailParts.join(" • ")}` : "";
+    const ciSuffix = result.confidenceReached ? " • CI target reached" : "";
+    const totalSuffix = result.backend || (totalMs - simMs > 500)
+      ? ` • total ${(totalMs / 1000).toFixed(2)}s`
+      : "";
     if (result.aborted || controller.signal.aborted) {
-      setStatus(`Stopped at ${result.iterations.toLocaleString()} iterations in ${(result.elapsedMs / 1000).toFixed(2)}s (${Math.round(avgIps).toLocaleString()} it/s avg).`);
+      setStatus(`Stopped at ${result.iterations.toLocaleString()} iterations in ${(simMs / 1000).toFixed(2)}s sim (${Math.round(avgIps).toLocaleString()} it/s avg)${totalSuffix}${detailSuffix}.`);
     } else {
-      setStatus(`Done. ${result.iterations.toLocaleString()} iterations in ${(result.elapsedMs / 1000).toFixed(2)}s (${Math.round(avgIps).toLocaleString()} it/s avg).${ciSuffix}`);
+      setStatus(`Done. ${result.iterations.toLocaleString()} iterations in ${(simMs / 1000).toFixed(2)}s sim (${Math.round(avgIps).toLocaleString()} it/s avg)${totalSuffix}${detailSuffix}${ciSuffix}.`);
     }
   } catch (err) {
     if (runAbortController?.signal?.aborted || err?.name === "AbortError") setStatus("Stopped.");

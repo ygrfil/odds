@@ -32,6 +32,7 @@ const RANK_VARS = new Set(["R", "O", "N"]);
 const SUIT_VARS = new Set(["x", "y", "z", "w"]);
 
 const percentileCache = new Map();
+const nativePercentileBitsetCache = new Map();
 const CHOOSE_52 = buildChooseTable52();
 
 function buildChooseTable52() {
@@ -105,6 +106,194 @@ function inTopExactByPercent(table, variant, p, hand) {
   if (sKey > bScore) return true;
   if (sKey < bScore) return false;
   return hRank <= bRank;
+}
+
+function encodeBase64Bytes(bytes) {
+  if (typeof Buffer !== "undefined" && typeof Buffer.from === "function") {
+    return Buffer.from(bytes).toString("base64");
+  }
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+
+function bitsetSet(bits, idx) {
+  bits[idx >> 3] |= (1 << (idx & 7));
+}
+
+function bitsetTopExact(table, p) {
+  const clampedP = Math.max(0, Math.min(100, Number(p)));
+  const idx = Math.max(0, Math.min(table.steps, Math.round(clampedP * table.basis)));
+  const count = Math.floor((idx / table.steps) * table.sampleSize);
+  const bits = new Uint8Array(Math.ceil(table.sampleSize / 8));
+  if (count <= 0) return bits;
+  if (!Array.isArray(table.scoreKeysByComboRank) || table.scoreKeysByComboRank.length < table.sampleSize) return null;
+  if (count >= table.sampleSize) {
+    bits.fill(0xff);
+    const rem = table.sampleSize & 7;
+    if (rem) bits[bits.length - 1] = (1 << rem) - 1;
+    return bits;
+  }
+  const bScore = Number(table.topScoreKeys[idx] || 0);
+  const bRank = Number(table.topRanks[idx] || 0);
+  for (let rank = 0; rank < table.sampleSize; rank++) {
+    const sKey = Number(table.scoreKeysByComboRank[rank] || 0);
+    if (sKey > bScore || (sKey === bScore && rank <= bRank)) bitsetSet(bits, rank);
+  }
+  return bits;
+}
+
+function bitsetRangeExact(table, low, high) {
+  const hi = bitsetTopExact(table, high);
+  const lo = bitsetTopExact(table, low);
+  if (!hi || !lo || hi.length !== lo.length) return null;
+  const out = new Uint8Array(hi.length);
+  for (let i = 0; i < out.length; i++) out[i] = hi[i] & (~lo[i]);
+  return out;
+}
+
+function rankMaskFromSet(rankSet) {
+  let mask = 0;
+  for (const r of rankSet) {
+    const idx = RANK_ORDER.indexOf(String(r).toUpperCase());
+    if (idx >= 0) mask |= (1 << idx);
+  }
+  return mask & 0x1fff;
+}
+
+function nativePercentileBitsCached(variant, percentileProfile, keySuffix, build) {
+  const key = `${variant}|${normalizePercentileProfile(variant, percentileProfile)}|${keySuffix}`;
+  if (nativePercentileBitsetCache.has(key)) return nativePercentileBitsetCache.get(key);
+  const out = build();
+  nativePercentileBitsetCache.set(key, out);
+  return out;
+}
+
+function nativePack(node, cost = 8, selectivity = 0.35) {
+  const c = Number(cost);
+  const s = Number(selectivity);
+  return {
+    node,
+    cost: Number.isFinite(c) && c >= 0 ? c : 8,
+    selectivity: Number.isFinite(s) ? Math.max(0, Math.min(1, s)) : 0.5
+  };
+}
+
+function nativeAtomPlan(rawAtom, variant, contextBoard, options = {}) {
+  let atom = expandShortcuts(stripSpaces(rawAtom), variant);
+  const percentileProfile = options.percentileProfile;
+
+  const w = atom.match(/@([0-9]{1,3})$/);
+  if (w) atom = atom.slice(0, atom.length - w[0].length);
+
+  const lowAtom = atom.toLowerCase();
+  const normalizedTag = normalizeTagToken(lowAtom);
+  if (normalizedTag) return null;
+
+  const PCT_TOKEN_RE = "(?:100(?:\\.0+)?|[0-9]{1,2}(?:\\.[0-9]+)?)";
+  const pctRange = atom.match(new RegExp(`^(${PCT_TOKEN_RE})%-(${PCT_TOKEN_RE})%$`));
+  if (pctRange) {
+    const low = Number(pctRange[1]);
+    const high = Number(pctRange[2]);
+    const spanSel = Math.max(0, Math.min(1, (high - low) / 100));
+    const exact = exactPercentileTable(variant, percentileProfile);
+    if (!exact || !Array.isArray(exact.scoreKeysByComboRank) || exact.scoreKeysByComboRank.length < exact.sampleSize) return null;
+    const bitsB64 = nativePercentileBitsCached(
+      variant,
+      percentileProfile,
+      `range:${low}:${high}`,
+      () => {
+        const bits = bitsetRangeExact(exact, low, high);
+        return bits ? encodeBase64Bytes(bits) : null;
+      }
+    );
+    if (!bitsB64) return null;
+    return nativePack({ kind: "pct_bits", bits_b64: bitsB64 }, 0.8, spanSel);
+  }
+
+  const pctTop = atom.match(new RegExp(`^(${PCT_TOKEN_RE})%$`));
+  if (pctTop) {
+    const p = Number(pctTop[1]);
+    const sel = Math.max(0, Math.min(1, p / 100));
+    const exact = exactPercentileTable(variant, percentileProfile);
+    if (!exact || !Array.isArray(exact.scoreKeysByComboRank) || exact.scoreKeysByComboRank.length < exact.sampleSize) return null;
+    const bitsB64 = nativePercentileBitsCached(
+      variant,
+      percentileProfile,
+      `top:${p}`,
+      () => {
+        const bits = bitsetTopExact(exact, p);
+        return bits ? encodeBase64Bytes(bits) : null;
+      }
+    );
+    if (!bitsB64) return null;
+    return nativePack({ kind: "pct_bits", bits_b64: bitsB64 }, 0.7, sel);
+  }
+
+  const expanded = expandSpan(atom);
+  const entries = expanded.map((x) => parseLeafSpecs(x));
+  const ranksVarIndex = { R: 0, O: 1, N: 2 };
+  const suitIndex = { c: 0, d: 1, h: 2, s: 3 };
+  const suitVarIndex = { x: 0, y: 1, z: 2, w: 3 };
+
+  const serEntries = entries.map((entry) => entry.specs.map((spec) => {
+    const rankVar = spec.rankVar ? (ranksVarIndex[String(spec.rankVar).toUpperCase()] ?? -1) : -1;
+    let suitMode = 0;
+    let suitValue = -1;
+    if (spec.suit && spec.suit.type === "fixed") {
+      suitMode = 1;
+      suitValue = suitIndex[String(spec.suit.value || "").toLowerCase()] ?? -1;
+    } else if (spec.suit && spec.suit.type === "var") {
+      suitMode = 2;
+      suitValue = suitVarIndex[String(spec.suit.value || "").toLowerCase()] ?? -1;
+    }
+    return {
+      ranks_mask: rankMaskFromSet(spec.ranks || new Set(RANK_ORDER)),
+      rank_var: rankVar,
+      suit_mode: suitMode,
+      suit_value: suitValue
+    };
+  }));
+  return nativePack({ kind: "specs", entries: serEntries }, 8.5, 0.35);
+}
+
+function nativePlanFromAst(ast, variant, board, options = {}) {
+  if (ast.kind === "atom") return nativeAtomPlan(ast.value, variant, board, options);
+  const left = nativePlanFromAst(ast.left, variant, board, options);
+  const right = nativePlanFromAst(ast.right, variant, board, options);
+  if (!left || !right) return null;
+  const lCost = left.cost;
+  const rCost = right.cost;
+  const lSel = left.selectivity;
+  const rSel = right.selectivity;
+  if (ast.kind === "or") {
+    const lrScore = lCost + (1 - lSel) * rCost;
+    const rlScore = rCost + (1 - rSel) * lCost;
+    const first = lrScore <= rlScore ? left : right;
+    const second = lrScore <= rlScore ? right : left;
+    return nativePack(
+      { kind: "or", left: first.node, right: second.node },
+      Math.min(lrScore, rlScore),
+      Math.max(0, Math.min(1, lSel + rSel - lSel * rSel))
+    );
+  }
+  if (ast.kind === "and") {
+    const lrScore = lCost + lSel * rCost;
+    const rlScore = rCost + rSel * lCost;
+    const first = lrScore <= rlScore ? left : right;
+    const second = lrScore <= rlScore ? right : left;
+    return nativePack(
+      { kind: "and", left: first.node, right: second.node },
+      Math.min(lrScore, rlScore),
+      Math.max(0, Math.min(1, lSel * rSel))
+    );
+  }
+  const leftFirstScore = lCost + lSel * rCost;
+  return nativePack(
+    { kind: "not", left: left.node, right: right.node },
+    leftFirstScore,
+    Math.max(0, Math.min(1, lSel * (1 - rSel)))
+  );
 }
 
 function stripSpaces(s) {
@@ -695,4 +884,17 @@ export function compileRange(rawExpr, variant, boardCards = [], options = {}) {
   const tokens = tokenizeExpr(expr);
   const ast = parser(tokens);
   return compileAst(ast, variant, boardCards, options);
+}
+
+export function tryCompileRangeNativePlan(rawExpr, variant, boardCards = [], options = {}) {
+  const expr = expandExprMacros(stripSpaces(rawExpr || "*"));
+  if (!expr || expr === "*") return null;
+  try {
+    const tokens = tokenizeExpr(expr);
+    const ast = parser(tokens);
+    const packed = nativePlanFromAst(ast, variant, boardCards, options);
+    return packed?.node || null;
+  } catch {
+    return null;
+  }
 }
