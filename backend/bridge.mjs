@@ -26,8 +26,9 @@ const PLAYER_SAMPLER_CACHE = new Map();
 const PLAYER_SAMPLER_CACHE_MAX = 48;
 const SAMPLER_CACHE_VERSION = 3;
 const SAMPLER_DISK_DIR = path.join(PROJECT_ROOT, "backend", ".cache", `samplers-v${SAMPLER_CACHE_VERSION}`);
-const SAMPLER_MAX_POOL_TO_CACHE = 30_000;
-const SAMPLER_MAX_FILE_BYTES = 14 * 1024 * 1024;
+const SAMPLER_MAX_POOL_TO_CACHE_MEM = 30_000;
+const SAMPLER_MAX_POOL_TO_CACHE_DISK = 220_000;
+const SAMPLER_MAX_FILE_BYTES = 64 * 1024 * 1024;
 
 function variantHandSize(variant) {
   if (variant === "holdem") return 2;
@@ -116,7 +117,7 @@ function isValidSamplerShape(obj) {
   if (obj.mode === "all" && Number.isFinite(obj.hand_size) && obj.hand_size >= 2) return true;
   if (obj.mode !== "pool") return false;
   if (!Number.isFinite(obj.hand_size) || obj.hand_size < 2) return false;
-  if (!Array.isArray(obj.pool) || obj.pool.length === 0 || obj.pool.length > SAMPLER_MAX_POOL_TO_CACHE) return false;
+  if (!Array.isArray(obj.pool) || obj.pool.length === 0 || obj.pool.length > SAMPLER_MAX_POOL_TO_CACHE_DISK) return false;
   for (let i = 0; i < obj.pool.length; i++) {
     const hand = obj.pool[i];
     if (!Array.isArray(hand) || hand.length !== obj.hand_size) return false;
@@ -141,17 +142,23 @@ function getCachedSampler(key) {
 
 function putCachedSampler(key, sampler) {
   if (!key || !sampler) return;
-  // Avoid caching very large pools to keep memory bounded.
-  if (Array.isArray(sampler.pool) && sampler.pool.length > SAMPLER_MAX_POOL_TO_CACHE) return;
   if (!isValidSamplerShape(sampler)) return;
-  if (PLAYER_SAMPLER_CACHE.has(key)) PLAYER_SAMPLER_CACHE.delete(key);
-  PLAYER_SAMPLER_CACHE.set(key, sampler);
-  while (PLAYER_SAMPLER_CACHE.size > PLAYER_SAMPLER_CACHE_MAX) {
-    const first = PLAYER_SAMPLER_CACHE.keys().next();
-    if (first?.done) break;
-    PLAYER_SAMPLER_CACHE.delete(first.value);
+
+  const poolLen = Array.isArray(sampler.pool) ? sampler.pool.length : 0;
+  const allowMem = poolLen === 0 || poolLen <= SAMPLER_MAX_POOL_TO_CACHE_MEM;
+  const allowDisk = poolLen === 0 || poolLen <= SAMPLER_MAX_POOL_TO_CACHE_DISK;
+
+  if (allowMem) {
+    if (PLAYER_SAMPLER_CACHE.has(key)) PLAYER_SAMPLER_CACHE.delete(key);
+    PLAYER_SAMPLER_CACHE.set(key, sampler);
+    while (PLAYER_SAMPLER_CACHE.size > PLAYER_SAMPLER_CACHE_MAX) {
+      const first = PLAYER_SAMPLER_CACHE.keys().next();
+      if (first?.done) break;
+      PLAYER_SAMPLER_CACHE.delete(first.value);
+    }
   }
 
+  if (!allowDisk) return;
   try {
     ensureSamplerDiskDir();
     const payload = JSON.stringify({
@@ -179,7 +186,16 @@ function getCachedSamplerWithDisk(key) {
     if (!parsed || parsed.v !== SAMPLER_CACHE_VERSION || parsed.key !== key) return null;
     const sampler = parsed.sampler;
     if (!isValidSamplerShape(sampler)) return null;
-    PLAYER_SAMPLER_CACHE.set(key, sampler);
+    const poolLen = Array.isArray(sampler.pool) ? sampler.pool.length : 0;
+    if (poolLen === 0 || poolLen <= SAMPLER_MAX_POOL_TO_CACHE_MEM) {
+      if (PLAYER_SAMPLER_CACHE.has(key)) PLAYER_SAMPLER_CACHE.delete(key);
+      PLAYER_SAMPLER_CACHE.set(key, sampler);
+      while (PLAYER_SAMPLER_CACHE.size > PLAYER_SAMPLER_CACHE_MAX) {
+        const first = PLAYER_SAMPLER_CACHE.keys().next();
+        if (first?.done) break;
+        PLAYER_SAMPLER_CACHE.delete(first.value);
+      }
+    }
     return sampler;
   } catch {
     return null;
@@ -305,7 +321,7 @@ function exactCoverageHint(config, playerIndex, totalSpace) {
   };
 }
 
-function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx, rng) {
+function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx, rng, requestSamplerCache = null) {
   const handSize = variantHandSize(config.variant);
   const rawRangeText = String(player.range || "*").trim() || "*";
   const rangeText = maybeExpandPureTagRange(rawRangeText, config.variant, boardCards);
@@ -334,8 +350,12 @@ function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx
     `pp:${percentileProfile || "-"}`,
     `r:${normalizedRange}`
   ].join("|");
+  if (requestSamplerCache?.has(cacheKey)) return requestSamplerCache.get(cacheKey);
   const cached = getCachedSamplerWithDisk(cacheKey);
-  if (cached) return cached;
+  if (cached) {
+    requestSamplerCache?.set(cacheKey, cached);
+    return cached;
+  }
 
   const compiled = compileRange(rangeText, config.variant, boardCards, { percentileProfile });
   if ((compiled.weight || 0) <= 0) {
@@ -382,6 +402,7 @@ function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx
       const sampled = sampleRangePool(baseDeck, handSize, predicate, target, maxTrials, rng, maxMs);
       if (sampled.length > 0) {
         const sampler = { mode: "pool", hand_size: handSize, pool: sampled };
+        requestSamplerCache?.set(cacheKey, sampler);
         putCachedSampler(cacheKey, sampler);
         return sampler;
       }
@@ -399,6 +420,7 @@ function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx
     }
     if (matched === totalSpace) return { mode: "all", hand_size: handSize };
     const sampler = { mode: "pool", hand_size: handSize, pool };
+    requestSamplerCache?.set(cacheKey, sampler);
     putCachedSampler(cacheKey, sampler);
     return sampler;
   }
@@ -420,6 +442,7 @@ function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx
       }
       if (matched === totalSpace) return { mode: "all", hand_size: handSize };
       const sampler = { mode: "pool", hand_size: handSize, pool };
+      requestSamplerCache?.set(cacheKey, sampler);
       putCachedSampler(cacheKey, sampler);
       return sampler;
     }
@@ -442,6 +465,7 @@ function buildPlayerSampler(config, baseDeck, boardCards, deadCards, player, idx
     throw new Error(`Player ${idx + 1} range appears empty on this board/dead-card setup`);
   }
   const sampler = { mode: "pool", hand_size: handSize, pool: sampled };
+  requestSamplerCache?.set(cacheKey, sampler);
   putCachedSampler(cacheKey, sampler);
   return sampler;
 }
@@ -460,7 +484,10 @@ function prepareNativeRequest(config, req) {
 
   const seed = Number(req.seed || 0x9e3779b9) >>> 0;
   const rng = makeRng(seed || 1);
-  const preparedPlayers = players.map((p, i) => buildPlayerSampler(config, baseDeck, board, dead, p, i, rng));
+  const requestSamplerCache = new Map();
+  const preparedPlayers = players.map((p, i) =>
+    buildPlayerSampler(config, baseDeck, board, dead, p, i, rng, requestSamplerCache)
+  );
 
   return {
     variant,

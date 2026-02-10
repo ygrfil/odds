@@ -435,6 +435,18 @@ function percentileThreshold(variant, p, percentileProfile) {
 }
 
 function atomCompiler(rawAtom, variant, contextBoard, options = {}) {
+  const clampProb = (v, fallback = 0.5) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(0, Math.min(1, n));
+  };
+  const pack = (weight, predicate, cost = 8, selectivity = 0.35) => ({
+    weight,
+    predicate,
+    cost,
+    selectivity: clampProb(selectivity)
+  });
+
   let atom = expandShortcuts(stripSpaces(rawAtom), variant);
   const percentileProfile = options.percentileProfile;
 
@@ -448,10 +460,12 @@ function atomCompiler(rawAtom, variant, contextBoard, options = {}) {
   const lowAtom = atom.toLowerCase();
   const normalizedTag = normalizeTagToken(lowAtom);
   if (normalizedTag) {
-    return {
+    return pack(
       weight,
-      predicate: (hand, _meta, helpers) => helpers.categoryMatch(normalizedTag, hand, contextBoard)
-    };
+      (hand, _meta, helpers) => helpers.categoryMatch(normalizedTag, hand, contextBoard),
+      7,
+      0.18
+    );
   }
 
   const PCT_TOKEN_RE = "(?:100(?:\\.0+)?|[0-9]{1,2}(?:\\.[0-9]+)?)";
@@ -459,51 +473,63 @@ function atomCompiler(rawAtom, variant, contextBoard, options = {}) {
   if (pctRange) {
     const low = Number(pctRange[1]);
     const high = Number(pctRange[2]);
+    const spanSel = Math.max(0, Math.min(1, (high - low) / 100));
     const exact = exactPercentileTable(variant, percentileProfile);
     if (exact) {
-      return {
+      return pack(
         weight,
-        predicate: (hand) => inTopExactByPercent(exact, variant, high, hand) && !inTopExactByPercent(exact, variant, low, hand)
-      };
+        (hand) => inTopExactByPercent(exact, variant, high, hand) && !inTopExactByPercent(exact, variant, low, hand),
+        1.2,
+        spanSel
+      );
     }
     const tHi = percentileThreshold(variant, low, percentileProfile);
     const tLo = percentileThreshold(variant, high, percentileProfile);
-    return {
+    return pack(
       weight,
-      predicate: (hand) => {
+      (hand) => {
         const s = evaluateHeuristic(hand, variant);
         return s <= tHi && s >= tLo;
-      }
-    };
+      },
+      1.6,
+      spanSel
+    );
   }
 
   const pctTop = atom.match(new RegExp(`^(${PCT_TOKEN_RE})%$`));
   if (pctTop) {
     const p = Number(pctTop[1]);
+    const sel = Math.max(0, Math.min(1, p / 100));
     const exact = exactPercentileTable(variant, percentileProfile);
     if (exact) {
-      return {
+      return pack(
         weight,
-        predicate: (hand) => inTopExactByPercent(exact, variant, p, hand)
-      };
+        (hand) => inTopExactByPercent(exact, variant, p, hand),
+        1,
+        sel
+      );
     }
     const threshold = percentileThreshold(variant, p, percentileProfile);
-    return {
+    return pack(
       weight,
-      predicate: (hand) => evaluateHeuristic(hand, variant) >= threshold
-    };
+      (hand) => evaluateHeuristic(hand, variant) >= threshold,
+      1.4,
+      sel
+    );
   }
 
   const expanded = expandSpan(atom);
   const handSize = variant === "holdem" ? 2 : variant === "plo4" ? 4 : variant === "plo5" ? 5 : 6;
   const entries = expanded.map((x) => parseLeafSpecs(x));
 
-  return {
+  return pack(
     weight,
-    predicate: (hand) => {
+    (hand) => {
       return entries.some((entry) => matchSpecs(entry.specs, hand, handSize));
-    }
-  };
+    },
+    8.5,
+    0.35
+  );
 }
 
 function cardRankChar(card) {
@@ -598,33 +624,72 @@ function matchSpecs(specsRaw, hand, handSize) {
 }
 
 function compileAst(ast, variant, board, options = {}) {
+  const nodeCost = (n) => {
+    const v = Number(n?.cost);
+    return Number.isFinite(v) && v >= 0 ? v : 8;
+  };
+  const nodeSel = (n) => {
+    const v = Number(n?.selectivity);
+    return Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0.5;
+  };
   if (ast.kind === "atom") {
     return atomCompiler(ast.value, variant, board, options);
   }
   const left = compileAst(ast.left, variant, board, options);
   const right = compileAst(ast.right, variant, board, options);
   if (ast.kind === "or") {
+    const lCost = nodeCost(left);
+    const rCost = nodeCost(right);
+    const lSel = nodeSel(left);
+    const rSel = nodeSel(right);
+    const lrScore = lCost + (1 - lSel) * rCost;
+    const rlScore = rCost + (1 - rSel) * lCost;
+    const first = lrScore <= rlScore ? left : right;
+    const second = lrScore <= rlScore ? right : left;
     return {
       weight: 100,
-      predicate: (hand, meta, helpers) => left.predicate(hand, meta, helpers) || right.predicate(hand, meta, helpers)
+      cost: Math.min(lrScore, rlScore),
+      selectivity: Math.max(0, Math.min(1, lSel + rSel - lSel * rSel)),
+      predicate: (hand, meta, helpers) => first.predicate(hand, meta, helpers) || second.predicate(hand, meta, helpers)
     };
   }
   if (ast.kind === "and") {
+    const lCost = nodeCost(left);
+    const rCost = nodeCost(right);
+    const lSel = nodeSel(left);
+    const rSel = nodeSel(right);
+    const lrScore = lCost + lSel * rCost;
+    const rlScore = rCost + rSel * lCost;
+    const first = lrScore <= rlScore ? left : right;
+    const second = lrScore <= rlScore ? right : left;
     return {
       weight: Math.min(left.weight, right.weight),
-      predicate: (hand, meta, helpers) => left.predicate(hand, meta, helpers) && right.predicate(hand, meta, helpers)
+      cost: Math.min(lrScore, rlScore),
+      selectivity: Math.max(0, Math.min(1, lSel * rSel)),
+      predicate: (hand, meta, helpers) => first.predicate(hand, meta, helpers) && second.predicate(hand, meta, helpers)
     };
   }
+  const lCost = nodeCost(left);
+  const rCost = nodeCost(right);
+  const lSel = nodeSel(left);
+  const rSel = nodeSel(right);
+  const leftFirstScore = lCost + lSel * rCost;
+  const rightFirstScore = rCost + (1 - rSel) * lCost;
+  const useRightFirst = rightFirstScore < leftFirstScore;
   return {
     weight: Math.min(left.weight, right.weight),
-    predicate: (hand, meta, helpers) => left.predicate(hand, meta, helpers) && !right.predicate(hand, meta, helpers)
+    cost: Math.min(leftFirstScore, rightFirstScore),
+    selectivity: Math.max(0, Math.min(1, lSel * (1 - rSel))),
+    predicate: useRightFirst
+      ? (hand, meta, helpers) => !right.predicate(hand, meta, helpers) && left.predicate(hand, meta, helpers)
+      : (hand, meta, helpers) => left.predicate(hand, meta, helpers) && !right.predicate(hand, meta, helpers)
   };
 }
 
 export function compileRange(rawExpr, variant, boardCards = [], options = {}) {
   const expr = expandExprMacros(stripSpaces(rawExpr || "*"));
   if (!expr) {
-    const ok = { predicate: () => true, weight: 100 };
+    const ok = { predicate: () => true, weight: 100, cost: 0.05, selectivity: 1 };
     return ok;
   }
   const tokens = tokenizeExpr(expr);
