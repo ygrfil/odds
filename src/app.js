@@ -1,5 +1,5 @@
 import { runSimulation } from "./engine.js";
-import { previewTagCoverage, previewRangeCoverage } from "./sim-core.js";
+import { previewTagCoreCombos, previewTagCoverage, previewRangeCoverage } from "./sim-core.js";
 import { extractNormalizedTags, normalizePureTagToken, splitTagToken } from "./tag-utils.js";
 import {
   normalizePercentileProfile,
@@ -98,6 +98,21 @@ function tagHintText(tagToken) {
   return TAG_BASE_HINTS[tagInfo.base] || "";
 }
 
+function tagShortcutPreviewText(tagToken, boardText, variant, maxItems = 24) {
+  const boardLen = Math.floor(String(boardText || "").replace(/\s+/g, "").length / 2);
+  if (boardLen < 3) return "needs flop+";
+  if (boardLen > 5) return "invalid board";
+  try {
+    const combos = previewTagCoreCombos(boardText, variant, tagToken);
+    if (!Array.isArray(combos) || combos.length === 0) return "-";
+    const shown = combos.slice(0, maxItems).join(",");
+    const tail = combos.length > maxItems ? ",..." : "";
+    return `${shown}${tail}`;
+  } catch {
+    return "invalid board";
+  }
+}
+
 const PRECISION_PRESETS = {
   ci30: { target: 0.3, min: 12000, iterationCap: 500000 },
   ci20: { target: 0.2, min: 25000, iterationCap: 900000 },
@@ -152,14 +167,16 @@ function syncOrderingProfileControl() {
   el.orderingProfile.title = percentileProfileLabel(normalized);
 }
 
-function rangeTagHints(rangeText, variant) {
+function rangeTagHints(rangeText, variant, boardText = "", showShortcuts = false) {
   const uniq = extractNormalizedTags(rangeText).filter((t) => !!tagHintText(t));
   if (!uniq.length) return "";
   const gameRule = variant === "holdem"
     ? "Game rule: Hold'em hand evaluation can use any 5-card combination."
     : "Game rule: Omaha hand evaluation always uses exactly 2 hole cards + 3 board cards.";
   const plusRule = "Tip: use '+' only on ready-hand tags (@tp, @overpair, @2p, @set, @s, @f) to include stronger made hands.";
-  const lines = uniq.map((t) => `${t}: ${tagHintText(t)}`);
+  const lines = uniq.map((t) => showShortcuts
+    ? `${t}: ${tagShortcutPreviewText(t, boardText, variant)}`
+    : `${t}: ${tagHintText(t)}`);
   return `${lines.join("\n")}\n${plusRule}\n${gameRule}`;
 }
 
@@ -714,7 +731,7 @@ function renderPlayers() {
       document.querySelectorAll(".tag-hint-popover").forEach((n) => n.remove());
       document.querySelectorAll(".tag-hint[aria-expanded='true']").forEach((n) => n.setAttribute("aria-expanded", "false"));
       if (existing) return;
-      const help = rangeTagHints(p.range, el.variant.value);
+      const help = rangeTagHints(p.range, el.variant.value, el.board.value.trim(), true);
 
       const pop = document.createElement("div");
       pop.className = "tag-hint-popover";

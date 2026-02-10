@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use aya_poker::base::{Hand, CARDS};
 use aya_poker::{omaha_rank, poker_rank, PokerRankCategory};
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
@@ -760,12 +761,16 @@ fn simulate_partition(
     let mut hand_buf: Vec<Vec<u8>> = samplers.iter().map(|s| vec![0u8; sampler_hand_size(s)]).collect();
     let mut score_buf = vec![0u16; pcount];
     let mut winners = vec![false; pcount];
+    let mut player_order: Vec<usize> = (0..pcount).collect();
 
     for _ in 0..iter_cap {
         used.copy_from_slice(&blocked);
         let mut failed = false;
 
-        for (pi, sampler) in samplers.iter().enumerate() {
+        player_order.shuffle(&mut rng);
+
+        for &pi in &player_order {
+            let sampler = &samplers[pi];
             let hand = &mut hand_buf[pi];
             let ok = match sampler {
                 Sampler::All { hand_size } => sample_random_hand(*hand_size, &used, &mut rng, hand),

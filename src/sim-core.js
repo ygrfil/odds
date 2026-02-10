@@ -795,6 +795,15 @@ function sampleFromPool(pool, usedFlags, rng) {
   return null;
 }
 
+function shufflePlayerOrder(order, rng) {
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const tmp = order[i];
+    order[i] = order[j];
+    order[j] = tmp;
+  }
+}
+
 export function rawToResult(raw, config) {
   const {
     iterations: it,
@@ -977,6 +986,7 @@ export async function runSimulationRaw(config, options = {}) {
   const board5 = [];
   const handScratch = [];
   const holeCards = [];
+  const playerOrder = players.map((_, i) => i);
 
   for (let i = 0; i < samplerPlans.length; i++) {
     const s = samplerPlans[i];
@@ -1029,10 +1039,12 @@ export async function runSimulationRaw(config, options = {}) {
 
     usedFlags.fill(0);
     for (const c of blocked) usedFlags[c] = 1;
-    holeCards.length = 0;
+    holeCards.length = players.length;
+    shufflePlayerOrder(playerOrder, rng);
     let failed = false;
 
-    for (let i = 0; i < players.length; i++) {
+    for (let p = 0; p < playerOrder.length; p++) {
+      const i = playerOrder[p];
       fillAvailable(baseDeck, usedFlags, available);
       const pooled = sampleFromPool(samplerPlans[i].pool, usedFlags, rng);
       const hand = pooled ? pooled.slice() : sampleHandFromRange(samplerPlans[i].compiled, available, handSize, rng, helpers, handScratch);
@@ -1041,7 +1053,7 @@ export async function runSimulationRaw(config, options = {}) {
         break;
       }
       for (const c of hand) usedFlags[c] = 1;
-      holeCards.push(hand);
+      holeCards[i] = hand;
       comboLists[i].add(comboKey(hand));
     }
     if (failed) continue;
