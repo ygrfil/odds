@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -14,6 +16,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -84,6 +87,177 @@ type bridgeResponse struct {
 	Body  json.RawMessage `json:"-"`
 }
 
+type bridgeClient struct {
+	projectRoot string
+	bridgePath  string
+
+	mu     sync.Mutex
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stdout *bufio.Reader
+}
+
+func newBridgeClient(projectRoot, bridgePath string) *bridgeClient {
+	return &bridgeClient{
+		projectRoot: projectRoot,
+		bridgePath:  bridgePath,
+	}
+}
+
+func (b *bridgeClient) Close() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.stopLocked("")
+}
+
+func (b *bridgeClient) Call(ctx context.Context, req any, out any) error {
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := b.ensureStartedLocked(); err != nil {
+			return err
+		}
+
+		if _, err := b.stdin.Write(append(payload, '\n')); err != nil {
+			lastErr = fmt.Errorf("bridge write failed: %w", err)
+			b.stopLocked("write failed")
+			continue
+		}
+
+		resp, err := b.readResponseLocked(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			lastErr = fmt.Errorf("bridge read failed: %w", err)
+			b.stopLocked("read failed")
+			continue
+		}
+
+		if out == nil {
+			return nil
+		}
+		if err := json.Unmarshal(resp, out); err != nil {
+			lastErr = fmt.Errorf("invalid bridge response: %w", err)
+			b.stopLocked("invalid response")
+			continue
+		}
+		return nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("bridge call failed")
+	}
+	return lastErr
+}
+
+func (b *bridgeClient) ensureStartedLocked() error {
+	if b.cmd != nil {
+		return nil
+	}
+
+	cmd := exec.Command("node", b.bridgePath)
+	cmd.Dir = b.projectRoot
+	cmd.Env = append(os.Environ(), "BRIDGE_DAEMON=1")
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("bridge stdin pipe: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return fmt.Errorf("bridge stdout pipe: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		return fmt.Errorf("bridge stderr pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		_ = stderr.Close()
+		return fmt.Errorf("start bridge: %w", err)
+	}
+
+	b.cmd = cmd
+	b.stdin = stdin
+	b.stdout = bufio.NewReader(stdout)
+
+	go func() {
+		sc := bufio.NewScanner(stderr)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" {
+				continue
+			}
+			log.Printf("[bridge] %s", line)
+		}
+		if err := sc.Err(); err != nil {
+			log.Printf("[bridge] stderr read error: %v", err)
+		}
+		_ = stderr.Close()
+	}()
+
+	return nil
+}
+
+func (b *bridgeClient) readResponseLocked(ctx context.Context) ([]byte, error) {
+	type readResult struct {
+		line []byte
+		err  error
+	}
+	ch := make(chan readResult, 1)
+	go func() {
+		line, err := b.stdout.ReadBytes('\n')
+		ch <- readResult{line: line, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		b.stopLocked("request canceled")
+		return nil, ctx.Err()
+	case res := <-ch:
+		if res.err != nil {
+			return nil, res.err
+		}
+		line := bytes.TrimSpace(res.line)
+		if len(line) == 0 {
+			return nil, errors.New("empty bridge response")
+		}
+		return line, nil
+	}
+}
+
+func (b *bridgeClient) stopLocked(reason string) {
+	if b.cmd == nil {
+		return
+	}
+	if reason != "" {
+		log.Printf("[bridge] restarting: %s", reason)
+	}
+	if b.stdin != nil {
+		_ = b.stdin.Close()
+	}
+	if b.cmd.Process != nil {
+		_ = b.cmd.Process.Kill()
+	}
+	_ = b.cmd.Wait()
+	b.cmd = nil
+	b.stdin = nil
+	b.stdout = nil
+}
+
 func main() {
 	projectRoot, err := os.Getwd()
 	if err != nil {
@@ -98,6 +272,8 @@ func main() {
 	if port == "" {
 		port = "8787"
 	}
+	bridge := newBridgeClient(projectRoot, bridgePath)
+	defer bridge.Close()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
@@ -107,9 +283,9 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, apiResponse{OK: true})
 	})
-	mux.HandleFunc("/api/sim/run", makeRunHandler(projectRoot, bridgePath))
-	mux.HandleFunc("/api/sim/preview/tag", makePreviewTagHandler(projectRoot, bridgePath))
-	mux.HandleFunc("/api/sim/preview/range", makePreviewRangeHandler(projectRoot, bridgePath))
+	mux.HandleFunc("/api/sim/run", makeRunHandler(bridge))
+	mux.HandleFunc("/api/sim/preview/tag", makePreviewTagHandler(bridge))
+	mux.HandleFunc("/api/sim/preview/range", makePreviewRangeHandler(bridge))
 	staticFS := http.FileServer(http.Dir(projectRoot))
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Keep frontend assets fresh during active development.
@@ -143,7 +319,7 @@ func logMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func makeRunHandler(projectRoot, bridgePath string) http.HandlerFunc {
+func makeRunHandler(bridge *bridgeClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, apiResponse{OK: false, Error: "method not allowed"})
@@ -162,12 +338,15 @@ func makeRunHandler(projectRoot, bridgePath string) http.HandlerFunc {
 		}
 
 		payload := map[string]any{
-			"action":  "run-native",
-			"config":  cfg,
-			"workers": req.Workers,
+			"action": "run-native",
+			"config": cfg,
+		}
+		if req.Workers > 0 {
+			payload["workers"] = req.Workers
 		}
 		var out map[string]any
-		if err := callBridge(r.Context(), projectRoot, bridgePath, payload, &out); err != nil {
+		bridgeStart := time.Now()
+		if err := callBridge(r.Context(), bridge, payload, &out); err != nil {
 			code := http.StatusInternalServerError
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				code = 499
@@ -175,6 +354,7 @@ func makeRunHandler(projectRoot, bridgePath string) http.HandlerFunc {
 			writeJSON(w, code, apiResponse{OK: false, Error: err.Error()})
 			return
 		}
+		bridgeWallMs := float64(time.Since(bridgeStart)) / float64(time.Millisecond)
 
 		ok, _ := out["ok"].(bool)
 		if !ok {
@@ -185,11 +365,23 @@ func makeRunHandler(projectRoot, bridgePath string) http.HandlerFunc {
 			writeJSON(w, http.StatusInternalServerError, apiResponse{OK: false, Error: errMsg})
 			return
 		}
+		timings, _ := out["timings"].(map[string]any)
+		if timings == nil {
+			timings = map[string]any{}
+			out["timings"] = timings
+		}
+		timings["bridgeWallMs"] = bridgeWallMs
+		if backendTotal, ok := anyToFloat64(timings["totalMs"]); ok {
+			overhead := bridgeWallMs - backendTotal
+			if overhead > 0 {
+				timings["bridgeOverheadMs"] = overhead
+			}
+		}
 		writeJSON(w, http.StatusOK, out)
 	}
 }
 
-func makePreviewTagHandler(projectRoot, bridgePath string) http.HandlerFunc {
+func makePreviewTagHandler(bridge *bridgeClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, apiResponse{OK: false, Error: "method not allowed"})
@@ -207,7 +399,7 @@ func makePreviewTagHandler(projectRoot, bridgePath string) http.HandlerFunc {
 			"tag":       req.Tag,
 		}
 		var out map[string]any
-		if err := callBridge(r.Context(), projectRoot, bridgePath, payload, &out); err != nil {
+		if err := callBridge(r.Context(), bridge, payload, &out); err != nil {
 			writeJSON(w, http.StatusInternalServerError, apiResponse{OK: false, Error: err.Error()})
 			return
 		}
@@ -215,7 +407,7 @@ func makePreviewTagHandler(projectRoot, bridgePath string) http.HandlerFunc {
 	}
 }
 
-func makePreviewRangeHandler(projectRoot, bridgePath string) http.HandlerFunc {
+func makePreviewRangeHandler(bridge *bridgeClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, apiResponse{OK: false, Error: "method not allowed"})
@@ -234,7 +426,7 @@ func makePreviewRangeHandler(projectRoot, bridgePath string) http.HandlerFunc {
 			"percentileProfile": req.PercentileProfile,
 		}
 		var out map[string]any
-		if err := callBridge(r.Context(), projectRoot, bridgePath, payload, &out); err != nil {
+		if err := callBridge(r.Context(), bridge, payload, &out); err != nil {
 			writeJSON(w, http.StatusInternalServerError, apiResponse{OK: false, Error: err.Error()})
 			return
 		}
@@ -242,41 +434,34 @@ func makePreviewRangeHandler(projectRoot, bridgePath string) http.HandlerFunc {
 	}
 }
 
-func callBridge(ctx context.Context, projectRoot, bridgePath string, req any, out any) error {
-	payload, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("marshal request: %w", err)
+func callBridge(ctx context.Context, bridge *bridgeClient, req any, out any) error {
+	if bridge == nil {
+		return errors.New("bridge unavailable")
 	}
+	return bridge.Call(ctx, req, out)
+}
 
-	cmd := exec.CommandContext(ctx, "node", bridgePath)
-	cmd.Dir = projectRoot
-	cmd.Stdin = bytes.NewReader(payload)
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = strings.TrimSpace(stdout.String())
-		}
-		if msg == "" {
-			msg = err.Error()
-		}
-		return fmt.Errorf("bridge failed: %s", msg)
+func anyToFloat64(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case uint:
+		return float64(n), true
+	case uint64:
+		return float64(n), true
+	case uint32:
+		return float64(n), true
+	default:
+		return 0, false
 	}
-
-	if out == nil {
-		return nil
-	}
-	if err := json.Unmarshal(stdout.Bytes(), out); err != nil {
-		return fmt.Errorf("invalid bridge response: %w", err)
-	}
-	return nil
 }
 
 func chooseWorkerCount(requested, iterCap int, mode string) int {

@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
+import { createInterface } from "node:readline";
 import {
   runSimulationRaw,
   runExhaustiveRaw,
@@ -86,7 +87,7 @@ async function readStdinJson() {
 }
 
 function writeJson(obj) {
-  process.stdout.write(JSON.stringify(obj));
+  process.stdout.write(`${JSON.stringify(obj)}\n`);
 }
 
 function comboKey(hand) {
@@ -529,10 +530,13 @@ async function prepareNativeRequest(config, req, nativeBin = "") {
   const rng = makeRng(seed || 1);
   const requestSamplerCache = new Map();
   const preparedPlayers = [];
+  const preparePlayersMs = [];
   for (let i = 0; i < players.length; i++) {
+    const playerStart = performance.now();
     preparedPlayers.push(
       await buildPlayerSampler(config, baseDeck, board, dead, players[i], i, rng, requestSamplerCache, nativeBin)
     );
+    preparePlayersMs.push(performance.now() - playerStart);
   }
 
   return {
@@ -547,11 +551,16 @@ async function prepareNativeRequest(config, req, nativeBin = "") {
       ? Math.max(1, Math.floor(Number(config.confidenceMinIterations)))
       : undefined,
     confidence_level: Number(config.confidenceLevel) > 0 ? Number(config.confidenceLevel) : undefined,
-    seed: Number(seed || 1)
+    seed: Number(seed || 1),
+    _timing_preparePlayersMs: preparePlayersMs
   };
 }
 
-async function runCommandWithJson(command, args, payload, cwd) {
+async function runCommandWithJsonDetailed(command, args, payload, cwd) {
+  const start = performance.now();
+  const payloadStart = performance.now();
+  const payloadText = JSON.stringify(payload);
+  const payloadMs = performance.now() - payloadStart;
   return await new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
@@ -568,20 +577,61 @@ async function runCommandWithJson(command, args, payload, cwd) {
         reject(new Error(stderr.trim() || stdout.trim() || `${command} exited with code ${code}`));
         return;
       }
+      const parseStart = performance.now();
       try {
-        resolve(JSON.parse(stdout || "{}"));
+        const json = JSON.parse(stdout || "{}");
+        const parseMs = performance.now() - parseStart;
+        resolve({
+          json,
+          timing: {
+            totalMs: performance.now() - start,
+            payloadMs,
+            processMs: Math.max(0, performance.now() - start - payloadMs - parseMs),
+            parseMs,
+            stdinBytes: Buffer.byteLength(payloadText, "utf8"),
+            stdoutBytes: Buffer.byteLength(stdout, "utf8")
+          }
+        });
       } catch (err) {
         reject(new Error(`Invalid JSON from ${command}: ${err?.message || String(err)}`));
       }
     });
-    child.stdin.end(JSON.stringify(payload));
+    child.stdin.end(payloadText);
   });
 }
 
-async function ensureNativeBinary() {
+async function runCommandWithJson(command, args, payload, cwd) {
+  const out = await runCommandWithJsonDetailed(command, args, payload, cwd);
+  return out.json;
+}
+
+async function ensureNativeBinary(timingOut = null) {
+  const started = performance.now();
+  const timing = {
+    totalMs: 0,
+    forced: false,
+    forcedExists: false,
+    sourceHashMs: 0,
+    stampCheckMs: 0,
+    cacheHit: false,
+    rebuilt: false,
+    cargoCleanMs: 0,
+    cargoBuildMs: 0,
+    stampWriteMs: 0
+  };
+  const finish = (binPath) => {
+    timing.totalMs = performance.now() - started;
+    if (timingOut && typeof timingOut === "object") Object.assign(timingOut, timing);
+    return binPath;
+  };
+
   const forced = process.env.NATIVE_SIM_BIN ? path.resolve(process.env.NATIVE_SIM_BIN) : "";
   const candidate = forced || NATIVE_SIM_BIN_DEFAULT;
-  if (forced) return fs.existsSync(candidate) ? candidate : null;
+  if (forced) {
+    timing.forced = true;
+    timing.forcedExists = fs.existsSync(candidate);
+    return finish(timing.forcedExists ? candidate : null);
+  }
 
   const runCargo = async (args) => {
     await new Promise((resolve, reject) => {
@@ -604,13 +654,16 @@ async function ensureNativeBinary() {
     });
   };
 
+  const sourceHashStart = performance.now();
   const sourceHash = hashKey(
     [
       fs.existsSync(NATIVE_SIM_MANIFEST) ? fs.readFileSync(NATIVE_SIM_MANIFEST, "utf8") : "",
       fs.existsSync(NATIVE_SIM_SOURCE_MAIN) ? fs.readFileSync(NATIVE_SIM_SOURCE_MAIN, "utf8") : ""
     ].join("\n---\n")
   );
+  timing.sourceHashMs = performance.now() - sourceHashStart;
   if (fs.existsSync(candidate) && fs.existsSync(NATIVE_SIM_BUILD_STAMP)) {
+    const stampStart = performance.now();
     try {
       const stamp = JSON.parse(fs.readFileSync(NATIVE_SIM_BUILD_STAMP, "utf8"));
       const binaryHash = hashKey(fs.readFileSync(candidate));
@@ -618,19 +671,30 @@ async function ensureNativeBinary() {
         stamp?.version === NATIVE_SIM_BUILD_STAMP_VERSION
         && stamp?.sourceHash === sourceHash
         && stamp?.binaryHash === binaryHash
-      ) return candidate;
+      ) {
+        timing.cacheHit = true;
+        timing.stampCheckMs = performance.now() - stampStart;
+        return finish(candidate);
+      }
     } catch {
       // fall through to rebuild
     }
+    timing.stampCheckMs = performance.now() - stampStart;
   }
-  if (!fs.existsSync(NATIVE_SIM_MANIFEST)) return null;
+  if (!fs.existsSync(NATIVE_SIM_MANIFEST)) return finish(null);
 
   // Target artifacts are tracked in this repository. A clean rebuild avoids stale fingerprint issues.
+  const cargoCleanStart = performance.now();
   await runCargo(["clean", "--manifest-path", NATIVE_SIM_MANIFEST]);
+  timing.cargoCleanMs = performance.now() - cargoCleanStart;
+  const cargoBuildStart = performance.now();
   await runCargo(["build", "--release", "--manifest-path", NATIVE_SIM_MANIFEST]);
+  timing.cargoBuildMs = performance.now() - cargoBuildStart;
+  timing.rebuilt = true;
 
-  if (!fs.existsSync(candidate)) return null;
+  if (!fs.existsSync(candidate)) return finish(null);
   try {
+    const stampWriteStart = performance.now();
     const binaryHash = hashKey(fs.readFileSync(candidate));
     fs.mkdirSync(path.dirname(NATIVE_SIM_BUILD_STAMP), { recursive: true });
     fs.writeFileSync(NATIVE_SIM_BUILD_STAMP, JSON.stringify({
@@ -639,10 +703,11 @@ async function ensureNativeBinary() {
       binaryHash,
       builtAt: Date.now()
     }), "utf8");
+    timing.stampWriteMs = performance.now() - stampWriteStart;
   } catch {
     // stamp is best-effort
   }
-  return candidate;
+  return finish(candidate);
 }
 
 function mapNativeRaw(nativeRaw) {
@@ -714,14 +779,20 @@ async function runNativeSimulation(config, req) {
     };
   }
 
-  const nativeBin = await ensureNativeBinary();
+  const ensureTiming = {};
+  const nativeBin = await ensureNativeBinary(ensureTiming);
   if (!nativeBin) throw new Error("native simulator binary not found");
 
   const prepStart = performance.now();
   const payload = await prepareNativeRequest(config, req, nativeBin);
   const prepareMs = performance.now() - prepStart;
+  const preparePlayersMs = Array.isArray(payload?._timing_preparePlayersMs)
+    ? payload._timing_preparePlayersMs.map((v) => Number(v || 0))
+    : [];
+  delete payload._timing_preparePlayersMs;
   const nativeStart = performance.now();
-  const resp = await runCommandWithJson(nativeBin, [], payload, PROJECT_ROOT);
+  const nativeCall = await runCommandWithJsonDetailed(nativeBin, [], payload, PROJECT_ROOT);
+  const resp = nativeCall.json;
   const nativeMs = performance.now() - nativeStart;
   if (!resp?.ok) throw new Error(resp?.error || "native simulator failed");
   return {
@@ -731,7 +802,22 @@ async function runNativeSimulation(config, req) {
     timings: {
       prepareMs,
       nativeMs,
-      totalMs: performance.now() - totalStart
+      totalMs: performance.now() - totalStart,
+      preparePlayersMs,
+      ensureMs: Number(ensureTiming.totalMs || 0),
+      ensureSourceHashMs: Number(ensureTiming.sourceHashMs || 0),
+      ensureStampCheckMs: Number(ensureTiming.stampCheckMs || 0),
+      ensureCargoCleanMs: Number(ensureTiming.cargoCleanMs || 0),
+      ensureCargoBuildMs: Number(ensureTiming.cargoBuildMs || 0),
+      ensureStampWriteMs: Number(ensureTiming.stampWriteMs || 0),
+      ensureCacheHit: !!ensureTiming.cacheHit,
+      ensureRebuilt: !!ensureTiming.rebuilt,
+      nativeCommandMs: Number(nativeCall?.timing?.totalMs || 0),
+      nativeCommandPayloadMs: Number(nativeCall?.timing?.payloadMs || 0),
+      nativeCommandProcessMs: Number(nativeCall?.timing?.processMs || 0),
+      nativeCommandParseMs: Number(nativeCall?.timing?.parseMs || 0),
+      nativeCommandStdinBytes: Number(nativeCall?.timing?.stdinBytes || 0),
+      nativeCommandStdoutBytes: Number(nativeCall?.timing?.stdoutBytes || 0)
     }
   };
 }
@@ -752,21 +838,18 @@ async function handleRunPart(req) {
   return { ok: true, mode, raw: serializeRaw(raw) };
 }
 
-async function main() {
-  const req = await readStdinJson();
+async function handleRequest(req) {
   const action = String(req.action || "");
   if (action === "health") {
-    writeJson({ ok: true });
-    return;
+    return { ok: true };
   }
   if (action === "run-part") {
-    writeJson(await handleRunPart(req));
-    return;
+    return await handleRunPart(req);
   }
   if (action === "run-native") {
     const totalStart = performance.now();
     try {
-      writeJson(await runNativeSimulation(req.config || {}, req));
+      return await runNativeSimulation(req.config || {}, req);
     } catch (nativeErr) {
       // Keep backend resilient: fallback to existing JS simulation path.
       const fallback = await handleRunPart({ ...req, mode: "auto" });
@@ -774,9 +857,8 @@ async function main() {
       fallback.nativeError = nativeErr?.message || String(nativeErr);
       fallback.timings = fallback.timings || {};
       fallback.timings.totalMs = performance.now() - totalStart;
-      writeJson(fallback);
+      return fallback;
     }
-    return;
   }
   if (action === "preview-tag") {
     const boardText = String(req.boardText || "");
@@ -784,8 +866,7 @@ async function main() {
     const tag = String(req.tag || "");
     const combos = previewTagCoreCombos(boardText, variant, tag);
     const coverage = previewTagCoverage(boardText, variant, tag);
-    writeJson({ ok: true, combos, coverage });
-    return;
+    return { ok: true, combos, coverage };
   }
   if (action === "preview-range") {
     const boardText = String(req.boardText || "");
@@ -799,14 +880,44 @@ async function main() {
       coverage = null;
     }
     if (!coverage) coverage = previewRangeCoverage(boardText, variant, rangeText, { percentileProfile });
-    writeJson({ ok: true, coverage });
-    return;
+    return { ok: true, coverage };
   }
-  writeJson({ ok: false, error: `Unsupported action: ${action}` });
-  process.exitCode = 1;
+  return { ok: false, error: `Unsupported action: ${action}` };
 }
 
-main().catch((err) => {
+async function oneShotMain() {
+  const req = await readStdinJson();
+  const out = await handleRequest(req);
+  writeJson(out);
+  if (!out?.ok) process.exitCode = 1;
+}
+
+async function daemonMain() {
+  const rl = createInterface({
+    input: process.stdin,
+    crlfDelay: Infinity,
+    terminal: false
+  });
+  for await (const line of rl) {
+    const text = String(line || "").trim();
+    if (!text) continue;
+    let req = {};
+    try {
+      req = JSON.parse(text);
+    } catch (err) {
+      writeJson({ ok: false, error: `invalid json: ${err?.message || String(err)}` });
+      continue;
+    }
+    try {
+      writeJson(await handleRequest(req));
+    } catch (err) {
+      writeJson({ ok: false, error: err?.message || String(err) });
+    }
+  }
+}
+
+const mainPromise = process.env.BRIDGE_DAEMON === "1" ? daemonMain() : oneShotMain();
+mainPromise.catch((err) => {
   writeJson({ ok: false, error: err?.message || String(err) });
   process.exitCode = 1;
 });

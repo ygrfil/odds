@@ -439,6 +439,14 @@ function queueLiveInfoUpdate(playerIndex, rangeText, immediate = false) {
   });
   liveInfoState.coverageByPlayer.delete(playerIndex);
   liveInfoState.coverageReadyByPlayer.delete(playerIndex);
+  const node = liveInfoState.nodeByPlayer.get(playerIndex);
+  if (node) {
+    if (String(rangeText || "").trim()) {
+      renderLiveInfo(node, [{ tone: "primary", text: "Calculating..." }]);
+    } else {
+      renderLiveInfo(node, []);
+    }
+  }
   const prevTimer = liveInfoState.timers.get(playerIndex);
   if (prevTimer) clearTimeout(prevTimer);
   const delay = immediate ? 0 : 180;
@@ -528,37 +536,11 @@ function renderSummary(result) {
     el.runSummary.textContent = "";
     return;
   }
-  const engine = result.backend ? "NATIVE BACKEND" : "BROWSER";
   const totalMs = result.backend && result.timings && Number(result.timings.endToEndMs) > 0
     ? Number(result.timings.endToEndMs)
     : Number(result.elapsedMs || 0);
   const total = (Math.max(0, totalMs) / 1000).toFixed(2);
-  let extra = "";
-  if (result.backend && result.timings) {
-    const coverage = Number(result.timings.coverageMs || 0);
-    const prep = Number(result.timings.prepareMs || 0);
-    const sim = Number(result.timings.nativeMs || result.backendComputeMs || 0);
-    const backendTotal = Number(result.timings.totalMs || 0);
-    const backendInit = Math.max(0, backendTotal - prep - sim);
-    const parts = [];
-    if (coverage > 0.5) parts.push(`coverage ${(coverage / 1000).toFixed(2)}s`);
-    if (backendInit > 0.5) parts.push(`backend init ${(backendInit / 1000).toFixed(2)}s`);
-    if (prep > 0 || sim > 0) {
-      parts.push(`prep ${(prep / 1000).toFixed(2)}s`);
-      parts.push(`sim ${(sim / 1000).toFixed(2)}s`);
-    }
-    if (parts.length) {
-      extra = ` • ${parts.join(" • ")}`;
-    }
-  }
-  let confText = "";
-  if (Number(result.confidenceLevel) > 0 && Number.isFinite(Number(result.confidenceHalfWidthPct))) {
-    const level = Math.round(Number(result.confidenceLevel) * 100);
-    const half = Number(result.confidenceHalfWidthPct);
-    confText = ` • CI${level} ±${half.toFixed(3)}%${result.confidenceReached ? " reached" : ""}`;
-  }
-  const profileText = result.percentileProfile ? ` • ${percentileProfileLabel(result.percentileProfile)}` : "";
-  el.runSummary.textContent = `${result.iterations.toLocaleString()} iterations in ${total}s • ${result.variant.toUpperCase()}${profileText} • ${String(result.method || "monte").toUpperCase()} • ${engine}${extra}${confText}`;
+  el.runSummary.textContent = `${result.iterations.toLocaleString()} iterations in ${total}s`;
 }
 
 function numericPercent(value) {
@@ -829,33 +811,47 @@ async function run() {
     result.timings = result.timings || {};
     result.timings.coverageMs = coverageMs;
     result.timings.endToEndMs = performance.now() - endToEndStarted;
+    if (result.backend && typeof console !== "undefined" && typeof console.info === "function") {
+      const t = result.timings;
+      console.info("[native timing]", {
+        coverageMs: Number(t.coverageMs || 0),
+        totalWallMs: Number(t.endToEndMs || 0),
+        backendTotalMs: Number(t.totalMs || 0),
+        backendPrepareMs: Number(t.prepareMs || 0),
+        backendSimMs: Number(t.nativeMs || 0),
+        backendInitMs: Math.max(0, Number(t.totalMs || 0) - Number(t.prepareMs || 0) - Number(t.nativeMs || 0)),
+        bridgeWallMs: Number(t.bridgeWallMs || 0),
+        bridgeOverheadMs: Number(t.bridgeOverheadMs || 0),
+        ensureMs: Number(t.ensureMs || 0),
+        ensureSourceHashMs: Number(t.ensureSourceHashMs || 0),
+        ensureStampCheckMs: Number(t.ensureStampCheckMs || 0),
+        ensureCargoCleanMs: Number(t.ensureCargoCleanMs || 0),
+        ensureCargoBuildMs: Number(t.ensureCargoBuildMs || 0),
+        ensureStampWriteMs: Number(t.ensureStampWriteMs || 0),
+        ensureCacheHit: !!t.ensureCacheHit,
+        ensureRebuilt: !!t.ensureRebuilt,
+        nativeCommandMs: Number(t.nativeCommandMs || 0),
+        nativeCommandPayloadMs: Number(t.nativeCommandPayloadMs || 0),
+        nativeCommandProcessMs: Number(t.nativeCommandProcessMs || 0),
+        nativeCommandParseMs: Number(t.nativeCommandParseMs || 0),
+        nativeCommandStdinBytes: Number(t.nativeCommandStdinBytes || 0),
+        nativeCommandStdoutBytes: Number(t.nativeCommandStdoutBytes || 0),
+        preparePlayersMs: Array.isArray(t.preparePlayersMs) ? t.preparePlayersMs.map((v) => Number(v || 0)) : []
+      });
+    }
     state.lastResult = result;
     renderSummary(result);
     renderPlayers();
     const simMs = result.backend
       ? Number(result.timings.nativeMs || result.backendComputeMs || result.elapsedMs || 0)
       : Number(result.elapsedMs || 0);
-    const prepMs = result.backend ? Number(result.timings.prepareMs || 0) : 0;
-    const coverageMsShown = Number(result.timings.coverageMs || 0);
-    const backendTotalMs = result.backend ? Number(result.timings.totalMs || 0) : 0;
-    const backendInitMs = result.backend ? Math.max(0, backendTotalMs - prepMs - simMs) : 0;
-    const totalMs = result.backend
-      ? Number(result.timings.endToEndMs || result.elapsedMs || 0)
-      : Number(result.elapsedMs || 0);
     const avgIps = result.iterations / Math.max(0.001, simMs / 1000);
-    const detailParts = [];
-    if (result.backend && coverageMsShown > 500) detailParts.push(`coverage ${(coverageMsShown / 1000).toFixed(2)}s`);
-    if (result.backend && backendInitMs > 500) detailParts.push(`backend init ${(backendInitMs / 1000).toFixed(2)}s`);
-    if (result.backend && prepMs > 0.5) detailParts.push(`prep ${(prepMs / 1000).toFixed(2)}s`);
-    const detailSuffix = detailParts.length ? ` • ${detailParts.join(" • ")}` : "";
-    const ciSuffix = result.confidenceReached ? " • CI target reached" : "";
-    const totalSuffix = result.backend || (totalMs - simMs > 500)
-      ? ` • total ${(totalMs / 1000).toFixed(2)}s`
-      : "";
+    const simSeconds = (simMs / 1000).toFixed(2);
+    const ipsText = `${Math.round(avgIps).toLocaleString()} it/s`;
     if (result.aborted || controller.signal.aborted) {
-      setStatus(`Stopped at ${result.iterations.toLocaleString()} iterations in ${(simMs / 1000).toFixed(2)}s sim (${Math.round(avgIps).toLocaleString()} it/s avg)${totalSuffix}${detailSuffix}.`);
+      setStatus(`Stopped at ${result.iterations.toLocaleString()} iterations in ${simSeconds}s • ${ipsText}`);
     } else {
-      setStatus(`Done. ${result.iterations.toLocaleString()} iterations in ${(simMs / 1000).toFixed(2)}s sim (${Math.round(avgIps).toLocaleString()} it/s avg)${totalSuffix}${detailSuffix}${ciSuffix}.`);
+      setStatus(`${result.iterations.toLocaleString()} iterations in ${simSeconds}s • ${ipsText}`);
     }
   } catch (err) {
     if (runAbortController?.signal?.aborted || err?.name === "AbortError") setStatus("Stopped.");
