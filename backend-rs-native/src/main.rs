@@ -5,7 +5,7 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -76,6 +76,10 @@ struct NativePlayerReq {
     hand_size: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pool: Option<Vec<Vec<u8>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<native_sim::PlanNodeReq>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    weight_pct: Option<u8>,
 }
 
 #[derive(Debug, Serialize)]
@@ -192,7 +196,6 @@ struct PercentileTable {
 
 const RANKS: &str = "23456789TJQKA";
 const SUITS: &str = "cdhs";
-const EXACT_ENUM_THRESHOLD: usize = 2_000_000;
 const DEFAULT_PREP_SEED: u32 = 0x9e37_79b9;
 const ALL_RANKS_MASK: u16 = 0x1fff;
 const MACRO_REPLACEMENTS: [(&str, &str); 21] = [
@@ -229,6 +232,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // Warm percentile tables once so first simulation prep stays fast.
+    let prewarm = std::env::var("PREWARM_PERCENTILES")
+        .ok()
+        .map(|v| {
+            let t = v.trim().to_ascii_lowercase();
+            !(t == "0" || t == "false" || t == "off" || t == "no")
+        })
+        .unwrap_or(true);
+    if prewarm {
+        prewarm_percentile_tables();
+    }
+
     let project_root = std::env::current_dir()?;
 
     let port = std::env::var("PORT")
@@ -248,6 +263,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn prewarm_percentile_tables() {
+    for variant in ["holdem", "plo4", "plo5", "plo6"] {
+        let _ = exact_percentile_table(variant, "ours");
+    }
 }
 
 async fn health() -> Json<Value> {
@@ -344,7 +365,6 @@ async fn sim_preview_tag(Json(req): Json<PreviewTagRequest>) -> (StatusCode, Jso
 }
 
 async fn sim_preview_range(Json(req): Json<PreviewRangeRequest>) -> (StatusCode, Json<Value>) {
-    let _ = req.percentile_profile;
     let variant = req.variant.trim().to_lowercase();
     let hand_size = match variant_hand_size(&variant) {
         Some(v) => v,
@@ -464,169 +484,288 @@ fn build_sampler_for_range(
         return Ok(cached);
     }
 
-    let base = base_deck(board, dead);
-    let total = n_choose_k(base.len(), hand_size);
-
     let compiled = compile_range_expr(range, variant, hand_size, percentile_profile)?;
     let expr = &compiled.expr;
     let weight_pct = compiled.weight_pct;
-    let has_weight = weight_pct < 100;
-    if is_any_expr(expr) && !has_weight {
-        let sampler = NativePlayerReq {
-            mode: "all".to_string(),
-            hand_size,
-            pool: None,
-        };
-        sampler_cache_put(cache_key, &sampler);
-        return Ok(sampler);
-    }
-
-    let lower = range.to_lowercase();
-    let has_tag = lower.contains('@');
-    let has_sd_tag = lower.contains("@sd");
-
-    if hand_size <= 4 {
-        let acceptance_trials = if has_tag { 96 } else { 320 };
-        let acceptance = estimate_acceptance_expr(
-            &base,
-            hand_size,
-            board,
-            expr,
-            weight_pct,
-            acceptance_trials,
-            prep_rng,
-        );
-        let prefer_sample = has_weight
-            || (hand_size >= 4
-                && (has_sd_tag || (has_tag && total > 90_000) || acceptance >= 0.03));
-        if prefer_sample {
-            let (target, max_trials) = if has_sd_tag {
-                (12_000usize, 180_000usize)
-            } else if has_tag {
-                if hand_size == 2 {
-                    (8_000usize, 100_000usize)
-                } else {
-                    (6_000usize, 90_000usize)
-                }
-            } else if hand_size == 2 {
-                (12_000usize, 150_000usize)
-            } else {
-                (10_000usize, 180_000usize)
-            };
-            let pool = sample_range_pool_js(
-                &base, hand_size, board, expr, weight_pct, target, max_trials, prep_rng,
-            );
-            if !pool.is_empty() {
-                let sampler = NativePlayerReq {
-                    mode: "pool".to_string(),
-                    hand_size,
-                    pool: Some(pool),
-                };
-                sampler_cache_put(cache_key, &sampler);
-                return Ok(sampler);
-            }
-            if has_tag {
-                return Err("range appears empty on this board/dead-card setup".to_string());
-            }
-        }
-    }
-
-    // For PLO5, prefer deterministic exact-enumeration reservoirs for non-weighted ranges.
-    // This improves stability and avoids drift from small stochastic pre-sampled pools.
-    if hand_size == 5 && !has_weight {
-        let exact_cap = 320_000usize;
-        let (matched, pool, _approx) =
-            build_pool_exact_with_cap(&base, hand_size, board, expr, exact_cap, prep_rng);
-        if matched == 0 || pool.is_empty() {
-            return Err("range appears empty on this board/dead-card setup".to_string());
-        }
-        if matched >= total {
-            let sampler = NativePlayerReq {
-                mode: "all".to_string(),
-                hand_size,
-                pool: None,
-            };
-            sampler_cache_put(cache_key, &sampler);
-            return Ok(sampler);
-        }
-        let sampler = NativePlayerReq {
-            mode: "pool".to_string(),
-            hand_size,
-            pool: Some(pool),
-        };
-        sampler_cache_put(cache_key, &sampler);
-        return Ok(sampler);
-    }
-
-    if hand_size > 5 && has_tag {
-        let (target, max_trials) = if has_sd_tag {
-            (9_000usize, 150_000usize)
-        } else {
-            (7_000usize, 120_000usize)
-        };
-        let pool = sample_range_pool_js(
-            &base, hand_size, board, expr, weight_pct, target, max_trials, prep_rng,
-        );
-        if pool.is_empty() {
-            return Err("range appears empty on this board/dead-card setup".to_string());
-        }
-        let sampler = NativePlayerReq {
-            mode: "pool".to_string(),
-            hand_size,
-            pool: Some(pool),
-        };
-        sampler_cache_put(cache_key, &sampler);
-        return Ok(sampler);
-    }
-
-    if hand_size > 4 {
-        let (target, max_trials) = if has_sd_tag {
-            (9_000usize, 150_000usize)
-        } else if has_tag {
-            (7_000usize, 120_000usize)
-        } else if hand_size == 5 {
-            (14_000usize, 280_000usize)
-        } else {
-            (10_000usize, 320_000usize)
-        };
-        let pool = sample_range_pool_js(
-            &base, hand_size, board, expr, weight_pct, target, max_trials, prep_rng,
-        );
-        if pool.is_empty() {
-            return Err("range appears empty on this board/dead-card setup".to_string());
-        }
-        let sampler = NativePlayerReq {
-            mode: "pool".to_string(),
-            hand_size,
-            pool: Some(pool),
-        };
-        sampler_cache_put(cache_key, &sampler);
-        return Ok(sampler);
-    }
-
-    let cap = pool_cap_for(hand_size);
-    let (matched, pool, approx) = build_pool_from_expr(&base, hand_size, board, expr, cap);
-    if matched == 0 {
+    if weight_pct == 0 {
         return Err("range appears empty on this board/dead-card setup".to_string());
     }
+    let has_weight = weight_pct < 100;
+    let weight_opt = if has_weight { Some(weight_pct) } else { None };
 
-    if !approx && matched >= total {
+    if is_any_expr(expr) {
         let sampler = NativePlayerReq {
             mode: "all".to_string(),
             hand_size,
             pool: None,
+            plan: None,
+            weight_pct: weight_opt,
         };
         sampler_cache_put(cache_key, &sampler);
         return Ok(sampler);
     }
 
+    if let Some(plan) = range_expr_to_plan(expr) {
+        let sampler = NativePlayerReq {
+            mode: "plan".to_string(),
+            hand_size,
+            pool: None,
+            plan: Some(plan),
+            weight_pct: weight_opt,
+        };
+        sampler_cache_put(cache_key, &sampler);
+        return Ok(sampler);
+    }
+
+    let base = base_deck(board, dead);
+    let total = n_choose_k(base.len(), hand_size);
+    let cap = pool_cap_for(hand_size);
+    let (matched, pool, _approx) =
+        build_pool_exact_with_cap(&base, hand_size, board, expr, cap, prep_rng);
+    if matched == 0 || pool.is_empty() {
+        return Err("range appears empty on this board/dead-card setup".to_string());
+    }
+    if matched >= total {
+        let sampler = NativePlayerReq {
+            mode: "all".to_string(),
+            hand_size,
+            pool: None,
+            plan: None,
+            weight_pct: weight_opt,
+        };
+        sampler_cache_put(cache_key, &sampler);
+        return Ok(sampler);
+    }
     let sampler = NativePlayerReq {
         mode: "pool".to_string(),
         hand_size,
         pool: Some(pool),
+        plan: None,
+        weight_pct: weight_opt,
     };
     sampler_cache_put(cache_key, &sampler);
     Ok(sampler)
+}
+
+fn range_expr_to_plan(expr: &RangeExpr) -> Option<native_sim::PlanNodeReq> {
+    match expr {
+        RangeExpr::Or(left, right) => Some(native_sim::PlanNodeReq::Or {
+            left: Box::new(range_expr_to_plan(left)?),
+            right: Box::new(range_expr_to_plan(right)?),
+        }),
+        RangeExpr::And(left, right) => Some(native_sim::PlanNodeReq::And {
+            left: Box::new(range_expr_to_plan(left)?),
+            right: Box::new(range_expr_to_plan(right)?),
+        }),
+        RangeExpr::Not(left, right) => Some(native_sim::PlanNodeReq::Not {
+            left: Box::new(range_expr_to_plan(left)?),
+            right: Box::new(range_expr_to_plan(right)?),
+        }),
+        RangeExpr::Atom(atom) => atom_to_plan(atom),
+    }
+}
+
+fn atom_to_plan(atom: &RangeAtom) -> Option<native_sim::PlanNodeReq> {
+    match atom {
+        RangeAtom::Any => Some(native_sim::PlanNodeReq::Specs {
+            entries: vec![Vec::new()],
+        }),
+        RangeAtom::Never => {
+            let any = native_sim::PlanNodeReq::Specs {
+                entries: vec![Vec::new()],
+            };
+            Some(native_sim::PlanNodeReq::Not {
+                left: Box::new(any.clone()),
+                right: Box::new(any),
+            })
+        }
+        RangeAtom::Exact(cards) => Some(native_sim::PlanNodeReq::Specs {
+            entries: vec![cards.iter().map(|c| exact_card_spec(*c)).collect()],
+        }),
+        RangeAtom::Specs(entries) => Some(native_sim::PlanNodeReq::Specs {
+            entries: entries
+                .iter()
+                .map(|entry| entry.iter().copied().map(spec_to_plan_spec).collect())
+                .collect(),
+        }),
+        RangeAtom::PercentTopExact {
+            variant,
+            profile,
+            pct,
+        } => {
+            let table = exact_percentile_table(variant, profile)?;
+            Some(native_sim::PlanNodeReq::PctBits {
+                bits_b64: None,
+                bits: Some(pct_top_bits(&table, *pct)),
+            })
+        }
+        RangeAtom::PercentRangeExact {
+            variant,
+            profile,
+            low_pct,
+            high_pct,
+        } => {
+            let table = exact_percentile_table(variant, profile)?;
+            let mut high_bits = pct_top_bits(&table, *high_pct);
+            let low_bits = pct_top_bits(&table, *low_pct);
+            for (dst, low) in high_bits.iter_mut().zip(low_bits.iter()) {
+                *dst &= !*low;
+            }
+            Some(native_sim::PlanNodeReq::PctBits {
+                bits_b64: None,
+                bits: Some(high_bits),
+            })
+        }
+        RangeAtom::PercentTopHeuristic { threshold } => {
+            Some(native_sim::PlanNodeReq::HeuristicTop {
+                threshold: *threshold,
+            })
+        }
+        RangeAtom::PercentRangeHeuristic {
+            low_threshold,
+            high_threshold,
+        } => Some(native_sim::PlanNodeReq::HeuristicRange {
+            low_threshold: *low_threshold,
+            high_threshold: *high_threshold,
+        }),
+        RangeAtom::RankPattern(req) => {
+            let mut entry = Vec::<native_sim::SpecReq>::new();
+            for (rank_idx, count) in req.iter().enumerate() {
+                for _ in 0..*count {
+                    entry.push(native_sim::SpecReq {
+                        ranks_mask: 1u16 << rank_idx,
+                        rank_var: -1,
+                        suit_mode: 0,
+                        suit_value: -1,
+                    });
+                }
+            }
+            Some(native_sim::PlanNodeReq::Specs {
+                entries: vec![entry],
+            })
+        }
+        RangeAtom::FixedPattern(specs) => Some(native_sim::PlanNodeReq::Specs {
+            entries: vec![specs
+                .iter()
+                .map(|s| native_sim::SpecReq {
+                    ranks_mask: 1u16 << s.rank,
+                    rank_var: -1,
+                    suit_mode: if s.suit.is_some() { 1 } else { 0 },
+                    suit_value: s.suit.map(|v| v as i8).unwrap_or(-1),
+                })
+                .collect()],
+        }),
+        RangeAtom::Tag(tag) => Some(native_sim::PlanNodeReq::Tag {
+            tag: plan_tag_from_atom(*tag),
+        }),
+    }
+}
+
+fn spec_to_plan_spec(s: Spec) -> native_sim::SpecReq {
+    native_sim::SpecReq {
+        ranks_mask: s.ranks_mask,
+        rank_var: s.rank_var,
+        suit_mode: s.suit_mode,
+        suit_value: s.suit_value,
+    }
+}
+
+fn exact_card_spec(card: u8) -> native_sim::SpecReq {
+    native_sim::SpecReq {
+        ranks_mask: 1u16 << card_rank(card),
+        rank_var: -1,
+        suit_mode: 1,
+        suit_value: card_suit(card) as i8,
+    }
+}
+
+fn plan_tag_from_atom(tag: TagAtom) -> native_sim::PlanTagReq {
+    match tag {
+        TagAtom::TopPair { plus } => native_sim::PlanTagReq {
+            kind: native_sim::PlanTagKind::TopPair,
+            plus,
+            min_outs: 0,
+        },
+        TagAtom::Overpair { plus } => native_sim::PlanTagReq {
+            kind: native_sim::PlanTagKind::Overpair,
+            plus,
+            min_outs: 0,
+        },
+        TagAtom::TwoPair { plus } => native_sim::PlanTagReq {
+            kind: native_sim::PlanTagKind::TwoPair,
+            plus,
+            min_outs: 0,
+        },
+        TagAtom::Set { plus } => native_sim::PlanTagReq {
+            kind: native_sim::PlanTagKind::Set,
+            plus,
+            min_outs: 0,
+        },
+        TagAtom::FlushDraw => native_sim::PlanTagReq {
+            kind: native_sim::PlanTagKind::FlushDraw,
+            plus: false,
+            min_outs: 0,
+        },
+        TagAtom::Flush { plus } => native_sim::PlanTagReq {
+            kind: native_sim::PlanTagKind::Flush,
+            plus,
+            min_outs: 0,
+        },
+        TagAtom::StraightDraw { min_outs } => native_sim::PlanTagReq {
+            kind: native_sim::PlanTagKind::StraightDraw,
+            plus: false,
+            min_outs,
+        },
+        TagAtom::Straight { plus } => native_sim::PlanTagReq {
+            kind: native_sim::PlanTagKind::Straight,
+            plus,
+            min_outs: 0,
+        },
+    }
+}
+
+fn pct_top_bits(table: &PercentileTable, pct: f64) -> Vec<u8> {
+    let combo_space = table.score_keys_by_combo_rank.len();
+    let mut bits = vec![0u8; (combo_space + 7) / 8];
+    if combo_space == 0 || table.sample_size == 0 {
+        return bits;
+    }
+
+    let clamped = pct.clamp(0.0, 100.0);
+    let basis = table.basis.max(1);
+    let steps = 100usize.saturating_mul(basis);
+    let idx = ((clamped * basis as f64).round() as usize).min(steps);
+    let count = ((idx as f64 / steps as f64) * table.sample_size as f64).floor() as usize;
+    if count == 0 {
+        return bits;
+    }
+    if count >= table.sample_size {
+        for combo_idx in 0..combo_space {
+            set_bit(&mut bits, combo_idx);
+        }
+        return bits;
+    }
+    if idx >= table.top_score_keys.len() || idx >= table.top_ranks.len() {
+        return bits;
+    }
+
+    let boundary_score = table.top_score_keys[idx];
+    let boundary_rank = table.top_ranks[idx] as usize;
+    for rank in 0..combo_space {
+        let score = table.score_keys_by_combo_rank[rank];
+        if score > boundary_score || (score == boundary_score && rank <= boundary_rank) {
+            set_bit(&mut bits, rank);
+        }
+    }
+    bits
+}
+
+fn set_bit(bits: &mut [u8], idx: usize) {
+    let byte = idx >> 3;
+    if byte >= bits.len() {
+        return;
+    }
+    bits[byte] |= 1u8 << (idx & 7);
 }
 
 fn sampler_cache_key(
@@ -716,98 +855,22 @@ fn sampler_cache_put(key: String, sampler: &NativePlayerReq) {
     guard.insert(key, sampler.clone());
 }
 
-fn build_pool_from_expr(
-    base: &[u8],
-    hand_size: usize,
-    board: &[u8],
-    expr: &RangeExpr,
-    cap: usize,
-) -> (usize, Vec<Vec<u8>>, bool) {
-    let total = n_choose_k(base.len(), hand_size);
-    if hand_size <= 4 && total <= EXACT_ENUM_THRESHOLD {
-        let mut matched = 0usize;
-        let mut pool = Vec::<Vec<u8>>::new();
-        enumerate_hands(base, hand_size, |hand| {
-            if range_expr_match(expr, hand, board) {
-                matched += 1;
-                if pool.len() < cap {
-                    pool.push(hand.to_vec());
-                }
-            }
-        });
-        return (matched, pool, false);
-    }
-
-    let trials = sample_trials_for(total, hand_size);
-    let seed = now_seed();
-    let mut rng = SmallRng::seed_from_u64(seed);
-    let mut scratch = vec![0u8; hand_size];
-    let mut pool = Vec::<Vec<u8>>::new();
-    let mut keys = HashSet::<u64>::new();
-    let mut accepted = 0usize;
-
-    for _ in 0..trials {
-        if !sample_distinct_hand(base, hand_size, &mut rng, &mut scratch) {
-            break;
-        }
-        if !range_expr_match(expr, &scratch, board) {
-            continue;
-        }
-        accepted += 1;
-        let key = combo_key(&scratch);
-        if keys.insert(key) && pool.len() < cap {
-            pool.push(scratch.clone());
-        }
-    }
-
-    if accepted == 0 {
-        return (0, Vec::new(), true);
-    }
-    let acceptance = accepted as f64 / trials.max(1) as f64;
-    let est = ((total as f64) * acceptance).round() as usize;
-    let matched = est.max(pool.len()).max(1);
-    (matched, pool, true)
-}
-
 fn estimate_coverage<F>(
     base: &[u8],
     hand_size: usize,
-    total: usize,
+    _total: usize,
     mut predicate: F,
 ) -> (usize, bool)
 where
     F: FnMut(&[u8]) -> bool,
 {
-    if total <= EXACT_ENUM_THRESHOLD {
-        let mut matched = 0usize;
-        enumerate_hands(base, hand_size, |hand| {
-            if predicate(hand) {
-                matched += 1;
-            }
-        });
-        return (matched, false);
-    }
-
-    let trials = sample_trials_for(total, hand_size);
-    let mut rng = SmallRng::seed_from_u64(now_seed());
-    let mut scratch = vec![0u8; hand_size];
-    let mut accepted = 0usize;
-
-    for _ in 0..trials {
-        if !sample_distinct_hand(base, hand_size, &mut rng, &mut scratch) {
-            break;
+    let mut matched = 0usize;
+    enumerate_hands(base, hand_size, |hand| {
+        if predicate(hand) {
+            matched += 1;
         }
-        if predicate(&scratch) {
-            accepted += 1;
-        }
-    }
-
-    if accepted == 0 {
-        return (0, true);
-    }
-    let acceptance = accepted as f64 / trials.max(1) as f64;
-    let est = ((total as f64) * acceptance).round() as usize;
-    (est.min(total), true)
+    });
+    (matched, false)
 }
 
 fn enumerate_hands<F>(base: &[u8], hand_size: usize, mut f: F)
@@ -837,29 +900,6 @@ where
     rec(0, 0, base, &mut hand, &mut f);
 }
 
-fn sample_distinct_hand(base: &[u8], hand_size: usize, rng: &mut SmallRng, out: &mut [u8]) -> bool {
-    if base.len() < hand_size || out.len() < hand_size {
-        return false;
-    }
-    for i in 0..hand_size {
-        let mut picked = None;
-        for _ in 0..128 {
-            let idx = rng.gen_range(0..base.len());
-            let c = base[idx];
-            if !out[..i].contains(&c) {
-                picked = Some(c);
-                break;
-            }
-        }
-        match picked {
-            Some(c) => out[i] = c,
-            None => return false,
-        }
-    }
-    out[..hand_size].sort_unstable();
-    true
-}
-
 #[derive(Clone, Copy)]
 struct JsRng {
     t: u32,
@@ -876,94 +916,6 @@ impl JsRng {
         r ^= r.wrapping_add((r ^ (r >> 7)).wrapping_mul(61 | r));
         ((r ^ (r >> 14)) as f64) / 4294967296.0
     }
-}
-
-fn pick_distinct_js(base: &[u8], hand_size: usize, rng: &mut JsRng, out: &mut Vec<u8>) -> bool {
-    if base.len() < hand_size {
-        return false;
-    }
-    out.clear();
-    for i in 0..hand_size {
-        let mut idx = (rng.next_f64() * base.len() as f64) as usize;
-        if idx >= base.len() {
-            idx = base.len() - 1;
-        }
-        let mut v = base[idx];
-        while out[..i].contains(&v) {
-            idx = (rng.next_f64() * base.len() as f64) as usize;
-            if idx >= base.len() {
-                idx = base.len() - 1;
-            }
-            v = base[idx];
-        }
-        out.push(v);
-    }
-    true
-}
-
-fn sample_range_pool_js(
-    base: &[u8],
-    hand_size: usize,
-    board: &[u8],
-    expr: &RangeExpr,
-    weight_pct: u8,
-    target: usize,
-    max_trials: usize,
-    rng: &mut JsRng,
-) -> Vec<Vec<u8>> {
-    let mut pool = Vec::<Vec<u8>>::new();
-    let mut seen = HashSet::<u64>::new();
-    let mut tmp = Vec::<u8>::with_capacity(hand_size);
-
-    for _ in 0..max_trials {
-        if !pick_distinct_js(base, hand_size, rng, &mut tmp) {
-            break;
-        }
-        if !range_expr_match(expr, &tmp, board) {
-            continue;
-        }
-        if rng.next_f64() * 100.0 > weight_pct as f64 {
-            continue;
-        }
-        let mut sorted = tmp.clone();
-        sorted.sort_unstable();
-        let key = combo_key(&sorted);
-        if !seen.insert(key) {
-            continue;
-        }
-        pool.push(sorted);
-        if pool.len() >= target {
-            break;
-        }
-    }
-
-    pool
-}
-
-fn estimate_acceptance_expr(
-    base: &[u8],
-    hand_size: usize,
-    board: &[u8],
-    expr: &RangeExpr,
-    weight_pct: u8,
-    trials: usize,
-    rng: &mut JsRng,
-) -> f64 {
-    let mut ok = 0usize;
-    let mut tmp = Vec::<u8>::with_capacity(hand_size);
-    for _ in 0..trials {
-        if !pick_distinct_js(base, hand_size, rng, &mut tmp) {
-            break;
-        }
-        if !range_expr_match(expr, &tmp, board) {
-            continue;
-        }
-        if rng.next_f64() * 100.0 > weight_pct as f64 {
-            continue;
-        }
-        ok += 1;
-    }
-    ok as f64 / trials.max(1) as f64
 }
 
 fn build_pool_exact_with_cap(
@@ -991,18 +943,6 @@ fn build_pool_exact_with_cap(
         }
     });
     (matched, pool, false)
-}
-
-fn sample_trials_for(total: usize, hand_size: usize) -> usize {
-    let base = match hand_size {
-        2 => 80_000,
-        4 => 140_000,
-        5 => 180_000,
-        6 => 220_000,
-        _ => 120_000,
-    };
-    let scaled = (total as f64 * 0.06).round() as usize;
-    base.max(scaled).min(350_000)
 }
 
 fn now_seed() -> u64 {
@@ -2761,6 +2701,8 @@ fn to_native_sim_request(payload: &NativeSimReq) -> native_sim::SimRequest {
                 mode: p.mode.clone(),
                 hand_size: p.hand_size,
                 pool: p.pool.clone(),
+                plan: p.plan.clone(),
+                weight_pct: p.weight_pct,
             })
             .collect(),
         workers: payload.workers,
@@ -2874,11 +2816,11 @@ fn variant_from_hand_size(hand_size: usize) -> &'static str {
 
 fn pool_cap_for(hand_size: usize) -> usize {
     match hand_size {
-        2 => 15_000,
-        4 => 90_000,
-        5 => 32_000,
-        6 => 18_000,
-        _ => 16_000,
+        2 => 20_000,
+        4 => 180_000,
+        5 => 320_000,
+        6 => 160_000,
+        _ => 64_000,
     }
 }
 
@@ -2900,14 +2842,6 @@ fn card_rank_value(card: u8) -> u8 {
 
 fn card_suit(card: u8) -> u8 {
     card % 4
-}
-
-fn combo_key(cards: &[u8]) -> u64 {
-    let mut out = 0u64;
-    for c in cards {
-        out = (out << 6) | (*c as u64);
-    }
-    out
 }
 
 fn error_json(status: StatusCode, msg: &str) -> (StatusCode, Json<Value>) {

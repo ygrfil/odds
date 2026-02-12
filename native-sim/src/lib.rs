@@ -32,6 +32,8 @@ pub struct SimPlayerReq {
     pub mode: String,
     pub hand_size: usize,
     pub pool: Option<Vec<Vec<u8>>>,
+    pub plan: Option<PlanNodeReq>,
+    pub weight_pct: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,7 +63,12 @@ struct Request {
 struct PlayerReq {
     mode: String,
     hand_size: usize,
+    #[serde(default)]
     pool: Option<Vec<Vec<u8>>>,
+    #[serde(default)]
+    plan: Option<PlanNodeReq>,
+    #[serde(default)]
+    weight_pct: Option<u8>,
 }
 
 #[derive(Debug, Serialize)]
@@ -117,9 +124,9 @@ struct PoolBuildOut {
     pool: Vec<Vec<u8>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
-enum PlanNodeReq {
+pub enum PlanNodeReq {
     #[serde(rename = "or")]
     Or {
         left: Box<PlanNodeReq>,
@@ -138,15 +145,51 @@ enum PlanNodeReq {
     #[serde(rename = "specs")]
     Specs { entries: Vec<Vec<SpecReq>> },
     #[serde(rename = "pct_bits")]
-    PctBits { bits_b64: String },
+    PctBits {
+        #[serde(default)]
+        bits_b64: Option<String>,
+        #[serde(default)]
+        bits: Option<Vec<u8>>,
+    },
+    #[serde(rename = "heuristic_top")]
+    HeuristicTop { threshold: f64 },
+    #[serde(rename = "heuristic_range")]
+    HeuristicRange {
+        low_threshold: f64,
+        high_threshold: f64,
+    },
+    #[serde(rename = "tag")]
+    Tag { tag: PlanTagReq },
 }
 
-#[derive(Debug, Deserialize)]
-struct SpecReq {
-    ranks_mask: u16,
-    rank_var: i8,
-    suit_mode: u8,
-    suit_value: i8,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecReq {
+    pub ranks_mask: u16,
+    pub rank_var: i8,
+    pub suit_mode: u8,
+    pub suit_value: i8,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanTagKind {
+    TopPair,
+    Overpair,
+    TwoPair,
+    Set,
+    FlushDraw,
+    Flush,
+    StraightDraw,
+    Straight,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PlanTagReq {
+    pub kind: PlanTagKind,
+    #[serde(default)]
+    pub plus: bool,
+    #[serde(default)]
+    pub min_outs: u8,
 }
 
 #[derive(Clone)]
@@ -154,8 +197,20 @@ enum PlanNode {
     Or(Box<PlanNode>, Box<PlanNode>),
     And(Box<PlanNode>, Box<PlanNode>),
     Not(Box<PlanNode>, Box<PlanNode>),
-    Specs { entries: Vec<Vec<Spec>> },
-    PctBits { bits: Vec<u8> },
+    Specs {
+        entries: Vec<Vec<Spec>>,
+    },
+    PctBits {
+        bits: Vec<u8>,
+    },
+    HeuristicTop {
+        threshold: f64,
+    },
+    HeuristicRange {
+        low_threshold: f64,
+        high_threshold: f64,
+    },
+    Tag(TagAtom),
 }
 
 #[derive(Clone, Copy)]
@@ -170,11 +225,30 @@ struct Spec {
 enum Sampler {
     All {
         hand_size: usize,
+        weight_pct: u8,
     },
     Pool {
         hand_size: usize,
         pool: Vec<Vec<u8>>,
+        weight_pct: u8,
     },
+    Plan {
+        hand_size: usize,
+        plan: PlanNode,
+        weight_pct: u8,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum TagAtom {
+    TopPair { plus: bool },
+    Overpair { plus: bool },
+    TwoPair { plus: bool },
+    Set { plus: bool },
+    FlushDraw,
+    Flush { plus: bool },
+    StraightDraw { min_outs: u8 },
+    Straight { plus: bool },
 }
 
 struct ComboSet {
@@ -257,6 +331,8 @@ fn sim_request_to_internal(req: SimRequest) -> Request {
                 mode: p.mode,
                 hand_size: p.hand_size,
                 pool: p.pool,
+                plan: p.plan,
+                weight_pct: p.weight_pct,
             })
             .collect(),
         workers: req.workers,
@@ -525,6 +601,7 @@ fn run_build_pool_mode(req: &Request) -> Result<Response> {
     let choose = build_choose_table();
     let seed = req.seed.unwrap_or(0xC0DE_F00D_9E37_79B9);
     let mut rng = StdRng::seed_from_u64(seed);
+    let is_holdem = req.variant == "holdem";
 
     let mut blocked = [false; 52];
     for &c in req.board.iter().chain(req.dead.iter()) {
@@ -552,6 +629,8 @@ fn run_build_pool_mode(req: &Request) -> Result<Response> {
         &mut hand,
         &plan,
         &choose,
+        &req.board,
+        is_holdem,
         cap,
         &mut rng,
         &mut pool,
@@ -591,9 +670,6 @@ fn compile_plan_node(req: &PlanNodeReq) -> Result<PlanNode> {
         PlanNodeReq::Specs { entries } => {
             let mut out = Vec::with_capacity(entries.len());
             for entry in entries {
-                if entry.is_empty() {
-                    continue;
-                }
                 let mut specs = Vec::with_capacity(entry.len());
                 for s in entry {
                     if s.rank_var < -1 || s.rank_var > 2 {
@@ -619,15 +695,43 @@ fn compile_plan_node(req: &PlanNodeReq) -> Result<PlanNode> {
             }
             Ok(PlanNode::Specs { entries: out })
         }
-        PlanNodeReq::PctBits { bits_b64 } => {
-            let bits = B64_STANDARD
-                .decode(bits_b64.as_bytes())
-                .context("failed to decode pct_bits")?;
+        PlanNodeReq::PctBits { bits_b64, bits } => {
+            let bits = if let Some(raw) = bits {
+                raw.clone()
+            } else if let Some(b64) = bits_b64 {
+                B64_STANDARD
+                    .decode(b64.as_bytes())
+                    .context("failed to decode pct_bits")?
+            } else {
+                anyhow::bail!("pct_bits payload is missing");
+            };
             if bits.is_empty() {
                 anyhow::bail!("pct_bits payload is empty");
             }
             Ok(PlanNode::PctBits { bits })
         }
+        PlanNodeReq::HeuristicTop { threshold } => Ok(PlanNode::HeuristicTop {
+            threshold: *threshold,
+        }),
+        PlanNodeReq::HeuristicRange {
+            low_threshold,
+            high_threshold,
+        } => Ok(PlanNode::HeuristicRange {
+            low_threshold: *low_threshold,
+            high_threshold: *high_threshold,
+        }),
+        PlanNodeReq::Tag { tag } => Ok(PlanNode::Tag(match tag.kind {
+            PlanTagKind::TopPair => TagAtom::TopPair { plus: tag.plus },
+            PlanTagKind::Overpair => TagAtom::Overpair { plus: tag.plus },
+            PlanTagKind::TwoPair => TagAtom::TwoPair { plus: tag.plus },
+            PlanTagKind::Set => TagAtom::Set { plus: tag.plus },
+            PlanTagKind::FlushDraw => TagAtom::FlushDraw,
+            PlanTagKind::Flush => TagAtom::Flush { plus: tag.plus },
+            PlanTagKind::StraightDraw => TagAtom::StraightDraw {
+                min_outs: tag.min_outs.max(1),
+            },
+            PlanTagKind::Straight => TagAtom::Straight { plus: tag.plus },
+        })),
     }
 }
 
@@ -639,13 +743,15 @@ fn enumerate_pool_with_plan(
     hand: &mut [u8],
     plan: &PlanNode,
     choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
     cap: usize,
     rng: &mut StdRng,
     pool: &mut Vec<Vec<u8>>,
     matched: &mut usize,
 ) {
     if depth == hand_size {
-        if !eval_plan(plan, hand, choose) {
+        if !eval_plan(plan, hand, choose, board, is_holdem) {
             return;
         }
         *matched += 1;
@@ -670,6 +776,8 @@ fn enumerate_pool_with_plan(
             hand,
             plan,
             choose,
+            board,
+            is_holdem,
             cap,
             rng,
             pool,
@@ -678,22 +786,40 @@ fn enumerate_pool_with_plan(
     }
 }
 
-fn eval_plan(node: &PlanNode, hand: &[u8], choose: &ChooseTable) -> bool {
+fn eval_plan(
+    node: &PlanNode,
+    hand: &[u8],
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+) -> bool {
     match node {
         PlanNode::Or(left, right) => {
-            eval_plan(left, hand, choose) || eval_plan(right, hand, choose)
+            eval_plan(left, hand, choose, board, is_holdem)
+                || eval_plan(right, hand, choose, board, is_holdem)
         }
         PlanNode::And(left, right) => {
-            eval_plan(left, hand, choose) && eval_plan(right, hand, choose)
+            eval_plan(left, hand, choose, board, is_holdem)
+                && eval_plan(right, hand, choose, board, is_holdem)
         }
         PlanNode::Not(left, right) => {
-            eval_plan(left, hand, choose) && !eval_plan(right, hand, choose)
+            eval_plan(left, hand, choose, board, is_holdem)
+                && !eval_plan(right, hand, choose, board, is_holdem)
         }
         PlanNode::Specs { entries } => entries.iter().any(|specs| match_specs(specs, hand)),
         PlanNode::PctBits { bits } => {
             let idx = combo_rank_52(hand, choose);
             bit_is_set(bits, idx)
         }
+        PlanNode::HeuristicTop { threshold } => evaluate_heuristic(hand) >= *threshold,
+        PlanNode::HeuristicRange {
+            low_threshold,
+            high_threshold,
+        } => {
+            let s = evaluate_heuristic(hand);
+            s <= *low_threshold && s >= *high_threshold
+        }
+        PlanNode::Tag(tag) => full_tag_match(*tag, hand, board, is_holdem),
     }
 }
 
@@ -1173,6 +1299,8 @@ fn build_samplers(req: &Request) -> Result<Vec<Sampler>> {
     if expected == 0 {
         anyhow::bail!("unsupported variant {}", req.variant);
     }
+    let choose = build_choose_table();
+    let is_holdem = req.variant == "holdem";
     req.players
         .iter()
         .enumerate()
@@ -1186,9 +1314,18 @@ fn build_samplers(req: &Request) -> Result<Vec<Sampler>> {
                     expected
                 );
             }
+            let weight_pct = p.weight_pct.unwrap_or(100);
+            if weight_pct == 0 || weight_pct > 100 {
+                anyhow::bail!(
+                    "player {} weight_pct {} is invalid (must be 1..=100)",
+                    i + 1,
+                    weight_pct
+                );
+            }
             if p.mode == "all" {
                 Ok(Sampler::All {
                     hand_size: p.hand_size,
+                    weight_pct,
                 })
             } else if p.mode == "pool" {
                 let mut pool = p.pool.clone().unwrap_or_default();
@@ -1217,12 +1354,190 @@ fn build_samplers(req: &Request) -> Result<Vec<Sampler>> {
                 Ok(Sampler::Pool {
                     hand_size: p.hand_size,
                     pool,
+                    weight_pct,
                 })
+            } else if p.mode == "plan" {
+                let plan_req = p
+                    .plan
+                    .as_ref()
+                    .with_context(|| format!("player {} plan is missing", i + 1))?;
+                let plan = compile_plan_node(plan_req)
+                    .with_context(|| format!("player {} plan is invalid", i + 1))?;
+                if plan_has_pct_bits(&plan) {
+                    Ok(Sampler::Plan {
+                        hand_size: p.hand_size,
+                        plan,
+                        weight_pct,
+                    })
+                } else {
+                    let limit = small_plan_pool_limit(p.hand_size);
+                    match collect_small_plan_pool(
+                        req,
+                        p.hand_size,
+                        &plan,
+                        &choose,
+                        is_holdem,
+                        limit,
+                    )? {
+                        SmallPlanPool::Empty => anyhow::bail!(
+                            "player {} range appears empty on this board/dead setup",
+                            i + 1
+                        ),
+                        SmallPlanPool::Small(mut pool) => {
+                            pool.sort_unstable();
+                            pool.dedup();
+                            pool.shrink_to_fit();
+                            Ok(Sampler::Pool {
+                                hand_size: p.hand_size,
+                                pool,
+                                weight_pct,
+                            })
+                        }
+                        SmallPlanPool::Large => Ok(Sampler::Plan {
+                            hand_size: p.hand_size,
+                            plan,
+                            weight_pct,
+                        }),
+                    }
+                }
             } else {
                 anyhow::bail!("unsupported player mode '{}'", p.mode);
             }
         })
         .collect()
+}
+
+fn plan_has_pct_bits(plan: &PlanNode) -> bool {
+    match plan {
+        PlanNode::PctBits { .. } => true,
+        PlanNode::Specs { .. }
+        | PlanNode::HeuristicTop { .. }
+        | PlanNode::HeuristicRange { .. }
+        | PlanNode::Tag(_) => false,
+        PlanNode::Or(left, right) | PlanNode::And(left, right) | PlanNode::Not(left, right) => {
+            plan_has_pct_bits(left) || plan_has_pct_bits(right)
+        }
+    }
+}
+
+enum SmallPlanPool {
+    Empty,
+    Small(Vec<Vec<u8>>),
+    Large,
+}
+
+fn small_plan_pool_limit(hand_size: usize) -> usize {
+    match hand_size {
+        2 => 10_000,
+        4 => 60_000,
+        5 => 80_000,
+        6 => 60_000,
+        _ => 40_000,
+    }
+}
+
+fn collect_small_plan_pool(
+    req: &Request,
+    hand_size: usize,
+    plan: &PlanNode,
+    choose: &ChooseTable,
+    is_holdem: bool,
+    limit: usize,
+) -> Result<SmallPlanPool> {
+    let mut blocked = [false; 52];
+    for &c in req.board.iter().chain(req.dead.iter()) {
+        blocked[c as usize] = true;
+    }
+    let mut base = Vec::<u8>::with_capacity(52 - req.board.len() - req.dead.len());
+    for c in 0u8..52u8 {
+        if !blocked[c as usize] {
+            base.push(c);
+        }
+    }
+    if base.len() < hand_size {
+        return Ok(SmallPlanPool::Empty);
+    }
+
+    let mut hand = vec![0u8; hand_size];
+    let mut pool = Vec::<Vec<u8>>::new();
+    let mut overflow = false;
+    collect_small_plan_pool_rec(
+        0,
+        0,
+        &base,
+        hand_size,
+        &mut hand,
+        plan,
+        choose,
+        &req.board,
+        is_holdem,
+        limit.max(1),
+        &mut pool,
+        &mut overflow,
+    );
+    if pool.is_empty() {
+        return Ok(SmallPlanPool::Empty);
+    }
+    if overflow {
+        return Ok(SmallPlanPool::Large);
+    }
+    Ok(SmallPlanPool::Small(pool))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_small_plan_pool_rec(
+    start: usize,
+    depth: usize,
+    base: &[u8],
+    hand_size: usize,
+    hand: &mut [u8],
+    plan: &PlanNode,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+    limit: usize,
+    pool: &mut Vec<Vec<u8>>,
+    overflow: &mut bool,
+) {
+    if *overflow {
+        return;
+    }
+    if depth == hand_size {
+        if eval_plan(plan, hand, choose, board, is_holdem) {
+            if pool.len() >= limit {
+                *overflow = true;
+                return;
+            }
+            pool.push(hand.to_vec());
+        }
+        return;
+    }
+
+    let need = hand_size - depth;
+    if base.len() < need || start > base.len() - need {
+        return;
+    }
+
+    for i in start..=base.len() - need {
+        hand[depth] = base[i];
+        collect_small_plan_pool_rec(
+            i + 1,
+            depth + 1,
+            base,
+            hand_size,
+            hand,
+            plan,
+            choose,
+            board,
+            is_holdem,
+            limit,
+            pool,
+            overflow,
+        );
+        if *overflow {
+            return;
+        }
+    }
 }
 
 fn new_partial(pcount: usize, combo_space: usize) -> Partial {
@@ -1281,8 +1596,28 @@ fn simulate_partition(
             let sampler = &samplers[pi];
             let hand = &mut hand_buf[pi];
             let ok = match sampler {
-                Sampler::All { hand_size } => sample_random_hand(*hand_size, &used, &mut rng, hand),
-                Sampler::Pool { pool, .. } => sample_from_pool(pool, &used, &mut rng, hand),
+                Sampler::All {
+                    hand_size,
+                    weight_pct,
+                } => sample_random_hand_weighted(*hand_size, *weight_pct, &used, &mut rng, hand),
+                Sampler::Pool {
+                    pool, weight_pct, ..
+                } => sample_from_pool_weighted(pool, *weight_pct, &used, &mut rng, hand),
+                Sampler::Plan {
+                    hand_size,
+                    plan,
+                    weight_pct,
+                } => sample_from_plan(
+                    *hand_size,
+                    plan,
+                    *weight_pct,
+                    &used,
+                    &mut rng,
+                    hand,
+                    choose,
+                    &req.board,
+                    is_holdem,
+                ),
             };
             if !ok {
                 failed = true;
@@ -1397,8 +1732,180 @@ fn confidence_reached(total: &Partial, cfg: ConfidenceCfg) -> (bool, f64) {
 
 fn sampler_hand_size(s: &Sampler) -> usize {
     match s {
-        Sampler::All { hand_size } => *hand_size,
+        Sampler::All { hand_size, .. } => *hand_size,
         Sampler::Pool { hand_size, .. } => *hand_size,
+        Sampler::Plan { hand_size, .. } => *hand_size,
+    }
+}
+
+const PLAN_RANDOM_TRIES: usize = 384;
+
+fn accept_weight(weight_pct: u8, rng: &mut StdRng) -> bool {
+    weight_pct >= 100 || rng.gen_range(0u8..100u8) < weight_pct
+}
+
+fn weight_try_budget(weight_pct: u8) -> usize {
+    if weight_pct >= 100 {
+        1
+    } else {
+        (400usize / weight_pct.max(1) as usize).clamp(8, 2_000)
+    }
+}
+
+fn sample_random_hand_weighted(
+    hand_size: usize,
+    weight_pct: u8,
+    used: &[bool; 52],
+    rng: &mut StdRng,
+    out: &mut Vec<u8>,
+) -> bool {
+    for _ in 0..weight_try_budget(weight_pct) {
+        if !sample_random_hand(hand_size, used, rng, out) {
+            return false;
+        }
+        if accept_weight(weight_pct, rng) {
+            return true;
+        }
+    }
+    false
+}
+
+fn sample_from_pool_weighted(
+    pool: &[Vec<u8>],
+    weight_pct: u8,
+    used: &[bool; 52],
+    rng: &mut StdRng,
+    out: &mut Vec<u8>,
+) -> bool {
+    for _ in 0..weight_try_budget(weight_pct) {
+        if !sample_from_pool(pool, used, rng, out) {
+            return false;
+        }
+        if accept_weight(weight_pct, rng) {
+            return true;
+        }
+    }
+    false
+}
+
+fn sample_from_plan(
+    hand_size: usize,
+    plan: &PlanNode,
+    weight_pct: u8,
+    used: &[bool; 52],
+    rng: &mut StdRng,
+    out: &mut Vec<u8>,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+) -> bool {
+    for _ in 0..PLAN_RANDOM_TRIES {
+        if !sample_random_hand(hand_size, used, rng, out) {
+            return false;
+        }
+        if eval_plan(plan, out, choose, board, is_holdem) && accept_weight(weight_pct, rng) {
+            return true;
+        }
+    }
+    sample_from_plan_exhaustive(
+        hand_size, plan, weight_pct, used, rng, out, choose, board, is_holdem,
+    )
+}
+
+fn sample_from_plan_exhaustive(
+    hand_size: usize,
+    plan: &PlanNode,
+    weight_pct: u8,
+    used: &[bool; 52],
+    rng: &mut StdRng,
+    out: &mut Vec<u8>,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+) -> bool {
+    let mut avail = Vec::with_capacity(52);
+    for c in 0u8..52u8 {
+        if !used[c as usize] {
+            avail.push(c);
+        }
+    }
+    if avail.len() < hand_size {
+        return false;
+    }
+
+    let mut hand = vec![0u8; hand_size];
+    let mut matched = 0usize;
+    let mut chosen = Vec::<u8>::new();
+    reservoir_plan_combos_rec(
+        0,
+        0,
+        &avail,
+        hand_size,
+        &mut hand,
+        plan,
+        choose,
+        board,
+        is_holdem,
+        rng,
+        &mut matched,
+        &mut chosen,
+    );
+
+    if matched == 0 || chosen.is_empty() || !accept_weight(weight_pct, rng) {
+        return false;
+    }
+    out.clear();
+    out.extend_from_slice(&chosen);
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reservoir_plan_combos_rec(
+    start: usize,
+    depth: usize,
+    avail: &[u8],
+    hand_size: usize,
+    hand: &mut [u8],
+    plan: &PlanNode,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+    rng: &mut StdRng,
+    matched: &mut usize,
+    chosen: &mut Vec<u8>,
+) {
+    if depth == hand_size {
+        if eval_plan(plan, hand, choose, board, is_holdem) {
+            *matched += 1;
+            if *matched == 1 || rng.gen_range(0..*matched) == 0 {
+                chosen.clear();
+                chosen.extend_from_slice(hand);
+            }
+        }
+        return;
+    }
+
+    let need = hand_size - depth;
+    if avail.len() < need || start > avail.len() - need {
+        return;
+    }
+
+    for i in start..=avail.len() - need {
+        hand[depth] = avail[i];
+        reservoir_plan_combos_rec(
+            i + 1,
+            depth + 1,
+            avail,
+            hand_size,
+            hand,
+            plan,
+            choose,
+            board,
+            is_holdem,
+            rng,
+            matched,
+            chosen,
+        );
     }
 }
 
@@ -1467,6 +1974,469 @@ fn disjoint(hand: &[u8], used: &[bool; 52]) -> bool {
         }
     }
     true
+}
+
+fn card_rank_value(card: u8) -> u8 {
+    card / 4 + 2
+}
+
+fn card_suit(card: u8) -> u8 {
+    card % 4
+}
+
+fn full_tag_match(tag: TagAtom, hand: &[u8], board: &[u8], is_holdem: bool) -> bool {
+    if board.len() < 3 {
+        return false;
+    }
+
+    if is_holdem {
+        if hand.len() != 2 {
+            return false;
+        }
+        let core = [hand[0], hand[1]];
+        return core_tag_match(tag, core, board, true);
+    }
+
+    for i in 0..hand.len().saturating_sub(1) {
+        for j in (i + 1)..hand.len() {
+            if core_tag_match(tag, [hand[i], hand[j]], board, false) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn core_tag_match(tag: TagAtom, core: [u8; 2], board: &[u8], is_holdem: bool) -> bool {
+    if board.len() < 3 {
+        return false;
+    }
+    if matches!(tag, TagAtom::Overpair { .. }) && !is_holdem {
+        return false;
+    }
+
+    let (made_flush, flush_draw) = core_flush_flags(core, board, is_holdem);
+    match tag {
+        TagAtom::TopPair { plus } => {
+            let eval = evaluate_core_ready_state(core, board, is_holdem);
+            if plus {
+                return eval.class_id >= 2
+                    || (eval.class_id == 1 && eval.pair_rank >= eval.top_board);
+            }
+            eval.class_id == 1 && eval.pair_rank == eval.top_board
+        }
+        TagAtom::Overpair { plus } => {
+            let eval = evaluate_core_ready_state(core, board, is_holdem);
+            if plus {
+                return eval.is_overpair || eval.class_id >= 2;
+            }
+            eval.is_overpair
+        }
+        TagAtom::TwoPair { plus } => {
+            let eval = evaluate_core_ready_state(core, board, is_holdem);
+            if plus {
+                eval.class_id >= 2
+            } else {
+                eval.class_id == 2
+            }
+        }
+        TagAtom::Set { plus } => {
+            let eval = evaluate_core_ready_state(core, board, is_holdem);
+            if plus {
+                eval.class_id >= 3
+            } else {
+                eval.class_id == 3
+            }
+        }
+        TagAtom::FlushDraw => flush_draw,
+        TagAtom::Flush { plus } => {
+            if !plus {
+                return made_flush;
+            }
+            let eval = evaluate_core_ready_state(core, board, is_holdem);
+            eval.class_id >= 5
+        }
+        TagAtom::Straight { plus } => {
+            if plus {
+                let eval = evaluate_core_ready_state(core, board, is_holdem);
+                return eval.class_id >= 4;
+            }
+            if is_holdem {
+                has_holdem_straight_by_ranks(&core, board)
+            } else {
+                has_omaha_core_straight(core, board)
+            }
+        }
+        TagAtom::StraightDraw { min_outs } => {
+            if board.len() >= 5 {
+                return false;
+            }
+            let has_straight_now = if is_holdem {
+                has_holdem_straight_by_ranks(&core, board)
+            } else {
+                has_omaha_core_straight(core, board)
+            };
+            if has_straight_now {
+                return false;
+            }
+            core_straight_outs(core, board, is_holdem) >= min_outs
+        }
+    }
+}
+
+fn core_flush_flags(core: [u8; 2], board: &[u8], is_holdem: bool) -> (bool, bool) {
+    let mut board_suit = [0u8; 4];
+    for c in board {
+        board_suit[card_suit(*c) as usize] = board_suit[card_suit(*c) as usize].saturating_add(1);
+    }
+
+    let mut core_suit = [0u8; 4];
+    core_suit[card_suit(core[0]) as usize] += 1;
+    core_suit[card_suit(core[1]) as usize] += 1;
+
+    let mut made_flush = false;
+    let mut flush_draw = false;
+    for s in 0..4 {
+        if is_holdem {
+            let total = board_suit[s] + core_suit[s];
+            if total >= 5 {
+                made_flush = true;
+            }
+            if !made_flush && board.len() < 5 && total == 4 {
+                flush_draw = true;
+            }
+        } else {
+            if core_suit[s] >= 2 && board_suit[s] >= 3 {
+                made_flush = true;
+            }
+            if !made_flush && board.len() < 5 && core_suit[s] >= 2 && board_suit[s] == 2 {
+                flush_draw = true;
+            }
+        }
+    }
+    (made_flush, flush_draw)
+}
+
+#[derive(Clone, Copy)]
+struct ReadyCoreEval {
+    class_id: u8,
+    pair_rank: u8,
+    top_board: u8,
+    is_overpair: bool,
+}
+
+fn evaluate_core_ready_state(core: [u8; 2], board: &[u8], is_holdem: bool) -> ReadyCoreEval {
+    let top_board = board.iter().map(|c| card_rank_value(*c)).max().unwrap_or(2);
+    let (class_id, pair_rank) = if is_holdem {
+        best_holdem_core_class(core, board)
+    } else {
+        best_omaha_core_class(core, board)
+    };
+    let is_overpair = is_holdem
+        && card_rank_value(core[0]) == card_rank_value(core[1])
+        && card_rank_value(core[0]) > top_board;
+
+    ReadyCoreEval {
+        class_id,
+        pair_rank,
+        top_board,
+        is_overpair,
+    }
+}
+
+fn best_holdem_core_class(core: [u8; 2], board: &[u8]) -> (u8, u8) {
+    let mut all = Vec::<u8>::with_capacity(2 + board.len());
+    all.push(core[0]);
+    all.push(core[1]);
+    all.extend_from_slice(board);
+    if all.len() < 5 {
+        return (0, 0);
+    }
+
+    let mut best_class = 0u8;
+    let mut best_pair = 0u8;
+    let n = all.len();
+    for a in 0..=n - 5 {
+        for b in a + 1..=n - 4 {
+            for c in b + 1..=n - 3 {
+                for d in c + 1..=n - 2 {
+                    for e in d + 1..=n - 1 {
+                        let cards = [all[a], all[b], all[c], all[d], all[e]];
+                        let (class_id, pair_rank) = eval_five_cards_class(cards);
+                        if class_id > best_class
+                            || (class_id == best_class && class_id == 1 && pair_rank > best_pair)
+                        {
+                            best_class = class_id;
+                            best_pair = pair_rank;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (best_class, best_pair)
+}
+
+fn best_omaha_core_class(core: [u8; 2], board: &[u8]) -> (u8, u8) {
+    if board.len() < 3 {
+        return (0, 0);
+    }
+    let mut best_class = 0u8;
+    let mut best_pair = 0u8;
+    for i in 0..board.len().saturating_sub(2) {
+        for j in (i + 1)..board.len().saturating_sub(1) {
+            for k in (j + 1)..board.len() {
+                let cards = [core[0], core[1], board[i], board[j], board[k]];
+                let (class_id, pair_rank) = eval_five_cards_class(cards);
+                if class_id > best_class
+                    || (class_id == best_class && class_id == 1 && pair_rank > best_pair)
+                {
+                    best_class = class_id;
+                    best_pair = pair_rank;
+                }
+            }
+        }
+    }
+    (best_class, best_pair)
+}
+
+fn eval_five_cards_class(cards: [u8; 5]) -> (u8, u8) {
+    let mut rank_counts = [0u8; 15];
+    let mut suit_counts = [0u8; 4];
+    for c in cards {
+        let r = card_rank_value(c) as usize;
+        let s = card_suit(c) as usize;
+        rank_counts[r] = rank_counts[r].saturating_add(1);
+        suit_counts[s] = suit_counts[s].saturating_add(1);
+    }
+
+    let is_flush = suit_counts.iter().any(|v| *v == 5);
+    let straight_high = straight_high_from_counts(&rank_counts);
+    let is_straight = straight_high > 0;
+
+    let mut freq = Vec::<(u8, u8)>::new();
+    for r in (2..=14).rev() {
+        let c = rank_counts[r as usize];
+        if c > 0 {
+            freq.push((c, r as u8));
+        }
+    }
+    freq.sort_unstable_by(|(ca, ra), (cb, rb)| cb.cmp(ca).then_with(|| rb.cmp(ra)));
+
+    if is_straight && is_flush {
+        return (8, 0);
+    }
+    if freq.first().map(|(c, _)| *c).unwrap_or(0) == 4 {
+        return (7, 0);
+    }
+    if freq.len() >= 2 && freq[0].0 == 3 && freq[1].0 == 2 {
+        return (6, 0);
+    }
+    if is_flush {
+        return (5, 0);
+    }
+    if is_straight {
+        return (4, 0);
+    }
+    if freq.first().map(|(c, _)| *c).unwrap_or(0) == 3 {
+        return (3, 0);
+    }
+    if freq.len() >= 2 && freq[0].0 == 2 && freq[1].0 == 2 {
+        return (2, 0);
+    }
+    if freq.first().map(|(c, _)| *c).unwrap_or(0) == 2 {
+        return (1, freq[0].1);
+    }
+    (0, 0)
+}
+
+fn straight_high_from_counts(rank_counts: &[u8; 15]) -> u8 {
+    for hi in (6..=14).rev() {
+        if rank_counts[hi] > 0
+            && rank_counts[hi - 1] > 0
+            && rank_counts[hi - 2] > 0
+            && rank_counts[hi - 3] > 0
+            && rank_counts[hi - 4] > 0
+        {
+            return hi as u8;
+        }
+    }
+    if rank_counts[14] > 0
+        && rank_counts[5] > 0
+        && rank_counts[4] > 0
+        && rank_counts[3] > 0
+        && rank_counts[2] > 0
+    {
+        return 5;
+    }
+    0
+}
+
+fn core_straight_outs(core: [u8; 2], board: &[u8], is_holdem: bool) -> u8 {
+    if board.len() >= 5 {
+        return 0;
+    }
+
+    let mut used = [false; 52];
+    used[core[0] as usize] = true;
+    used[core[1] as usize] = true;
+    for c in board {
+        used[*c as usize] = true;
+    }
+
+    let mut outs = 0u8;
+    for c in 0u8..52u8 {
+        if used[c as usize] {
+            continue;
+        }
+        let mut next = board.to_vec();
+        next.push(c);
+        let makes = if is_holdem {
+            has_holdem_straight_by_ranks(&core, &next)
+        } else {
+            has_omaha_core_straight(core, &next)
+        };
+        if makes {
+            outs = outs.saturating_add(1);
+        }
+    }
+    outs
+}
+
+fn has_holdem_straight_by_ranks(hand2: &[u8; 2], board: &[u8]) -> bool {
+    let mut present = [false; 15];
+    present[card_rank_value(hand2[0]) as usize] = true;
+    present[card_rank_value(hand2[1]) as usize] = true;
+    for c in board {
+        present[card_rank_value(*c) as usize] = true;
+    }
+
+    for hi in (6..=14).rev() {
+        if present[hi] && present[hi - 1] && present[hi - 2] && present[hi - 3] && present[hi - 4] {
+            return true;
+        }
+    }
+    present[14] && present[5] && present[4] && present[3] && present[2]
+}
+
+fn has_omaha_core_straight(core: [u8; 2], board: &[u8]) -> bool {
+    if board.len() < 3 {
+        return false;
+    }
+    let hr1 = card_rank_value(core[0]);
+    let hr2 = card_rank_value(core[1]);
+
+    for i in 0..board.len().saturating_sub(2) {
+        let r1 = card_rank_value(board[i]);
+        for j in (i + 1)..board.len().saturating_sub(1) {
+            let r2 = card_rank_value(board[j]);
+            for k in (j + 1)..board.len() {
+                let r3 = card_rank_value(board[k]);
+                if is_five_rank_straight(hr1, hr2, r1, r2, r3) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn is_five_rank_straight(r1: u8, r2: u8, r3: u8, r4: u8, r5: u8) -> bool {
+    let mut seen = [false; 15];
+    for r in [r1, r2, r3, r4, r5] {
+        seen[r as usize] = true;
+    }
+    let uniq = (2..=14).filter(|r| seen[*r]).count();
+    if uniq != 5 {
+        return false;
+    }
+    for hi in (6..=14).rev() {
+        if seen[hi] && seen[hi - 1] && seen[hi - 2] && seen[hi - 3] && seen[hi - 4] {
+            return true;
+        }
+    }
+    seen[14] && seen[5] && seen[4] && seen[3] && seen[2]
+}
+
+fn variant_from_hand_size(hand_size: usize) -> &'static str {
+    match hand_size {
+        2 => "holdem",
+        4 => "plo4",
+        5 => "plo5",
+        6 => "plo6",
+        _ => "",
+    }
+}
+
+fn evaluate_heuristic(hand: &[u8]) -> f64 {
+    let mut ranks = hand
+        .iter()
+        .map(|c| card_rank_value(*c) as i32)
+        .collect::<Vec<_>>();
+    ranks.sort_unstable_by(|a, b| b.cmp(a));
+
+    let mut rank_counts = [0u8; 15];
+    let mut suit_counts = [0u8; 4];
+    for c in hand {
+        rank_counts[card_rank_value(*c) as usize] =
+            rank_counts[card_rank_value(*c) as usize].saturating_add(1);
+        suit_counts[card_suit(*c) as usize] = suit_counts[card_suit(*c) as usize].saturating_add(1);
+    }
+
+    let mut freq = rank_counts
+        .iter()
+        .copied()
+        .filter(|v| *v > 0)
+        .collect::<Vec<_>>();
+    freq.sort_unstable_by(|a, b| b.cmp(a));
+    let freq0 = *freq.first().unwrap_or(&0);
+    let freq1 = *freq.get(1).unwrap_or(&0);
+    let suit_peak = suit_counts.iter().copied().max().unwrap_or(0);
+
+    let mut uniq = ranks.clone();
+    uniq.sort_unstable();
+    uniq.dedup();
+    let mut conn = 0f64;
+    for i in 1..uniq.len() {
+        let d = uniq[i] - uniq[i - 1];
+        if d == 1 {
+            conn += 7.0;
+        } else if d == 2 {
+            conn += 3.0;
+        }
+    }
+
+    let variant = variant_from_hand_size(hand.len());
+    let mut score =
+        ranks.iter().map(|r| *r as f64).sum::<f64>() * if variant == "holdem" { 2.7 } else { 1.8 };
+
+    if freq0 >= 2 {
+        score += 26.0 * freq0 as f64;
+    }
+    if freq1 >= 2 {
+        score += 8.0;
+    }
+    score += conn;
+
+    if variant == "holdem" {
+        if suit_peak == 2 {
+            score += 7.0;
+        }
+    } else {
+        if suit_peak >= 2 {
+            score += 6.0;
+        }
+        if suit_peak >= 3 {
+            score -= 2.0;
+        }
+        if suit_peak >= 4 {
+            score -= 5.0;
+        }
+    }
+    if ranks.contains(&14) {
+        score += 5.0;
+    }
+    score
 }
 
 fn complete_board_runout(
