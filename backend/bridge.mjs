@@ -25,7 +25,8 @@ const NATIVE_SIM_BUILD_STAMP = path.join(PROJECT_ROOT, "native-sim", "target", "
 const NATIVE_SIM_BUILD_STAMP_VERSION = 2;
 const PLAYER_SAMPLER_CACHE = new Map();
 const PLAYER_SAMPLER_CACHE_MAX = 48;
-const SAMPLER_CACHE_VERSION = 3;
+// Bump cache generation after sampler/parity fixes to avoid stale persisted pools.
+const SAMPLER_CACHE_VERSION = 4;
 const SAMPLER_DISK_DIR = path.join(PROJECT_ROOT, "backend", ".cache", `samplers-v${SAMPLER_CACHE_VERSION}`);
 const SAMPLER_MAX_POOL_TO_CACHE_MEM = 30_000;
 const SAMPLER_MAX_POOL_TO_CACHE_DISK = 220_000;

@@ -1,7 +1,7 @@
-import { previewTagCoverage, previewRangeCoverage } from "./sim-core.js";
 import { extractNormalizedTags, normalizePureTagToken, splitTagToken } from "./tag-utils.js";
 
 const REMOTE_COVERAGE_CACHE = new Map();
+const REMOTE_TAG_COVERAGE_CACHE = new Map();
 
 function atTagsInRange(rangeText) {
   return extractNormalizedTags(rangeText);
@@ -70,45 +70,77 @@ function canUseBackendPreview() {
   return proto.startsWith("http");
 }
 
-function shouldUseBackendPreview(rangeText) {
-  const compact = String(rangeText || "").replace(/\s+/g, "");
-  if (!compact) return false;
-  if (/@[a-z0-9_]+/i.test(compact)) return false;
-  const hasPct = compact.includes("%");
-  const hasBooleanOps = /[!:()]/.test(compact);
-  return (hasPct && hasBooleanOps) || compact.length >= 28;
+function backendOfflineError(message = "Helper backend offline") {
+  const err = new Error(message);
+  err.code = "BACKEND_OFFLINE";
+  return err;
+}
+
+function isBackendOfflineError(err) {
+  return !!(err && typeof err === "object" && err.code === "BACKEND_OFFLINE");
+}
+
+async function fetchBackendJson(path, body) {
+  if (!canUseBackendPreview()) throw backendOfflineError();
+  let res;
+  try {
+    res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+  } catch {
+    throw backendOfflineError();
+  }
+  if (res.status === 404 || res.status === 405) throw backendOfflineError();
+  let payload = null;
+  try {
+    payload = await res.json();
+  } catch {
+    // leave payload null
+  }
+  if (!res.ok) {
+    const msg = payload?.error || `Backend error (${res.status})`;
+    if (res.status >= 500) throw backendOfflineError(msg);
+    throw new Error(msg);
+  }
+  if (!payload || typeof payload !== "object") throw new Error("Invalid backend response");
+  return payload;
 }
 
 async function previewRangeCoverageFast(boardText, variant, rangeText, percentileProfile = "") {
   const key = `${variant}|${percentileProfile}|${String(boardText || "").trim()}|${String(rangeText || "").replace(/\s+/g, "")}`;
   if (REMOTE_COVERAGE_CACHE.has(key)) return REMOTE_COVERAGE_CACHE.get(key);
-  if (canUseBackendPreview() && shouldUseBackendPreview(rangeText)) {
-    try {
-      const res = await fetch("/api/sim/preview-range", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          boardText,
-          variant,
-          rangeText,
-          percentileProfile
-        })
-      });
-      if (res.ok) {
-        const payload = await res.json();
-        const cov = payload?.coverage;
-        if (cov && typeof cov === "object") {
-          REMOTE_COVERAGE_CACHE.set(key, cov);
-          return cov;
-        }
-      }
-    } catch {
-      // fallback to local path below
-    }
+  const payload = await fetchBackendJson("/api/sim/preview/range", {
+    boardText,
+    variant,
+    rangeText,
+    percentileProfile
+  });
+  if (payload?.ok === false) {
+    throw new Error(payload?.error || "Range: invalid expression");
   }
-  const local = previewRangeCoverage(boardText, variant, rangeText, { percentileProfile });
-  REMOTE_COVERAGE_CACHE.set(key, local);
-  return local;
+  const cov = payload?.coverage;
+  if (!cov || typeof cov !== "object") throw new Error("Range: invalid backend response");
+  REMOTE_COVERAGE_CACHE.set(key, cov);
+  return cov;
+}
+
+async function previewTagCoverageFast(boardText, variant, tag) {
+  const key = `${variant}|${String(boardText || "").trim()}|${String(tag || "").trim().toLowerCase()}`;
+  if (REMOTE_TAG_COVERAGE_CACHE.has(key)) return REMOTE_TAG_COVERAGE_CACHE.get(key);
+  const payload = await fetchBackendJson("/api/sim/preview/tag", {
+    boardText,
+    variant,
+    tag
+  });
+  if (payload?.ok === false) {
+    throw new Error(payload?.error || "Tag: invalid expression");
+  }
+  const cov = payload?.coverage;
+  if (!cov || typeof cov !== "object") throw new Error("Tag: invalid backend response");
+  REMOTE_TAG_COVERAGE_CACHE.set(key, cov);
+  return cov;
 }
 
 async function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "") {
@@ -126,7 +158,10 @@ async function computeLiveInfo(rangeText, boardText, variant, percentileProfile 
     covExpr = await previewRangeCoverageFast(boardText, variant, expr, percentileProfile);
     const statExpr = coverageText(covExpr);
     if (statExpr) parts.push({ tone: "primary", text: `Range: ${statExpr}` });
-  } catch {
+  } catch (err) {
+    if (isBackendOfflineError(err)) {
+      return { parts: [{ tone: "warn", text: "Helper unavailable: backend offline." }], coverage: null };
+    }
     return { parts: [{ tone: "error", text: "Range: invalid expression" }], coverage: null };
   }
 
@@ -151,7 +186,11 @@ async function computeLiveInfo(rangeText, boardText, variant, percentileProfile 
         const pctLabel = pctAtoms.length === 1 ? pctAtoms[0] : "% filters";
         parts.push({ tone: "focus", text: `Inside ${pctLabel}: ${within.toFixed(1)}% (${shownExpr}/${shownBase} combos)` });
       }
-    } catch {
+    } catch (err) {
+      if (isBackendOfflineError(err)) {
+        parts.push({ tone: "warn", text: "Helper unavailable: backend offline." });
+        return { parts, coverage: null };
+      }
       // keep live info stable even for transient invalid sub-expressions
     }
   }
@@ -173,18 +212,22 @@ async function computeLiveInfo(rangeText, boardText, variant, percentileProfile 
     try {
       const cov = (pureTag && pureTag === tag && covExpr && typeof covExpr === "object")
         ? covExpr
-        : previewTagCoverage(boardText, variant, tag);
+        : await previewTagCoverageFast(boardText, variant, tag);
       const stat = coverageText(cov);
       let extra = "";
       if (!isHoldem && tagInfo.base === "@sd") {
-        const c4 = previewTagCoverage(boardText, variant, "@sd4");
+        const c4 = await previewTagCoverageFast(boardText, variant, "@sd4");
         if (cov.pct > c4.pct + 0.2) extra = " + blocker-only <4 out draws";
       }
       if (pureTag && pureTag === tag && tags.length === 1) {
         continue;
       }
       parts.push({ tone: "tag", text: `${tag}: ${stat}${extra}` });
-    } catch {
+    } catch (err) {
+      if (isBackendOfflineError(err)) {
+        parts.push({ tone: "warn", text: "Helper unavailable: backend offline." });
+        return { parts, coverage: null };
+      }
       parts.push({ tone: "warn", text: `${tag}: invalid board input` });
     }
   }

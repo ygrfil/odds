@@ -126,11 +126,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     info!("rust backend listening on http://localhost:{port}");
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await?;
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+    axum::serve(listener, app).await?;
     Ok(())
 }
 

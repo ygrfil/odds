@@ -1,6 +1,6 @@
 import { runSimulation } from "./engine.js";
-import { previewTagCoreCombos, previewTagCoverage, previewRangeCoverage } from "./sim-core.js";
-import { extractNormalizedTags, normalizePureTagToken, splitTagToken } from "./tag-utils.js";
+import { previewTagCoreCombos } from "./sim-core.js";
+import { extractNormalizedTags, splitTagToken } from "./tag-utils.js";
 import {
   normalizePercentileProfile,
   percentileProfileOptionsForVariant,
@@ -121,7 +121,6 @@ const PRECISION_PRESETS = {
 };
 const DEFAULT_PRECISION_PRESET = "ci20";
 const DEFAULT_PERCENTILE_PROFILE = PERCENTILE_PROFILE_OURS;
-const RUN_COVERAGE_WAIT_BUDGET_MS = 220;
 
 function normalizePrecisionPreset(value) {
   const key = String(value || "").trim().toLowerCase();
@@ -179,155 +178,6 @@ function rangeTagHints(rangeText, variant, boardText = "", showShortcuts = false
     ? `${t}: ${tagShortcutPreviewText(t, boardText, variant)}`
     : `${t}: ${tagHintText(t)}`);
   return `${lines.join("\n")}\n${plusRule}\n${gameRule}`;
-}
-
-function atTagsInRange(rangeText) {
-  return extractNormalizedTags(rangeText);
-}
-
-function normalizedPureTag(rangeText) {
-  return normalizePureTagToken(rangeText);
-}
-
-function extractPercentAtoms(rangeText) {
-  const src = String(rangeText || "").replace(/\s+/g, "");
-  const raw = src.match(/\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)?%/g) || [];
-  const out = [];
-  for (const tok of raw) {
-    const nums = tok.slice(0, -1).split("-").map(Number);
-    if (!nums.every((n) => Number.isFinite(n) && n >= 0 && n <= 100)) continue;
-    if (nums.length === 2 && nums[0] > nums[1]) continue;
-    if (!out.includes(tok)) out.push(tok);
-  }
-  return out;
-}
-
-function parseSimplePercentSpec(expr) {
-  const s = String(expr || "").replace(/\s+/g, "");
-  const top = s.match(/^(\d+(?:\.\d+)?)%$/);
-  if (top) {
-    const p = Number(top[1]);
-    if (Number.isFinite(p) && p >= 0 && p <= 100) return { label: `${top[1]}%`, nominalPct: p };
-    return null;
-  }
-  const band = s.match(/^(\d+(?:\.\d+)?)%-(\d+(?:\.\d+)?)%$/);
-  if (band) {
-    const low = Number(band[1]);
-    const high = Number(band[2]);
-    if (!Number.isFinite(low) || !Number.isFinite(high) || low < 0 || high > 100 || low > high) return null;
-    return { label: `${band[1]}%-${band[2]}%`, nominalPct: high - low };
-  }
-  return null;
-}
-
-function coverageCounts(cov) {
-  if (!cov) return { matched: 0, total: 0, approx: false };
-  if (cov.approx) {
-    const matched = Number.isFinite(cov.estimatedMatched) ? cov.estimatedMatched : cov.matched;
-    const total = Number.isFinite(cov.population) ? cov.population : cov.total;
-    return { matched, total, approx: true };
-  }
-  return { matched: cov.matched, total: cov.total, approx: false };
-}
-
-function coverageText(cov) {
-  if (!cov || cov.total <= 0) return "";
-  if (cov.approx) {
-    const pct = `~${cov.pct.toFixed(1)}%`;
-    if (Number.isFinite(cov.estimatedMatched) && Number.isFinite(cov.population) && cov.population > 0) {
-      return `${pct}, ~${cov.estimatedMatched.toLocaleString()}/${cov.population.toLocaleString()} combos`;
-    }
-    return `${pct}, ${cov.matched.toLocaleString()}/${cov.total.toLocaleString()} samples`;
-  }
-  return `${cov.pct.toFixed(1)}%, ${cov.matched.toLocaleString()}/${cov.total.toLocaleString()} combos`;
-}
-
-function rangeLiveInfo(
-  rangeText,
-  boardText = el.board.value.trim(),
-  variant = el.variant.value,
-  percentileProfile = currentOrderingProfile(variant)
-) {
-  const expr = String(rangeText || "").trim();
-  if (!expr) return [];
-
-  const tags = atTagsInRange(expr);
-  const boardCards = Math.floor(String(boardText).replace(/\s+/g, "").length / 2);
-  const isHoldem = variant === "holdem";
-  const pctSpec = parseSimplePercentSpec(expr);
-  const parts = [];
-  let covExpr = null;
-
-  try {
-    covExpr = previewRangeCoverage(boardText, variant, expr, { percentileProfile });
-    const statExpr = coverageText(covExpr);
-    if (statExpr) parts.push({ tone: "primary", text: `Range: ${statExpr}` });
-  } catch {
-    parts.push({ tone: "error", text: "Range: invalid expression" });
-    return parts;
-  }
-
-  const pctAtoms = extractPercentAtoms(expr);
-  if (covExpr && pctSpec && boardCards > 0 && Math.abs(covExpr.pct - pctSpec.nominalPct) >= 0.05) {
-    parts.push({
-      tone: "focus",
-      text: `${pctSpec.label} is a preflop percentile filter; current board blockers make it ${covExpr.pct.toFixed(1)}% of remaining combos.`
-    });
-  }
-  if (covExpr && pctAtoms.length && !pctSpec) {
-    try {
-      const baseExpr = pctAtoms.join(",");
-      const baseCov = previewRangeCoverage(boardText, variant, baseExpr, { percentileProfile });
-      const exprCnt = coverageCounts(covExpr);
-      const baseCnt = coverageCounts(baseCov);
-      if (baseCnt.matched > 0) {
-        const within = (exprCnt.matched * 100) / baseCnt.matched;
-        const approx = exprCnt.approx || baseCnt.approx;
-        const shownExpr = `${approx ? "~" : ""}${Math.max(0, Math.round(exprCnt.matched)).toLocaleString()}`;
-        const shownBase = `${approx ? "~" : ""}${Math.max(0, Math.round(baseCnt.matched)).toLocaleString()}`;
-        const pctLabel = pctAtoms.length === 1 ? pctAtoms[0] : "% filters";
-        parts.push({ tone: "focus", text: `Inside ${pctLabel}: ${within.toFixed(1)}% (${shownExpr}/${shownBase} combos)` });
-      }
-    } catch {
-      // ignore subset stats for invalid percent filter expression
-    }
-  }
-
-  if (!tags.length) return parts;
-  const pureTag = normalizedPureTag(expr);
-
-  for (const tag of tags) {
-    const tagInfo = splitTagToken(tag);
-    if (!tagInfo) continue;
-    if (tagInfo.base === "@overpair" && !isHoldem) {
-      parts.push({ tone: "warn", text: "@overpair: Hold'em only." });
-      continue;
-    }
-    if (boardCards < 3) {
-      parts.push({ tone: "warn", text: `${tag}: needs flop+.` });
-    } else {
-      try {
-        const cov = (pureTag && pureTag === tag && covExpr && typeof covExpr === "object")
-          ? covExpr
-          : previewTagCoverage(boardText, variant, tag);
-        const stat = coverageText(cov);
-        let extra = "";
-        if (!isHoldem && tagInfo.base === "@sd") {
-          const c4 = previewTagCoverage(boardText, variant, "@sd4");
-          if (cov.pct > c4.pct + 0.2) {
-            extra = " + blocker-only <4 out draws";
-          }
-        }
-        if (pureTag && pureTag === tag && tags.length === 1) {
-          continue;
-        }
-        parts.push({ tone: "tag", text: `${tag}: ${stat}${extra}` });
-      } catch {
-        parts.push({ tone: "warn", text: `${tag}: invalid board input` });
-      }
-    }
-  }
-  return parts;
 }
 
 function renderLiveInfo(node, parts) {
@@ -419,14 +269,7 @@ function dispatchLiveInfoUpdate(playerIndex) {
     });
     return;
   }
-
-  setTimeout(() => {
-    if (liveInfoState.latestRequestByPlayer.get(playerIndex) !== requestId) return;
-    const parts = rangeLiveInfo(ctx.rangeText, ctx.boardText, ctx.variant, ctx.percentileProfile);
-    const latestNode = liveInfoState.nodeByPlayer.get(playerIndex);
-    if (!latestNode) return;
-    renderLiveInfo(latestNode, parts);
-  }, 0);
+  renderLiveInfo(node, [{ tone: "warn", text: "Helper unavailable: backend offline." }]);
 }
 
 function queueLiveInfoUpdate(playerIndex, rangeText, immediate = false) {
@@ -618,51 +461,9 @@ function buildRangeCoverageSnapshot(config) {
       out.push(cached);
       continue;
     }
-    // Keep run button responsive: if worker is available, avoid heavy sync
-    // exact recomputation on the main thread.
-    if (liveInfoState.worker) {
-      out.push(null);
-      continue;
-    }
-    try {
-      const boardText = String(config.board || "").trim();
-      const variant = String(config.variant || "");
-      const percentileProfile = String(config.percentileProfile || "");
-      const rangeText = String(players[i]?.range || "*");
-      out.push(previewRangeCoverage(boardText, variant, rangeText, { percentileProfile }));
-    } catch {
-      out.push(null);
-    }
+    out.push(null);
   }
   return out;
-}
-
-function waitForCoverage(config, playerIndex, signal, baselineReadyId = 0, timeoutMs = 0) {
-  const started = performance.now();
-  return new Promise((resolve) => {
-    const poll = () => {
-      if (signal?.aborted) {
-        resolve(null);
-        return;
-      }
-      const cov = coverageForConfigPlayer(config, playerIndex);
-      if (cov) {
-        resolve(cov);
-        return;
-      }
-      const readyId = Number(liveInfoState.coverageReadyByPlayer.get(playerIndex) || 0);
-      if (readyId && readyId !== baselineReadyId) {
-        resolve(null);
-        return;
-      }
-      if (timeoutMs > 0 && performance.now() - started >= timeoutMs) {
-        resolve(null);
-        return;
-      }
-      setTimeout(poll, 40);
-    };
-    poll();
-  });
 }
 
 async function collectRangeCoverageSnapshot(config, signal) {
@@ -670,21 +471,10 @@ async function collectRangeCoverageSnapshot(config, signal) {
   if (!liveInfoState.worker) return snapshot;
   if (signal?.aborted) return snapshot;
   const players = Array.isArray(config.players) ? config.players : [];
-  const missing = [];
   for (let i = 0; i < players.length; i++) {
-    if (!snapshot[i]) missing.push(i);
-  }
-  if (!missing.length) return snapshot;
-  const readyBaseline = new Map();
-  for (const i of missing) {
-    readyBaseline.set(i, Number(liveInfoState.coverageReadyByPlayer.get(i) || 0));
-    queueLiveInfoUpdate(i, players[i]?.range || "*", true);
-  }
-  const resolved = await Promise.all(
-    missing.map((i) => waitForCoverage(config, i, signal, readyBaseline.get(i) || 0, RUN_COVERAGE_WAIT_BUDGET_MS))
-  );
-  for (let j = 0; j < missing.length; j++) {
-    snapshot[missing[j]] = resolved[j];
+    if (!snapshot[i]) {
+      queueLiveInfoUpdate(i, players[i]?.range || "*", true);
+    }
   }
   return snapshot;
 }
