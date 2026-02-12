@@ -467,16 +467,10 @@ function buildRangeCoverageSnapshot(config) {
 }
 
 async function collectRangeCoverageSnapshot(config, signal) {
-  const snapshot = buildRangeCoverageSnapshot(config);
-  if (!liveInfoState.worker) return snapshot;
-  if (signal?.aborted) return snapshot;
-  const players = Array.isArray(config.players) ? config.players : [];
-  for (let i = 0; i < players.length; i++) {
-    if (!snapshot[i]) {
-      queueLiveInfoUpdate(i, players[i]?.range || "*", true);
-    }
-  }
-  return snapshot;
+  if (signal?.aborted) return buildRangeCoverageSnapshot(config);
+  // Avoid launching duplicate helper requests during Run; use only data
+  // already computed by the live helper and cached in memory.
+  return buildRangeCoverageSnapshot(config);
 }
 
 function renderPlayers() {
@@ -584,7 +578,7 @@ async function run() {
   try {
     const config = currentConfig();
     const controller = runAbortController;
-    setStatus("Preparing exact range coverage...");
+    setStatus("Preparing cached range coverage...");
     const coverageStarted = performance.now();
     config.rangeCoverage = await collectRangeCoverageSnapshot(config, controller?.signal);
     const coverageMs = performance.now() - coverageStarted;

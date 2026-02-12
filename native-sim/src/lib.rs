@@ -229,7 +229,7 @@ enum Sampler {
     },
     Pool {
         hand_size: usize,
-        pool: Vec<Vec<u8>>,
+        pool: Vec<PoolEntry>,
         weight_pct: u8,
     },
     Plan {
@@ -237,6 +237,12 @@ enum Sampler {
         plan: PlanNode,
         weight_pct: u8,
     },
+}
+
+#[derive(Clone)]
+struct PoolEntry {
+    cards: Vec<u8>,
+    mask: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -1351,6 +1357,13 @@ fn build_samplers(req: &Request) -> Result<Vec<Sampler>> {
                 pool.sort_unstable();
                 pool.dedup();
                 pool.shrink_to_fit();
+                let pool = pool
+                    .into_iter()
+                    .map(|cards| PoolEntry {
+                        mask: cards_mask(&cards),
+                        cards,
+                    })
+                    .collect();
                 Ok(Sampler::Pool {
                     hand_size: p.hand_size,
                     pool,
@@ -1383,6 +1396,13 @@ fn build_samplers(req: &Request) -> Result<Vec<Sampler>> {
                             pool.sort_unstable();
                             pool.dedup();
                             pool.shrink_to_fit();
+                            let pool = pool
+                                .into_iter()
+                                .map(|cards| PoolEntry {
+                                    mask: cards_mask(&cards),
+                                    cards,
+                                })
+                                .collect();
                             Ok(Sampler::Pool {
                                 hand_size: p.hand_size,
                                 pool,
@@ -1568,8 +1588,10 @@ fn simulate_partition(
 
     let mut rng = StdRng::seed_from_u64(seed);
     let mut blocked = [false; 52];
+    let mut blocked_mask = 0u64;
     for &c in req.board.iter().chain(req.dead.iter()) {
         blocked[c as usize] = true;
+        blocked_mask |= 1u64 << c;
     }
 
     let is_holdem = req.variant == "holdem";
@@ -1590,6 +1612,7 @@ fn simulate_partition(
 
     for _ in 0..iter_cap {
         used.copy_from_slice(&blocked);
+        let mut used_mask = blocked_mask;
         let mut failed = false;
 
         player_order.shuffle(&mut rng);
@@ -1604,7 +1627,7 @@ fn simulate_partition(
                 } => sample_random_hand_weighted(*hand_size, *weight_pct, &used, &mut rng, hand),
                 Sampler::Pool {
                     pool, weight_pct, ..
-                } => sample_from_pool_weighted(pool, *weight_pct, &used, &mut rng, hand),
+                } => sample_from_pool_weighted(pool, *weight_pct, used_mask, &mut rng, hand),
                 Sampler::Plan {
                     hand_size,
                     plan,
@@ -1627,6 +1650,7 @@ fn simulate_partition(
             }
             for &c in hand.iter() {
                 used[c as usize] = true;
+                used_mask |= 1u64 << c;
             }
             out.combo_sets[pi].insert_index(combo_rank_52(hand, choose));
         }
@@ -1773,14 +1797,14 @@ fn sample_random_hand_weighted(
 }
 
 fn sample_from_pool_weighted(
-    pool: &[Vec<u8>],
+    pool: &[PoolEntry],
     weight_pct: u8,
-    used: &[bool; 52],
+    used_mask: u64,
     rng: &mut StdRng,
     out: &mut Vec<u8>,
 ) -> bool {
     for _ in 0..weight_try_budget(weight_pct) {
-        if !sample_from_pool(pool, used, rng, out) {
+        if !sample_from_pool(pool, used_mask, rng, out) {
             return false;
         }
         if accept_weight(weight_pct, rng) {
@@ -1939,8 +1963,8 @@ fn sample_random_hand(
 }
 
 fn sample_from_pool(
-    pool: &[Vec<u8>],
-    used: &[bool; 52],
+    pool: &[PoolEntry],
+    used_mask: u64,
     rng: &mut StdRng,
     out: &mut Vec<u8>,
 ) -> bool {
@@ -1950,9 +1974,9 @@ fn sample_from_pool(
     for _ in 0..64 {
         let idx = rng.gen_range(0..pool.len());
         let hand = &pool[idx];
-        if disjoint(hand, used) {
+        if (hand.mask & used_mask) == 0 {
             out.clear();
-            out.extend_from_slice(hand);
+            out.extend_from_slice(&hand.cards);
             return true;
         }
     }
@@ -1960,22 +1984,21 @@ fn sample_from_pool(
     for step in 0..pool.len() {
         let idx = (start + step) % pool.len();
         let hand = &pool[idx];
-        if disjoint(hand, used) {
+        if (hand.mask & used_mask) == 0 {
             out.clear();
-            out.extend_from_slice(hand);
+            out.extend_from_slice(&hand.cards);
             return true;
         }
     }
     false
 }
 
-fn disjoint(hand: &[u8], used: &[bool; 52]) -> bool {
-    for &c in hand {
-        if used[c as usize] {
-            return false;
-        }
+fn cards_mask(cards: &[u8]) -> u64 {
+    let mut mask = 0u64;
+    for &c in cards {
+        mask |= 1u64 << c;
     }
-    true
+    mask
 }
 
 fn card_rank_value(card: u8) -> u8 {

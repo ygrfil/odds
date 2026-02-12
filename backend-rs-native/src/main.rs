@@ -6,7 +6,7 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -235,6 +235,9 @@ const MACRO_REPLACEMENTS: [(&str, &str); 21] = [
 ];
 const PERCENTILE_SAMPLE_SIZE: usize = 30_000;
 const PREVIEW_PARALLEL_THRESHOLD: usize = 400_000;
+const EXACT_PLAN_POOL_LIMIT_HOLDEM: usize = 40_000;
+const EXACT_PLAN_POOL_LIMIT_PLO4: usize = 180_000;
+const EXACT_PLAN_POOL_LIMIT_PLO5: usize = 260_000;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -410,6 +413,10 @@ async fn sim_preview_range(Json(req): Json<PreviewRangeRequest>) -> (StatusCode,
     let total = n_choose_k(base.len(), hand_size);
 
     let range_text = req.range_text.trim();
+    let profile_norm = normalize_percentile_profile(
+        &variant,
+        req.percentile_profile.as_deref().unwrap_or_default(),
+    );
     let compiled = match compile_range_expr(
         range_text,
         &variant,
@@ -427,6 +434,15 @@ async fn sim_preview_range(Json(req): Json<PreviewRangeRequest>) -> (StatusCode,
             );
         }
     };
+
+    cache_sampler_from_preview(
+        &variant,
+        hand_size,
+        &board,
+        range_text,
+        &profile_norm,
+        &compiled,
+    );
 
     if is_any_expr(&compiled.expr) {
         let out = json!({ "matched": total, "total": total, "pct": 100, "approx": false });
@@ -482,6 +498,7 @@ fn prepare_native_request(cfg: &RunConfig, workers: Option<usize>) -> Result<Nat
             hand_size,
             &board,
             &dead,
+            cfg.players.len(),
             p.range.trim(),
             cfg.percentile_profile.as_deref(),
             &mut prep_rng,
@@ -514,6 +531,7 @@ fn build_sampler_for_range(
     hand_size: usize,
     board: &[u8],
     dead: &[u8],
+    player_count: usize,
     raw_range: &str,
     percentile_profile: Option<&str>,
     prep_rng: &mut JsRng,
@@ -523,7 +541,13 @@ fn build_sampler_for_range(
         normalize_percentile_profile(variant, percentile_profile.unwrap_or_default());
     let cache_key = sampler_cache_key(variant, hand_size, board, dead, range, &profile_norm);
     if let Some(cached) = sampler_cache_get(&cache_key) {
-        return Ok(cached);
+        let can_upgrade_plan = cached.mode == "plan"
+            && player_count <= 3
+            && exact_plan_pool_limit(variant) > 0
+            && !plan_pool_too_large_contains(&cache_key);
+        if !can_upgrade_plan {
+            return Ok(cached);
+        }
     }
 
     let compiled = compile_range_expr(range, variant, hand_size, percentile_profile)?;
@@ -548,6 +572,33 @@ fn build_sampler_for_range(
     }
 
     if let Some(plan) = range_expr_to_plan(expr) {
+        let limit = if player_count <= 3 {
+            exact_plan_pool_limit(variant)
+        } else {
+            0
+        };
+        if limit > 0 {
+            let base = base_deck(board, dead);
+            match collect_exact_pool_with_limit(&base, hand_size, board, expr, limit) {
+                ExactPoolCollect::Empty => {
+                    return Err("range appears empty on this board/dead-card setup".to_string());
+                }
+                ExactPoolCollect::Full(pool) => {
+                    let sampler = NativePlayerReq {
+                        mode: "pool".to_string(),
+                        hand_size,
+                        pool: Some(pool),
+                        plan: None,
+                        weight_pct: weight_opt,
+                    };
+                    sampler_cache_put(cache_key, &sampler);
+                    return Ok(sampler);
+                }
+                ExactPoolCollect::TooLarge => {
+                    plan_pool_too_large_mark(&cache_key);
+                }
+            }
+        }
         let sampler = NativePlayerReq {
             mode: "plan".to_string(),
             hand_size,
@@ -587,6 +638,150 @@ fn build_sampler_for_range(
     };
     sampler_cache_put(cache_key, &sampler);
     Ok(sampler)
+}
+
+#[derive(Debug)]
+enum ExactPoolCollect {
+    Empty,
+    Full(Vec<Vec<u8>>),
+    TooLarge,
+}
+
+fn exact_plan_pool_limit(variant: &str) -> usize {
+    match variant {
+        "holdem" => EXACT_PLAN_POOL_LIMIT_HOLDEM,
+        "plo4" => EXACT_PLAN_POOL_LIMIT_PLO4,
+        "plo5" => EXACT_PLAN_POOL_LIMIT_PLO5,
+        _ => 0,
+    }
+}
+
+fn collect_exact_pool_with_limit(
+    base: &[u8],
+    hand_size: usize,
+    board: &[u8],
+    expr: &RangeExpr,
+    limit: usize,
+) -> ExactPoolCollect {
+    if base.len() < hand_size || hand_size == 0 || limit == 0 {
+        return ExactPoolCollect::Empty;
+    }
+
+    let mut overflow = false;
+    let mut hand = vec![0u8; hand_size];
+    let mut pool = Vec::<Vec<u8>>::new();
+    collect_exact_pool_with_limit_rec(
+        0,
+        0,
+        base,
+        &mut hand,
+        board,
+        expr,
+        limit,
+        &mut pool,
+        &mut overflow,
+    );
+
+    if overflow {
+        ExactPoolCollect::TooLarge
+    } else if pool.is_empty() {
+        ExactPoolCollect::Empty
+    } else {
+        ExactPoolCollect::Full(pool)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_exact_pool_with_limit_rec(
+    start: usize,
+    depth: usize,
+    base: &[u8],
+    hand: &mut [u8],
+    board: &[u8],
+    expr: &RangeExpr,
+    limit: usize,
+    pool: &mut Vec<Vec<u8>>,
+    overflow: &mut bool,
+) {
+    if *overflow {
+        return;
+    }
+    if depth == hand.len() {
+        if range_expr_match(expr, hand, board) {
+            if pool.len() >= limit {
+                *overflow = true;
+                return;
+            }
+            pool.push(hand.to_vec());
+        }
+        return;
+    }
+
+    let need = hand.len() - depth;
+    if base.len() < need || start > base.len() - need {
+        return;
+    }
+    for i in start..=base.len() - need {
+        if *overflow {
+            return;
+        }
+        hand[depth] = base[i];
+        collect_exact_pool_with_limit_rec(
+            i + 1,
+            depth + 1,
+            base,
+            hand,
+            board,
+            expr,
+            limit,
+            pool,
+            overflow,
+        );
+    }
+}
+
+fn cache_sampler_from_preview(
+    variant: &str,
+    hand_size: usize,
+    board: &[u8],
+    range: &str,
+    profile_norm: &str,
+    compiled: &CompiledRangeExpr,
+) {
+    let weight_pct = compiled.weight_pct;
+    if weight_pct == 0 {
+        return;
+    }
+    let weight_opt = if weight_pct < 100 {
+        Some(weight_pct)
+    } else {
+        None
+    };
+
+    let sampler = if is_any_expr(&compiled.expr) {
+        Some(NativePlayerReq {
+            mode: "all".to_string(),
+            hand_size,
+            pool: None,
+            plan: None,
+            weight_pct: weight_opt,
+        })
+    } else if let Some(plan) = range_expr_to_plan(&compiled.expr) {
+        Some(NativePlayerReq {
+            mode: "plan".to_string(),
+            hand_size,
+            pool: None,
+            plan: Some(plan),
+            weight_pct: weight_opt,
+        })
+    } else {
+        None
+    };
+
+    if let Some(s) = sampler {
+        let cache_key = sampler_cache_key(variant, hand_size, board, &[], range, profile_norm);
+        sampler_cache_put(cache_key, &s);
+    }
 }
 
 fn range_expr_to_plan(expr: &RangeExpr) -> Option<native_sim::PlanNodeReq> {
@@ -1040,11 +1235,28 @@ fn percentile_seed(variant: &str) -> u64 {
 
 static PERCENTILE_CACHE: OnceLock<Mutex<HashMap<String, Vec<f64>>>> = OnceLock::new();
 static SAMPLER_CACHE: OnceLock<Mutex<SamplerCacheStore>> = OnceLock::new();
+static PLAN_POOL_TOO_LARGE_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static EXACT_PERCENTILE_TABLES: OnceLock<
     Mutex<HashMap<String, HashMap<String, Arc<PercentileTable>>>>,
 > = OnceLock::new();
 static CHOOSE_52_TABLE: OnceLock<[[usize; 7]; 53]> = OnceLock::new();
 const SAMPLER_CACHE_MAX: usize = 96;
+
+fn plan_pool_too_large_contains(key: &str) -> bool {
+    let cache = PLAN_POOL_TOO_LARGE_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
+    let guard = match cache.lock() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    guard.contains(key)
+}
+
+fn plan_pool_too_large_mark(key: &str) {
+    let cache = PLAN_POOL_TOO_LARGE_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key.to_string());
+    }
+}
 
 fn percentile_threshold(variant: &str, pct: f64) -> f64 {
     let key = variant.to_lowercase();
