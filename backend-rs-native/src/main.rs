@@ -3,12 +3,13 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -122,15 +123,16 @@ enum RangeAtom {
     Exact(Vec<u8>),
     Specs(Vec<Vec<Spec>>),
     PercentTopExact {
-        variant: String,
-        profile: String,
+        table: Arc<PercentileTable>,
         pct: f64,
+        boundary: PercentBoundary,
     },
     PercentRangeExact {
-        variant: String,
-        profile: String,
+        table: Arc<PercentileTable>,
         low_pct: f64,
         high_pct: f64,
+        low_boundary: PercentBoundary,
+        high_boundary: PercentBoundary,
     },
     PercentTopHeuristic {
         threshold: f64,
@@ -194,6 +196,16 @@ struct PercentileTable {
     score_keys_by_combo_rank: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PercentBoundary {
+    None,
+    All,
+    Partial {
+        boundary_score: u32,
+        boundary_rank: usize,
+    },
+}
+
 const RANKS: &str = "23456789TJQKA";
 const SUITS: &str = "cdhs";
 const DEFAULT_PREP_SEED: u32 = 0x9e37_79b9;
@@ -222,6 +234,7 @@ const MACRO_REPLACEMENTS: [(&str, &str); 21] = [
     ("\t", ""),
 ];
 const PERCENTILE_SAMPLE_SIZE: usize = 30_000;
+const PREVIEW_PARALLEL_THRESHOLD: usize = 400_000;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -349,9 +362,23 @@ async fn sim_preview_tag(Json(req): Json<PreviewTagRequest>) -> (StatusCode, Jso
     let combos = preview_tag_core_combos(&board, &variant, tag);
     let base = base_deck(&board, &[]);
     let total = n_choose_k(base.len(), hand_size);
-    let (matched, approx) = estimate_coverage(&base, hand_size, total, |hand| {
-        full_tag_match(tag, hand, &board)
-    });
+    let cov_board = board.clone();
+    let cov_base = base.clone();
+    let (matched, approx) = match tokio::task::spawn_blocking(move || {
+        estimate_coverage(&cov_base, hand_size, total, |hand| {
+            full_tag_match(tag, hand, &cov_board)
+        })
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("preview tag coverage task failed: {e}"),
+            )
+        }
+    };
     let coverage = json!({
         "matched": matched,
         "total": total,
@@ -406,9 +433,24 @@ async fn sim_preview_range(Json(req): Json<PreviewRangeRequest>) -> (StatusCode,
         return (StatusCode::OK, Json(json!({ "ok": true, "coverage": out })));
     }
 
-    let (matched, approx) = estimate_coverage(&base, hand_size, total, |hand| {
-        range_expr_match(&compiled.expr, hand, &board)
-    });
+    let cov_board = board.clone();
+    let cov_base = base.clone();
+    let cov_expr = compiled.expr.clone();
+    let (matched, approx) = match tokio::task::spawn_blocking(move || {
+        estimate_coverage(&cov_base, hand_size, total, |hand| {
+            range_expr_match(&cov_expr, hand, &cov_board)
+        })
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("preview range coverage task failed: {e}"),
+            )
+        }
+    };
     let out = json!({
         "matched": matched,
         "total": total,
@@ -588,24 +630,16 @@ fn atom_to_plan(atom: &RangeAtom) -> Option<native_sim::PlanNodeReq> {
                 .map(|entry| entry.iter().copied().map(spec_to_plan_spec).collect())
                 .collect(),
         }),
-        RangeAtom::PercentTopExact {
-            variant,
-            profile,
-            pct,
-        } => {
-            let table = exact_percentile_table(variant, profile)?;
-            Some(native_sim::PlanNodeReq::PctBits {
-                bits_b64: None,
-                bits: Some(pct_top_bits(&table, *pct)),
-            })
-        }
+        RangeAtom::PercentTopExact { table, pct, .. } => Some(native_sim::PlanNodeReq::PctBits {
+            bits_b64: None,
+            bits: Some(pct_top_bits(&table, *pct)),
+        }),
         RangeAtom::PercentRangeExact {
-            variant,
-            profile,
             low_pct,
             high_pct,
+            table,
+            ..
         } => {
-            let table = exact_percentile_table(variant, profile)?;
             let mut high_bits = pct_top_bits(&table, *high_pct);
             let low_bits = pct_top_bits(&table, *low_pct);
             for (dst, low) in high_bits.iter_mut().zip(low_bits.iter()) {
@@ -855,15 +889,15 @@ fn sampler_cache_put(key: String, sampler: &NativePlayerReq) {
     guard.insert(key, sampler.clone());
 }
 
-fn estimate_coverage<F>(
-    base: &[u8],
-    hand_size: usize,
-    _total: usize,
-    mut predicate: F,
-) -> (usize, bool)
+fn estimate_coverage<F>(base: &[u8], hand_size: usize, total: usize, predicate: F) -> (usize, bool)
 where
-    F: FnMut(&[u8]) -> bool,
+    F: Fn(&[u8]) -> bool + Sync,
 {
+    if total >= PREVIEW_PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
+        let matched = count_matching_hands_parallel(base, hand_size, &predicate);
+        return (matched, false);
+    }
+
     let mut matched = 0usize;
     enumerate_hands(base, hand_size, |hand| {
         if predicate(hand) {
@@ -871,6 +905,54 @@ where
         }
     });
     (matched, false)
+}
+
+fn count_matching_hands_parallel<F>(base: &[u8], hand_size: usize, predicate: &F) -> usize
+where
+    F: Fn(&[u8]) -> bool + Sync,
+{
+    if hand_size == 0 {
+        return if predicate(&[]) { 1 } else { 0 };
+    }
+    if base.len() < hand_size {
+        return 0;
+    }
+    let max_start = base.len() - hand_size;
+    (0..=max_start)
+        .into_par_iter()
+        .map(|first_idx| {
+            let mut hand = vec![0u8; hand_size];
+            hand[0] = base[first_idx];
+            count_matching_hands_rec(base, first_idx + 1, 1, &mut hand, predicate)
+        })
+        .sum()
+}
+
+fn count_matching_hands_rec<F>(
+    base: &[u8],
+    start: usize,
+    depth: usize,
+    hand: &mut [u8],
+    predicate: &F,
+) -> usize
+where
+    F: Fn(&[u8]) -> bool,
+{
+    if depth == hand.len() {
+        return usize::from(predicate(hand));
+    }
+
+    let need = hand.len() - depth;
+    if base.len() < need || start > base.len() - need {
+        return 0;
+    }
+
+    let mut matched = 0usize;
+    for i in start..=base.len() - need {
+        hand[depth] = base[i];
+        matched += count_matching_hands_rec(base, i + 1, depth + 1, hand, predicate);
+    }
+    matched
 }
 
 fn enumerate_hands<F>(base: &[u8], hand_size: usize, mut f: F)
@@ -945,11 +1027,15 @@ fn build_pool_exact_with_cap(
     (matched, pool, false)
 }
 
-fn now_seed() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(1)
+fn percentile_seed(variant: &str) -> u64 {
+    // Keep heuristic percentile thresholds stable across runs for variants without
+    // exact precomputed percentile tables.
+    let mut h = 0xcbf29ce484222325u64;
+    for b in variant.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h ^ 0x9E37_79B9_7F4A_7C15
 }
 
 static PERCENTILE_CACHE: OnceLock<Mutex<HashMap<String, Vec<f64>>>> = OnceLock::new();
@@ -966,7 +1052,7 @@ fn percentile_threshold(variant: &str, pct: f64) -> f64 {
     let mut guard = cache.lock().unwrap();
     let scores = guard.entry(key.clone()).or_insert_with(|| {
         let hand_size = variant_hand_size(&key).unwrap_or(2);
-        let mut rng = SmallRng::seed_from_u64(now_seed() ^ 0x9E37_79B9_7F4A_7C15);
+        let mut rng = SmallRng::seed_from_u64(percentile_seed(&key));
         let mut deck: Vec<u8> = (0u8..52u8).collect();
         let mut out = Vec::<f64>::with_capacity(PERCENTILE_SAMPLE_SIZE);
         for _ in 0..PERCENTILE_SAMPLE_SIZE {
@@ -1161,43 +1247,64 @@ fn extract_exported_object_literal(text: &str, export_name: &str) -> Option<Stri
     Some(chars[start..=end].iter().collect())
 }
 
-fn in_top_exact_by_percent(table: &PercentileTable, pct: f64, hand: &[u8]) -> bool {
-    if hand.is_empty() || table.sample_size == 0 {
-        return false;
+fn percent_boundary_for(table: &PercentileTable, pct: f64) -> PercentBoundary {
+    if table.sample_size == 0 {
+        return PercentBoundary::None;
     }
     let clamped = pct.clamp(0.0, 100.0);
     let steps = 100usize.saturating_mul(table.basis.max(1));
     let idx = ((clamped * table.basis.max(1) as f64).round() as usize).min(steps);
     let count = ((idx as f64 / steps as f64) * table.sample_size as f64).floor() as usize;
     if count == 0 {
-        return false;
+        return PercentBoundary::None;
     }
     if count >= table.sample_size {
-        return true;
+        return PercentBoundary::All;
     }
 
     if table.top_score_keys.len() <= idx || table.top_ranks.len() <= idx {
+        return PercentBoundary::None;
+    }
+    PercentBoundary::Partial {
+        boundary_score: table.top_score_keys[idx],
+        boundary_rank: table.top_ranks[idx] as usize,
+    }
+}
+
+fn in_top_exact_boundary(table: &PercentileTable, boundary: PercentBoundary, hand: &[u8]) -> bool {
+    if hand.is_empty() {
         return false;
     }
-    let boundary_score = table.top_score_keys[idx];
-    let boundary_rank = table.top_ranks[idx] as usize;
+    match boundary {
+        PercentBoundary::None => return false,
+        PercentBoundary::All => return true,
+        PercentBoundary::Partial { .. } => {}
+    }
     let hand_rank = combo_rank_52(hand);
     if hand_rank >= table.sample_size || hand_rank >= table.score_keys_by_combo_rank.len() {
         return false;
     }
     let score_key = table.score_keys_by_combo_rank[hand_rank];
-    score_key > boundary_score || (score_key == boundary_score && hand_rank <= boundary_rank)
+    match boundary {
+        PercentBoundary::Partial {
+            boundary_score,
+            boundary_rank,
+        } => {
+            score_key > boundary_score
+                || (score_key == boundary_score && hand_rank <= boundary_rank)
+        }
+        PercentBoundary::None => false,
+        PercentBoundary::All => true,
+    }
 }
 
 fn combo_rank_52(hand_cards: &[u8]) -> usize {
     let choose = CHOOSE_52_TABLE.get_or_init(build_choose_52_table);
-    let mut cards = hand_cards.to_vec();
-    cards.sort_unstable();
-    let k = cards.len();
+    let k = hand_cards.len();
     let mut rank = 0usize;
     let mut start = 0usize;
     for i in 0..k {
-        let ci = cards[i] as usize;
+        let ci = hand_cards[i] as usize;
         for v in start..ci {
             rank += choose[52 - (v + 1)][k - i - 1];
         }
@@ -1496,11 +1603,12 @@ fn compile_atom(
 
     if let Some((low, high)) = parse_percent_range(atom_text) {
         let profile = normalize_percentile_profile(variant, percentile_profile);
-        if exact_percentile_table(variant, &profile).is_some() {
+        if let Some(table) = exact_percentile_table(variant, &profile) {
             return Ok((
                 RangeAtom::PercentRangeExact {
-                    variant: variant.to_string(),
-                    profile,
+                    low_boundary: percent_boundary_for(&table, low),
+                    high_boundary: percent_boundary_for(&table, high),
+                    table,
                     low_pct: low,
                     high_pct: high,
                 },
@@ -1519,11 +1627,11 @@ fn compile_atom(
     }
     if let Some(p) = parse_percent_top(atom_text) {
         let profile = normalize_percentile_profile(variant, percentile_profile);
-        if exact_percentile_table(variant, &profile).is_some() {
+        if let Some(table) = exact_percentile_table(variant, &profile) {
             return Ok((
                 RangeAtom::PercentTopExact {
-                    variant: variant.to_string(),
-                    profile,
+                    boundary: percent_boundary_for(&table, p),
+                    table,
                     pct: p,
                 },
                 weight,
@@ -2033,26 +2141,16 @@ fn atom_match(atom: &RangeAtom, hand: &[u8], board: &[u8]) -> bool {
         RangeAtom::Exact(expected) => hand == expected,
         RangeAtom::Specs(entries) => entries.iter().any(|specs| match_specs(specs, hand)),
         RangeAtom::PercentTopExact {
-            variant,
-            profile,
-            pct,
-        } => {
-            if let Some(table) = exact_percentile_table(variant, profile) {
-                return in_top_exact_by_percent(&table, *pct, hand);
-            }
-            false
-        }
+            table, boundary, ..
+        } => in_top_exact_boundary(table, *boundary, hand),
         RangeAtom::PercentRangeExact {
-            variant,
-            profile,
-            low_pct,
-            high_pct,
+            table,
+            low_boundary,
+            high_boundary,
+            ..
         } => {
-            if let Some(table) = exact_percentile_table(variant, profile) {
-                return in_top_exact_by_percent(&table, *high_pct, hand)
-                    && !in_top_exact_by_percent(&table, *low_pct, hand);
-            }
-            false
+            in_top_exact_boundary(table, *high_boundary, hand)
+                && !in_top_exact_boundary(table, *low_boundary, hand)
         }
         RangeAtom::PercentTopHeuristic { threshold } => evaluate_heuristic(hand) >= *threshold,
         RangeAtom::PercentRangeHeuristic {
@@ -2548,38 +2646,56 @@ fn core_straight_outs(core: [u8; 2], board: &[u8], is_holdem: bool) -> u8 {
         return 0;
     }
 
-    let mut used = [false; 52];
-    used[core[0] as usize] = true;
-    used[core[1] as usize] = true;
-    for c in board {
-        used[*c as usize] = true;
+    let hr1 = card_rank_value(core[0]);
+    let hr2 = card_rank_value(core[1]);
+    let mut board_ranks = Vec::<u8>::with_capacity(board.len() + 1);
+    for &c in board {
+        board_ranks.push(card_rank_value(c));
+    }
+
+    let mut used_rank_count = [0u8; 15];
+    used_rank_count[hr1 as usize] = used_rank_count[hr1 as usize].saturating_add(1);
+    used_rank_count[hr2 as usize] = used_rank_count[hr2 as usize].saturating_add(1);
+    for &r in &board_ranks {
+        used_rank_count[r as usize] = used_rank_count[r as usize].saturating_add(1);
     }
 
     let mut outs = 0u8;
-    for c in 0u8..52u8 {
-        if used[c as usize] {
+    for r in 2u8..=14u8 {
+        let remain = 4u8.saturating_sub(used_rank_count[r as usize]);
+        if remain == 0 {
             continue;
         }
-        let mut next = board.to_vec();
-        next.push(c);
+        board_ranks.push(r);
         let makes = if is_holdem {
-            has_holdem_straight_by_ranks(&core, &next)
+            has_holdem_straight_by_rank_values(hr1, hr2, &board_ranks)
         } else {
-            has_omaha_core_straight(core, &next)
+            has_omaha_core_straight_ranks(hr1, hr2, &board_ranks)
         };
+        board_ranks.pop();
         if makes {
-            outs = outs.saturating_add(1);
+            outs = outs.saturating_add(remain);
         }
     }
     outs
 }
 
 fn has_holdem_straight_by_ranks(hand2: &[u8; 2], board: &[u8]) -> bool {
+    let hr1 = card_rank_value(hand2[0]);
+    let hr2 = card_rank_value(hand2[1]);
+    let mut board_ranks = Vec::<u8>::with_capacity(board.len());
+    for &c in board {
+        board_ranks.push(card_rank_value(c));
+    }
+    has_holdem_straight_by_rank_values(hr1, hr2, &board_ranks)
+}
+
+fn has_holdem_straight_by_rank_values(hr1: u8, hr2: u8, board_ranks: &[u8]) -> bool {
     let mut present = [false; 15];
-    present[card_rank_value(hand2[0]) as usize] = true;
-    present[card_rank_value(hand2[1]) as usize] = true;
-    for c in board {
-        present[card_rank_value(*c) as usize] = true;
+    present[hr1 as usize] = true;
+    present[hr2 as usize] = true;
+    for &r in board_ranks {
+        present[r as usize] = true;
     }
 
     for hi in (6..=14).rev() {
@@ -2596,13 +2712,23 @@ fn has_omaha_core_straight(core: [u8; 2], board: &[u8]) -> bool {
     }
     let hr1 = card_rank_value(core[0]);
     let hr2 = card_rank_value(core[1]);
+    let mut board_ranks = Vec::<u8>::with_capacity(board.len());
+    for &c in board {
+        board_ranks.push(card_rank_value(c));
+    }
+    has_omaha_core_straight_ranks(hr1, hr2, &board_ranks)
+}
 
-    for i in 0..board.len().saturating_sub(2) {
-        let r1 = card_rank_value(board[i]);
-        for j in (i + 1)..board.len().saturating_sub(1) {
-            let r2 = card_rank_value(board[j]);
-            for k in (j + 1)..board.len() {
-                let r3 = card_rank_value(board[k]);
+fn has_omaha_core_straight_ranks(hr1: u8, hr2: u8, board_ranks: &[u8]) -> bool {
+    if board_ranks.len() < 3 {
+        return false;
+    }
+    for i in 0..board_ranks.len().saturating_sub(2) {
+        let r1 = board_ranks[i];
+        for j in (i + 1)..board_ranks.len().saturating_sub(1) {
+            let r2 = board_ranks[j];
+            for k in (j + 1)..board_ranks.len() {
+                let r3 = board_ranks[k];
                 if is_five_rank_straight(hr1, hr2, r1, r2, r3) {
                     return true;
                 }

@@ -1363,13 +1363,9 @@ fn build_samplers(req: &Request) -> Result<Vec<Sampler>> {
                     .with_context(|| format!("player {} plan is missing", i + 1))?;
                 let plan = compile_plan_node(plan_req)
                     .with_context(|| format!("player {} plan is invalid", i + 1))?;
-                if plan_has_pct_bits(&plan) {
-                    Ok(Sampler::Plan {
-                        hand_size: p.hand_size,
-                        plan,
-                        weight_pct,
-                    })
-                } else {
+                let has_pct = plan_has_pct_bits(&plan);
+                let try_small_pool = !has_pct;
+                if try_small_pool {
                     let limit = small_plan_pool_limit(p.hand_size);
                     match collect_small_plan_pool(
                         req,
@@ -1399,6 +1395,12 @@ fn build_samplers(req: &Request) -> Result<Vec<Sampler>> {
                             weight_pct,
                         }),
                     }
+                } else {
+                    Ok(Sampler::Plan {
+                        hand_size: p.hand_size,
+                        plan,
+                        weight_pct,
+                    })
                 }
             } else {
                 anyhow::bail!("unsupported player mode '{}'", p.mode);
@@ -2277,38 +2279,56 @@ fn core_straight_outs(core: [u8; 2], board: &[u8], is_holdem: bool) -> u8 {
         return 0;
     }
 
-    let mut used = [false; 52];
-    used[core[0] as usize] = true;
-    used[core[1] as usize] = true;
-    for c in board {
-        used[*c as usize] = true;
+    let hr1 = card_rank_value(core[0]);
+    let hr2 = card_rank_value(core[1]);
+    let mut board_ranks = Vec::<u8>::with_capacity(board.len() + 1);
+    for &c in board {
+        board_ranks.push(card_rank_value(c));
+    }
+
+    let mut used_rank_count = [0u8; 15];
+    used_rank_count[hr1 as usize] = used_rank_count[hr1 as usize].saturating_add(1);
+    used_rank_count[hr2 as usize] = used_rank_count[hr2 as usize].saturating_add(1);
+    for &r in &board_ranks {
+        used_rank_count[r as usize] = used_rank_count[r as usize].saturating_add(1);
     }
 
     let mut outs = 0u8;
-    for c in 0u8..52u8 {
-        if used[c as usize] {
+    for r in 2u8..=14u8 {
+        let remain = 4u8.saturating_sub(used_rank_count[r as usize]);
+        if remain == 0 {
             continue;
         }
-        let mut next = board.to_vec();
-        next.push(c);
+        board_ranks.push(r);
         let makes = if is_holdem {
-            has_holdem_straight_by_ranks(&core, &next)
+            has_holdem_straight_by_rank_values(hr1, hr2, &board_ranks)
         } else {
-            has_omaha_core_straight(core, &next)
+            has_omaha_core_straight_ranks(hr1, hr2, &board_ranks)
         };
+        board_ranks.pop();
         if makes {
-            outs = outs.saturating_add(1);
+            outs = outs.saturating_add(remain);
         }
     }
     outs
 }
 
 fn has_holdem_straight_by_ranks(hand2: &[u8; 2], board: &[u8]) -> bool {
+    let hr1 = card_rank_value(hand2[0]);
+    let hr2 = card_rank_value(hand2[1]);
+    let mut board_ranks = Vec::<u8>::with_capacity(board.len());
+    for &c in board {
+        board_ranks.push(card_rank_value(c));
+    }
+    has_holdem_straight_by_rank_values(hr1, hr2, &board_ranks)
+}
+
+fn has_holdem_straight_by_rank_values(hr1: u8, hr2: u8, board_ranks: &[u8]) -> bool {
     let mut present = [false; 15];
-    present[card_rank_value(hand2[0]) as usize] = true;
-    present[card_rank_value(hand2[1]) as usize] = true;
-    for c in board {
-        present[card_rank_value(*c) as usize] = true;
+    present[hr1 as usize] = true;
+    present[hr2 as usize] = true;
+    for &r in board_ranks {
+        present[r as usize] = true;
     }
 
     for hi in (6..=14).rev() {
@@ -2325,13 +2345,23 @@ fn has_omaha_core_straight(core: [u8; 2], board: &[u8]) -> bool {
     }
     let hr1 = card_rank_value(core[0]);
     let hr2 = card_rank_value(core[1]);
+    let mut board_ranks = Vec::<u8>::with_capacity(board.len());
+    for &c in board {
+        board_ranks.push(card_rank_value(c));
+    }
+    has_omaha_core_straight_ranks(hr1, hr2, &board_ranks)
+}
 
-    for i in 0..board.len().saturating_sub(2) {
-        let r1 = card_rank_value(board[i]);
-        for j in (i + 1)..board.len().saturating_sub(1) {
-            let r2 = card_rank_value(board[j]);
-            for k in (j + 1)..board.len() {
-                let r3 = card_rank_value(board[k]);
+fn has_omaha_core_straight_ranks(hr1: u8, hr2: u8, board_ranks: &[u8]) -> bool {
+    if board_ranks.len() < 3 {
+        return false;
+    }
+    for i in 0..board_ranks.len().saturating_sub(2) {
+        let r1 = board_ranks[i];
+        for j in (i + 1)..board_ranks.len().saturating_sub(1) {
+            let r2 = board_ranks[j];
+            for k in (j + 1)..board_ranks.len() {
+                let r3 = board_ranks[k];
                 if is_five_rank_straight(hr1, hr2, r1, r2, r3) {
                     return true;
                 }
