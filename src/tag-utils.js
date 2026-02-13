@@ -25,7 +25,6 @@ function applyLegacyAlias(base, plus) {
   let outPlus = plus;
   if (outBase === "@straight") outBase = "@s";
   else if (outBase === "@flush") outBase = "@f";
-  else if (outBase === "@sd13") outBase = "@sd12";
   else if (outBase === "@tpplus") {
     outBase = "@tp";
     outPlus = true;

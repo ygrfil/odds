@@ -2,6 +2,7 @@ import { extractNormalizedTags, normalizePureTagToken, splitTagToken } from "./t
 
 const REMOTE_COVERAGE_CACHE = new Map();
 const REMOTE_TAG_COVERAGE_CACHE = new Map();
+const REMOTE_INFLIGHT_BY_PLAYER = new Map();
 
 function atTagsInRange(rangeText) {
   return extractNormalizedTags(rangeText);
@@ -80,16 +81,22 @@ function isBackendOfflineError(err) {
   return !!(err && typeof err === "object" && err.code === "BACKEND_OFFLINE");
 }
 
-async function fetchBackendJson(path, body) {
+function isAbortError(err) {
+  return !!(err && typeof err === "object" && err.name === "AbortError");
+}
+
+async function fetchBackendJson(path, body, signal) {
   if (!canUseBackendPreview()) throw backendOfflineError();
   let res;
   try {
     res = await fetch(path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      signal
     });
-  } catch {
+  } catch (err) {
+    if (isAbortError(err)) throw err;
     throw backendOfflineError();
   }
   if (res.status === 404 || res.status === 405) throw backendOfflineError();
@@ -108,7 +115,7 @@ async function fetchBackendJson(path, body) {
   return payload;
 }
 
-async function previewRangeCoverageFast(boardText, variant, rangeText, percentileProfile = "") {
+async function previewRangeCoverageFast(boardText, variant, rangeText, percentileProfile = "", signal) {
   const key = `${variant}|${percentileProfile}|${String(boardText || "").trim()}|${String(rangeText || "").replace(/\s+/g, "")}`;
   if (REMOTE_COVERAGE_CACHE.has(key)) return REMOTE_COVERAGE_CACHE.get(key);
   const payload = await fetchBackendJson("/api/sim/preview/range", {
@@ -116,7 +123,7 @@ async function previewRangeCoverageFast(boardText, variant, rangeText, percentil
     variant,
     rangeText,
     percentileProfile
-  });
+  }, signal);
   if (payload?.ok === false) {
     throw new Error(payload?.error || "Range: invalid expression");
   }
@@ -126,14 +133,14 @@ async function previewRangeCoverageFast(boardText, variant, rangeText, percentil
   return cov;
 }
 
-async function previewTagCoverageFast(boardText, variant, tag) {
+async function previewTagCoverageFast(boardText, variant, tag, signal) {
   const key = `${variant}|${String(boardText || "").trim()}|${String(tag || "").trim().toLowerCase()}`;
   if (REMOTE_TAG_COVERAGE_CACHE.has(key)) return REMOTE_TAG_COVERAGE_CACHE.get(key);
   const payload = await fetchBackendJson("/api/sim/preview/tag", {
     boardText,
     variant,
     tag
-  });
+  }, signal);
   if (payload?.ok === false) {
     throw new Error(payload?.error || "Tag: invalid expression");
   }
@@ -143,7 +150,7 @@ async function previewTagCoverageFast(boardText, variant, tag) {
   return cov;
 }
 
-async function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "") {
+async function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "", signal) {
   const expr = String(rangeText || "").trim();
   if (!expr) return { parts: [], coverage: null };
 
@@ -155,7 +162,7 @@ async function computeLiveInfo(rangeText, boardText, variant, percentileProfile 
   let covExpr = null;
 
   try {
-    covExpr = await previewRangeCoverageFast(boardText, variant, expr, percentileProfile);
+    covExpr = await previewRangeCoverageFast(boardText, variant, expr, percentileProfile, signal);
     const statExpr = coverageText(covExpr);
     if (statExpr) parts.push({ tone: "primary", text: `Range: ${statExpr}` });
   } catch (err) {
@@ -175,7 +182,7 @@ async function computeLiveInfo(rangeText, boardText, variant, percentileProfile 
   if (covExpr && pctAtoms.length && !pctSpec) {
     try {
       const baseExpr = pctAtoms.join(",");
-      const baseCov = await previewRangeCoverageFast(boardText, variant, baseExpr, percentileProfile);
+      const baseCov = await previewRangeCoverageFast(boardText, variant, baseExpr, percentileProfile, signal);
       const exprCnt = coverageCounts(covExpr);
       const baseCnt = coverageCounts(baseCov);
       if (baseCnt.matched > 0) {
@@ -212,11 +219,11 @@ async function computeLiveInfo(rangeText, boardText, variant, percentileProfile 
     try {
       const cov = (pureTag && pureTag === tag && covExpr && typeof covExpr === "object")
         ? covExpr
-        : await previewTagCoverageFast(boardText, variant, tag);
+        : await previewTagCoverageFast(boardText, variant, tag, signal);
       const stat = coverageText(cov);
       let extra = "";
       if (!isHoldem && tagInfo.base === "@sd") {
-        const c4 = await previewTagCoverageFast(boardText, variant, "@sd4");
+        const c4 = await previewTagCoverageFast(boardText, variant, "@sd4", signal);
         if (cov.pct > c4.pct + 0.2) extra = " + blocker-only <4 out draws";
       }
       if (pureTag && pureTag === tag && tags.length === 1) {
@@ -237,16 +244,33 @@ async function computeLiveInfo(rangeText, boardText, variant, percentileProfile 
 self.onmessage = (event) => {
   const msg = event.data;
   if (!msg || msg.type !== "range-live-info") return;
+  const playerNum = Number(msg.playerIndex);
+  const playerKey = Number.isFinite(playerNum) ? playerNum : String(msg.playerIndex ?? "");
+  const prev = REMOTE_INFLIGHT_BY_PLAYER.get(playerKey);
+  if (prev) prev.abort();
+  const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  if (ctrl) REMOTE_INFLIGHT_BY_PLAYER.set(playerKey, ctrl);
   (async () => {
     let parts = [];
     let coverage = null;
     try {
-      const out = await computeLiveInfo(msg.rangeText, msg.boardText, msg.variant, msg.percentileProfile);
+      const out = await computeLiveInfo(
+        msg.rangeText,
+        msg.boardText,
+        msg.variant,
+        msg.percentileProfile,
+        ctrl?.signal
+      );
       parts = Array.isArray(out?.parts) ? out.parts : [];
       coverage = out?.coverage || null;
-    } catch {
+    } catch (err) {
+      if (isAbortError(err)) return;
       parts = [];
       coverage = null;
+    } finally {
+      if (!ctrl) return;
+      const current = REMOTE_INFLIGHT_BY_PLAYER.get(playerKey);
+      if (current === ctrl) REMOTE_INFLIGHT_BY_PLAYER.delete(playerKey);
     }
 
     self.postMessage({

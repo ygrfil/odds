@@ -71,27 +71,32 @@ function isFiveRanksStraight(r1, r2, r3, r4, r5) {
   return !!(mask[14] && mask[5] && mask[4] && mask[3] && mask[2]);
 }
 
-function hasHoldemStraightByRanks(hand, board) {
+function hasHoldemStraightByRankValues(hr1, hr2, boardRanks) {
   const present = new Uint8Array(15);
-  for (let i = 0; i < hand.length; i++) present[rankOf(hand[i])] = 1;
-  for (let i = 0; i < board.length; i++) present[rankOf(board[i])] = 1;
+  present[hr1] = 1;
+  present[hr2] = 1;
+  for (let i = 0; i < boardRanks.length; i++) present[boardRanks[i]] = 1;
   for (let hi = 14; hi >= 6; hi--) {
     if (present[hi] && present[hi - 1] && present[hi - 2] && present[hi - 3] && present[hi - 4]) return true;
   }
   return !!(present[14] && present[5] && present[4] && present[3] && present[2]);
 }
 
-function hasOmahaCoreStraight(core, board) {
-  if (board.length < 3) return false;
-  const hr1 = rankOf(core[0]);
-  const hr2 = rankOf(core[1]);
-  const n = board.length;
+function hasHoldemStraightByRanks(hand, board) {
+  const boardRanks = new Array(board.length);
+  for (let i = 0; i < board.length; i++) boardRanks[i] = rankOf(board[i]);
+  return hasHoldemStraightByRankValues(rankOf(hand[0]), rankOf(hand[1]), boardRanks);
+}
+
+function hasOmahaCoreStraightRanks(hr1, hr2, boardRanks) {
+  if (boardRanks.length < 3) return false;
+  const n = boardRanks.length;
   for (let i = 0; i < n - 2; i++) {
-    const r1 = rankOf(board[i]);
+    const r1 = boardRanks[i];
     for (let j = i + 1; j < n - 1; j++) {
-      const r2 = rankOf(board[j]);
+      const r2 = boardRanks[j];
       for (let k = j + 1; k < n; k++) {
-        const r3 = rankOf(board[k]);
+        const r3 = boardRanks[k];
         if (isFiveRanksStraight(hr1, hr2, r1, r2, r3)) return true;
       }
     }
@@ -99,28 +104,58 @@ function hasOmahaCoreStraight(core, board) {
   return false;
 }
 
-function hasOmahaStraight(hand, board) {
+function hasOmahaCoreStraight(core, board) {
   if (board.length < 3) return false;
-  const hn = hand.length;
-  for (let a = 0; a < hn - 1; a++) {
-    for (let b = a + 1; b < hn; b++) {
-      if (hasOmahaCoreStraight([hand[a], hand[b]], board)) return true;
+  const boardRanks = new Array(board.length);
+  for (let i = 0; i < board.length; i++) boardRanks[i] = rankOf(board[i]);
+  return hasOmahaCoreStraightRanks(rankOf(core[0]), rankOf(core[1]), boardRanks);
+}
+
+function hasOmahaStraightByRankValues(hand, boardRanks) {
+  if (boardRanks.length < 3) return false;
+  for (let a = 0; a < hand.length - 1; a++) {
+    const hr1 = rankOf(hand[a]);
+    for (let b = a + 1; b < hand.length; b++) {
+      const hr2 = rankOf(hand[b]);
+      if (hasOmahaCoreStraightRanks(hr1, hr2, boardRanks)) return true;
     }
   }
   return false;
 }
 
+function hasOmahaStraight(hand, board) {
+  if (board.length < 3) return false;
+  const boardRanks = new Array(board.length);
+  for (let i = 0; i < board.length; i++) boardRanks[i] = rankOf(board[i]);
+  return hasOmahaStraightByRankValues(hand, boardRanks);
+}
+
 function straightOutCountNextCard(hand, board, isHoldem) {
   if (board.length >= 5) return 0;
-  const used = new Uint8Array(52);
-  for (let i = 0; i < hand.length; i++) used[hand[i]] = 1;
-  for (let i = 0; i < board.length; i++) used[board[i]] = 1;
+  const boardRanks = new Array(board.length);
+  for (let i = 0; i < board.length; i++) boardRanks[i] = rankOf(board[i]);
+  const usedRankCount = new Uint8Array(15);
+  for (let i = 0; i < hand.length; i++) usedRankCount[rankOf(hand[i])]++;
+  for (let i = 0; i < board.length; i++) usedRankCount[rankOf(board[i])]++;
   let outs = 0;
-  for (let c = 0; c < 52; c++) {
-    if (used[c]) continue;
-    const nextBoard = board.concat(c);
-    const isStraight = isHoldem ? hasHoldemStraightByRanks(hand, nextBoard) : hasOmahaStraight(hand, nextBoard);
-    if (isStraight) outs++;
+  if (isHoldem) {
+    const hr1 = rankOf(hand[0]);
+    const hr2 = rankOf(hand[1]);
+    for (let r = 2; r <= 14; r++) {
+      const remain = 4 - usedRankCount[r];
+      if (remain <= 0) continue;
+      boardRanks.push(r);
+      if (hasHoldemStraightByRankValues(hr1, hr2, boardRanks)) outs += remain;
+      boardRanks.pop();
+    }
+  } else {
+    for (let r = 2; r <= 14; r++) {
+      const remain = 4 - usedRankCount[r];
+      if (remain <= 0) continue;
+      boardRanks.push(r);
+      if (hasOmahaStraightByRankValues(hand, boardRanks)) outs += remain;
+      boardRanks.pop();
+    }
   }
   return outs;
 }
@@ -186,16 +221,24 @@ function coreSuitLabel(c1, c2) {
 
 function straightOutCountForCoreNextCard(core, board, isHoldem) {
   if (board.length >= 5) return 0;
-  const used = new Uint8Array(52);
-  used[core[0]] = 1;
-  used[core[1]] = 1;
-  for (let i = 0; i < board.length; i++) used[board[i]] = 1;
+  const hr1 = rankOf(core[0]);
+  const hr2 = rankOf(core[1]);
+  const boardRanks = new Array(board.length);
+  for (let i = 0; i < board.length; i++) boardRanks[i] = rankOf(board[i]);
+  const usedRankCount = new Uint8Array(15);
+  usedRankCount[hr1]++;
+  usedRankCount[hr2]++;
+  for (let i = 0; i < board.length; i++) usedRankCount[rankOf(board[i])]++;
   let outs = 0;
-  for (let c = 0; c < 52; c++) {
-    if (used[c]) continue;
-    const nextBoard = board.concat(c);
-    const isStraight = isHoldem ? hasHoldemStraightByRanks(core, nextBoard) : hasOmahaCoreStraight(core, nextBoard);
-    if (isStraight) outs++;
+  for (let r = 2; r <= 14; r++) {
+    const remain = 4 - usedRankCount[r];
+    if (remain <= 0) continue;
+    boardRanks.push(r);
+    const isStraight = isHoldem
+      ? hasHoldemStraightByRankValues(hr1, hr2, boardRanks)
+      : hasOmahaCoreStraightRanks(hr1, hr2, boardRanks);
+    boardRanks.pop();
+    if (isStraight) outs += remain;
   }
   return outs;
 }
@@ -306,13 +349,18 @@ function formatRankComboUser(ranks) {
 
 function straightOutCountOmahaHandNextCard(hand, board) {
   if (board.length >= 5) return 0;
-  const used = new Uint8Array(52);
-  for (let i = 0; i < hand.length; i++) used[hand[i]] = 1;
-  for (let i = 0; i < board.length; i++) used[board[i]] = 1;
+  const boardRanks = new Array(board.length);
+  for (let i = 0; i < board.length; i++) boardRanks[i] = rankOf(board[i]);
+  const usedRankCount = new Uint8Array(15);
+  for (let i = 0; i < hand.length; i++) usedRankCount[rankOf(hand[i])]++;
+  for (let i = 0; i < board.length; i++) usedRankCount[rankOf(board[i])]++;
   let outs = 0;
-  for (let c = 0; c < 52; c++) {
-    if (used[c]) continue;
-    if (hasOmahaStraight(hand, board.concat(c))) outs++;
+  for (let r = 2; r <= 14; r++) {
+    const remain = 4 - usedRankCount[r];
+    if (remain <= 0) continue;
+    boardRanks.push(r);
+    if (hasOmahaStraightByRankValues(hand, boardRanks)) outs += remain;
+    boardRanks.pop();
   }
   return outs;
 }
@@ -580,6 +628,18 @@ function categoryMatch(tag, hand, board) {
   if (!tagInfo) return false;
   const variant = variantFromHandSize(hand.length);
   if (!variant) return false;
+  const isHoldem = variant === "holdem";
+
+  if (tagInfo.base === "@sd" || tagInfo.base === "@sd4" || tagInfo.base === "@sd8" || tagInfo.base === "@sd12") {
+    if (board.length >= 5) return false;
+    const hasStraightNow = isHoldem
+      ? hasHoldemStraightByRanks(hand, board)
+      : hasOmahaStraight(hand, board);
+    if (hasStraightNow) return false;
+    const outs = straightOutCountNextCard(hand, board, isHoldem);
+    return outs >= minOutsForSdTag(tagInfo.base);
+  }
+
   if (tagInfo.base === "@overpair" && variant !== "holdem") return false;
   const shortcut = tagShortcutEntry(tagInfo, board, variant);
   if (!shortcut || shortcut.labels.size === 0) return false;

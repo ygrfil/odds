@@ -2062,6 +2062,24 @@ fn full_tag_match(tag: TagAtom, hand: &[u8], board: &[u8], is_holdem: bool) -> b
         return false;
     }
 
+    if let TagAtom::StraightDraw { min_outs } = tag {
+        if board.len() >= 5 {
+            return false;
+        }
+        let has_straight_now = if is_holdem {
+            if hand.len() != 2 {
+                return false;
+            }
+            has_holdem_straight_by_ranks(&[hand[0], hand[1]], board)
+        } else {
+            has_omaha_straight(hand, board)
+        };
+        if has_straight_now {
+            return false;
+        }
+        return straight_outs_for_hand(hand, board, is_holdem) >= min_outs;
+    }
+
     if is_holdem {
         if hand.len() != 2 {
             return false;
@@ -2384,6 +2402,54 @@ fn core_straight_outs(core: [u8; 2], board: &[u8], is_holdem: bool) -> u8 {
     outs
 }
 
+fn straight_outs_for_hand(hand: &[u8], board: &[u8], is_holdem: bool) -> u8 {
+    if board.len() >= 5 {
+        return 0;
+    }
+    if is_holdem && hand.len() != 2 {
+        return 0;
+    }
+
+    let mut board_ranks = Vec::<u8>::with_capacity(board.len() + 1);
+    for &c in board {
+        board_ranks.push(card_rank_value(c));
+    }
+    let mut used_rank_count = [0u8; 15];
+    for &c in hand.iter().chain(board.iter()) {
+        let r = card_rank_value(c);
+        used_rank_count[r as usize] = used_rank_count[r as usize].saturating_add(1);
+    }
+    let mut outs = 0u8;
+    if is_holdem {
+        let hr1 = card_rank_value(hand[0]);
+        let hr2 = card_rank_value(hand[1]);
+        for r in 2u8..=14u8 {
+            let remain = 4u8.saturating_sub(used_rank_count[r as usize]);
+            if remain == 0 {
+                continue;
+            }
+            board_ranks.push(r);
+            if has_holdem_straight_by_rank_values(hr1, hr2, &board_ranks) {
+                outs = outs.saturating_add(remain);
+            }
+            board_ranks.pop();
+        }
+    } else {
+        for r in 2u8..=14u8 {
+            let remain = 4u8.saturating_sub(used_rank_count[r as usize]);
+            if remain == 0 {
+                continue;
+            }
+            board_ranks.push(r);
+            if has_omaha_straight_by_rank_values(hand, &board_ranks) {
+                outs = outs.saturating_add(remain);
+            }
+            board_ranks.pop();
+        }
+    }
+    outs
+}
+
 fn has_holdem_straight_by_ranks(hand2: &[u8; 2], board: &[u8]) -> bool {
     let hr1 = card_rank_value(hand2[0]);
     let hr2 = card_rank_value(hand2[1]);
@@ -2421,6 +2487,33 @@ fn has_omaha_core_straight(core: [u8; 2], board: &[u8]) -> bool {
         board_ranks.push(card_rank_value(c));
     }
     has_omaha_core_straight_ranks(hr1, hr2, &board_ranks)
+}
+
+fn has_omaha_straight(hand: &[u8], board: &[u8]) -> bool {
+    if board.len() < 3 {
+        return false;
+    }
+    let mut board_ranks = Vec::<u8>::with_capacity(board.len());
+    for &c in board {
+        board_ranks.push(card_rank_value(c));
+    }
+    has_omaha_straight_by_rank_values(hand, &board_ranks)
+}
+
+fn has_omaha_straight_by_rank_values(hand: &[u8], board_ranks: &[u8]) -> bool {
+    if board_ranks.len() < 3 {
+        return false;
+    }
+    for i in 0..hand.len().saturating_sub(1) {
+        let hr1 = card_rank_value(hand[i]);
+        for j in (i + 1)..hand.len() {
+            let hr2 = card_rank_value(hand[j]);
+            if has_omaha_core_straight_ranks(hr1, hr2, board_ranks) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn has_omaha_core_straight_ranks(hr1: u8, hr2: u8, board_ranks: &[u8]) -> bool {
