@@ -3,15 +3,18 @@ use aya_poker::base::{Hand, CARDS};
 use aya_poker::{omaha_rank, poker_rank, PokerRankCategory};
 use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use base64::Engine as _;
-use rand::rngs::StdRng;
+use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::OnceLock;
 
 type ChooseTable = [[usize; 7]; 53];
+
+static COMBO_RANK_PREFIX: OnceLock<[[usize; 53]; 7]> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct SimRequest {
@@ -241,8 +244,19 @@ enum Sampler {
 
 #[derive(Clone)]
 struct PoolEntry {
-    cards: Vec<u8>,
+    cards: [u8; 6],
     mask: u64,
+}
+
+impl PoolEntry {
+    fn new(cards: &[u8]) -> Self {
+        let mut fixed = [0u8; 6];
+        fixed[..cards.len()].copy_from_slice(cards);
+        Self {
+            cards: fixed,
+            mask: cards_mask(cards),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -606,7 +620,7 @@ fn run_build_pool_mode(req: &Request) -> Result<Response> {
     let plan = compile_plan_node(plan_req)?;
     let choose = build_choose_table();
     let seed = req.seed.unwrap_or(0xC0DE_F00D_9E37_79B9);
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = SmallRng::seed_from_u64(seed);
     let is_holdem = req.variant == "holdem";
 
     let mut blocked = [false; 52];
@@ -752,7 +766,7 @@ fn enumerate_pool_with_plan(
     board: &[u8],
     is_holdem: bool,
     cap: usize,
-    rng: &mut StdRng,
+    rng: &mut SmallRng,
     pool: &mut Vec<Vec<u8>>,
     matched: &mut usize,
 ) {
@@ -1025,7 +1039,7 @@ fn simulate_equity_rank_partition(
     combo_space: usize,
 ) -> EquityRankPartial {
     let mut out = new_equity_rank_partial(combo_space);
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = SmallRng::seed_from_u64(seed);
     let is_holdem = variant == "holdem";
 
     let mut used = [false; 52];
@@ -1359,10 +1373,7 @@ fn build_samplers(req: &Request) -> Result<Vec<Sampler>> {
                 pool.shrink_to_fit();
                 let pool = pool
                     .into_iter()
-                    .map(|cards| PoolEntry {
-                        mask: cards_mask(&cards),
-                        cards,
-                    })
+                    .map(|cards| PoolEntry::new(&cards))
                     .collect();
                 Ok(Sampler::Pool {
                     hand_size: p.hand_size,
@@ -1398,10 +1409,7 @@ fn build_samplers(req: &Request) -> Result<Vec<Sampler>> {
                             pool.shrink_to_fit();
                             let pool = pool
                                 .into_iter()
-                                .map(|cards| PoolEntry {
-                                    mask: cards_mask(&cards),
-                                    cards,
-                                })
+                                .map(|cards| PoolEntry::new(&cards))
                                 .collect();
                             Ok(Sampler::Pool {
                                 hand_size: p.hand_size,
@@ -1586,7 +1594,7 @@ fn simulate_partition(
     let pcount = req.players.len();
     let mut out = new_partial(pcount, combo_space);
 
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = SmallRng::seed_from_u64(seed);
     let mut blocked = [false; 52];
     let mut blocked_mask = 0u64;
     for &c in req.board.iter().chain(req.dead.iter()) {
@@ -1626,8 +1634,17 @@ fn simulate_partition(
                     weight_pct,
                 } => sample_random_hand_weighted(*hand_size, *weight_pct, &used, &mut rng, hand),
                 Sampler::Pool {
-                    pool, weight_pct, ..
-                } => sample_from_pool_weighted(pool, *weight_pct, used_mask, &mut rng, hand),
+                    pool,
+                    hand_size,
+                    weight_pct,
+                } => sample_from_pool_weighted(
+                    pool,
+                    *hand_size,
+                    *weight_pct,
+                    used_mask,
+                    &mut rng,
+                    hand,
+                ),
                 Sampler::Plan {
                     hand_size,
                     plan,
@@ -1766,7 +1783,7 @@ fn sampler_hand_size(s: &Sampler) -> usize {
 
 const PLAN_RANDOM_TRIES: usize = 384;
 
-fn accept_weight(weight_pct: u8, rng: &mut StdRng) -> bool {
+fn accept_weight(weight_pct: u8, rng: &mut SmallRng) -> bool {
     weight_pct >= 100 || rng.gen_range(0u8..100u8) < weight_pct
 }
 
@@ -1782,7 +1799,7 @@ fn sample_random_hand_weighted(
     hand_size: usize,
     weight_pct: u8,
     used: &[bool; 52],
-    rng: &mut StdRng,
+    rng: &mut SmallRng,
     out: &mut Vec<u8>,
 ) -> bool {
     for _ in 0..weight_try_budget(weight_pct) {
@@ -1798,13 +1815,14 @@ fn sample_random_hand_weighted(
 
 fn sample_from_pool_weighted(
     pool: &[PoolEntry],
+    hand_size: usize,
     weight_pct: u8,
     used_mask: u64,
-    rng: &mut StdRng,
+    rng: &mut SmallRng,
     out: &mut Vec<u8>,
 ) -> bool {
     for _ in 0..weight_try_budget(weight_pct) {
-        if !sample_from_pool(pool, used_mask, rng, out) {
+        if !sample_from_pool(pool, hand_size, used_mask, rng, out) {
             return false;
         }
         if accept_weight(weight_pct, rng) {
@@ -1819,31 +1837,7 @@ fn sample_from_plan(
     plan: &PlanNode,
     weight_pct: u8,
     used: &[bool; 52],
-    rng: &mut StdRng,
-    out: &mut Vec<u8>,
-    choose: &ChooseTable,
-    board: &[u8],
-    is_holdem: bool,
-) -> bool {
-    for _ in 0..PLAN_RANDOM_TRIES {
-        if !sample_random_hand(hand_size, used, rng, out) {
-            return false;
-        }
-        if eval_plan(plan, out, choose, board, is_holdem) && accept_weight(weight_pct, rng) {
-            return true;
-        }
-    }
-    sample_from_plan_exhaustive(
-        hand_size, plan, weight_pct, used, rng, out, choose, board, is_holdem,
-    )
-}
-
-fn sample_from_plan_exhaustive(
-    hand_size: usize,
-    plan: &PlanNode,
-    weight_pct: u8,
-    used: &[bool; 52],
-    rng: &mut StdRng,
+    rng: &mut SmallRng,
     out: &mut Vec<u8>,
     choose: &ChooseTable,
     board: &[u8],
@@ -1859,13 +1853,41 @@ fn sample_from_plan_exhaustive(
         return false;
     }
 
+    for _ in 0..PLAN_RANDOM_TRIES {
+        if !sample_random_hand_from_avail(&avail, hand_size, rng, out) {
+            return false;
+        }
+        if eval_plan(plan, out, choose, board, is_holdem) && accept_weight(weight_pct, rng) {
+            return true;
+        }
+    }
+    sample_from_plan_exhaustive_from_avail(
+        &avail, hand_size, plan, weight_pct, rng, out, choose, board, is_holdem,
+    )
+}
+
+fn sample_from_plan_exhaustive_from_avail(
+    avail: &[u8],
+    hand_size: usize,
+    plan: &PlanNode,
+    weight_pct: u8,
+    rng: &mut SmallRng,
+    out: &mut Vec<u8>,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+) -> bool {
+    if avail.len() < hand_size {
+        return false;
+    }
+
     let mut hand = vec![0u8; hand_size];
     let mut matched = 0usize;
     let mut chosen = Vec::<u8>::new();
     reservoir_plan_combos_rec(
         0,
         0,
-        &avail,
+        avail,
         hand_size,
         &mut hand,
         plan,
@@ -1896,7 +1918,7 @@ fn reservoir_plan_combos_rec(
     choose: &ChooseTable,
     board: &[u8],
     is_holdem: bool,
-    rng: &mut StdRng,
+    rng: &mut SmallRng,
     matched: &mut usize,
     chosen: &mut Vec<u8>,
 ) {
@@ -1938,7 +1960,7 @@ fn reservoir_plan_combos_rec(
 fn sample_random_hand(
     hand_size: usize,
     used: &[bool; 52],
-    rng: &mut StdRng,
+    rng: &mut SmallRng,
     out: &mut Vec<u8>,
 ) -> bool {
     let mut avail = [0u8; 52];
@@ -1962,10 +1984,36 @@ fn sample_random_hand(
     true
 }
 
+fn sample_random_hand_from_avail(
+    avail: &[u8],
+    hand_size: usize,
+    rng: &mut SmallRng,
+    out: &mut Vec<u8>,
+) -> bool {
+    if avail.len() < hand_size {
+        return false;
+    }
+    let mut picked = [0usize; 6];
+    out.clear();
+    for i in 0..hand_size {
+        loop {
+            let idx = rng.gen_range(0..avail.len());
+            if !picked[..i].contains(&idx) {
+                picked[i] = idx;
+                out.push(avail[idx]);
+                break;
+            }
+        }
+    }
+    out.sort_unstable();
+    true
+}
+
 fn sample_from_pool(
     pool: &[PoolEntry],
+    hand_size: usize,
     used_mask: u64,
-    rng: &mut StdRng,
+    rng: &mut SmallRng,
     out: &mut Vec<u8>,
 ) -> bool {
     if pool.is_empty() {
@@ -1976,7 +2024,7 @@ fn sample_from_pool(
         let hand = &pool[idx];
         if (hand.mask & used_mask) == 0 {
             out.clear();
-            out.extend_from_slice(&hand.cards);
+            out.extend_from_slice(&hand.cards[..hand_size]);
             return true;
         }
     }
@@ -1986,7 +2034,7 @@ fn sample_from_pool(
         let hand = &pool[idx];
         if (hand.mask & used_mask) == 0 {
             out.clear();
-            out.extend_from_slice(&hand.cards);
+            out.extend_from_slice(&hand.cards[..hand_size]);
             return true;
         }
     }
@@ -2496,7 +2544,7 @@ fn complete_board_runout(
     board5: &mut [u8; 5],
     known_len: usize,
     used: &[bool; 52],
-    rng: &mut StdRng,
+    rng: &mut SmallRng,
 ) -> bool {
     if known_len >= 5 {
         return true;
@@ -2571,15 +2619,27 @@ fn build_choose_table() -> ChooseTable {
     table
 }
 
-fn combo_rank_52(cards: &[u8], choose: &ChooseTable) -> usize {
+fn build_combo_rank_prefix() -> [[usize; 53]; 7] {
+    let choose = build_choose_table();
+    let mut prefix = [[0usize; 53]; 7];
+    for rem in 0..=6 {
+        for x in 1..=52 {
+            let v = x - 1;
+            prefix[rem][x] = prefix[rem][x - 1] + choose[52 - (v + 1)][rem];
+        }
+    }
+    prefix
+}
+
+fn combo_rank_52(cards: &[u8], _choose: &ChooseTable) -> usize {
+    let prefix = COMBO_RANK_PREFIX.get_or_init(build_combo_rank_prefix);
     let k = cards.len();
     let mut rank = 0usize;
     let mut start = 0usize;
     for i in 0..k {
         let ci = cards[i] as usize;
-        for v in start..ci {
-            rank += choose[52 - (v + 1)][k - i - 1];
-        }
+        let rem = k - i - 1;
+        rank += prefix[rem][ci].saturating_sub(prefix[rem][start]);
         start = ci + 1;
     }
     rank

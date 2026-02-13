@@ -498,7 +498,6 @@ fn prepare_native_request(cfg: &RunConfig, workers: Option<usize>) -> Result<Nat
             hand_size,
             &board,
             &dead,
-            cfg.players.len(),
             p.range.trim(),
             cfg.percentile_profile.as_deref(),
             &mut prep_rng,
@@ -531,7 +530,6 @@ fn build_sampler_for_range(
     hand_size: usize,
     board: &[u8],
     dead: &[u8],
-    player_count: usize,
     raw_range: &str,
     percentile_profile: Option<&str>,
     prep_rng: &mut JsRng,
@@ -542,7 +540,6 @@ fn build_sampler_for_range(
     let cache_key = sampler_cache_key(variant, hand_size, board, dead, range, &profile_norm);
     if let Some(cached) = sampler_cache_get(&cache_key) {
         let can_upgrade_plan = cached.mode == "plan"
-            && player_count <= 3
             && exact_plan_pool_limit(variant) > 0
             && !plan_pool_too_large_contains(&cache_key);
         if !can_upgrade_plan {
@@ -572,11 +569,7 @@ fn build_sampler_for_range(
     }
 
     if let Some(plan) = range_expr_to_plan(expr) {
-        let limit = if player_count <= 3 {
-            exact_plan_pool_limit(variant)
-        } else {
-            0
-        };
+        let limit = exact_plan_pool_limit(variant);
         if limit > 0 {
             let base = base_deck(board, dead);
             match collect_exact_pool_with_limit(&base, hand_size, board, expr, limit) {
