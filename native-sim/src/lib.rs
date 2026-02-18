@@ -1616,63 +1616,143 @@ fn simulate_partition(
         .collect();
     let mut score_buf = vec![0u16; pcount];
     let mut winners = vec![false; pcount];
+    let unbiased_hu_sampling = pcount == 2;
     let mut player_order: Vec<usize> = (0..pcount).collect();
 
     for _ in 0..iter_cap {
-        used.copy_from_slice(&blocked);
-        let mut used_mask = blocked_mask;
-        let mut failed = false;
-
-        player_order.shuffle(&mut rng);
-
-        for &pi in &player_order {
-            let sampler = &samplers[pi];
-            let hand = &mut hand_buf[pi];
-            let ok = match sampler {
-                Sampler::All {
-                    hand_size,
-                    weight_pct,
-                } => sample_random_hand_weighted(*hand_size, *weight_pct, &used, &mut rng, hand),
-                Sampler::Pool {
-                    pool,
-                    hand_size,
-                    weight_pct,
-                } => sample_from_pool_weighted(
-                    pool,
-                    *hand_size,
-                    *weight_pct,
-                    used_mask,
-                    &mut rng,
-                    hand,
-                ),
-                Sampler::Plan {
-                    hand_size,
-                    plan,
-                    weight_pct,
-                } => sample_from_plan(
-                    *hand_size,
-                    plan,
-                    *weight_pct,
-                    &used,
-                    &mut rng,
-                    hand,
-                    choose,
-                    &req.board,
-                    is_holdem,
-                ),
-            };
-            if !ok {
-                failed = true;
-                break;
+        if unbiased_hu_sampling {
+            let mut failed = false;
+            for pi in 0..pcount {
+                let sampler = &samplers[pi];
+                let hand = &mut hand_buf[pi];
+                let ok = match sampler {
+                    Sampler::All {
+                        hand_size,
+                        weight_pct,
+                    } => sample_random_hand_weighted(
+                        *hand_size,
+                        *weight_pct,
+                        &blocked,
+                        &mut rng,
+                        hand,
+                    ),
+                    Sampler::Pool {
+                        pool,
+                        hand_size,
+                        weight_pct,
+                    } => sample_from_pool_weighted(
+                        pool,
+                        *hand_size,
+                        *weight_pct,
+                        blocked_mask,
+                        &mut rng,
+                        hand,
+                    ),
+                    Sampler::Plan {
+                        hand_size,
+                        plan,
+                        weight_pct,
+                    } => sample_from_plan(
+                        *hand_size,
+                        plan,
+                        *weight_pct,
+                        &blocked,
+                        &mut rng,
+                        hand,
+                        choose,
+                        &req.board,
+                        is_holdem,
+                    ),
+                };
+                if !ok {
+                    failed = true;
+                    break;
+                }
             }
-            for &c in hand.iter() {
-                used[c as usize] = true;
-                used_mask |= 1u64 << c;
+            if failed {
+                continue;
             }
-            out.combo_sets[pi].insert_index(combo_rank_52(hand, choose));
-        }
-        if failed {
-            continue;
+
+            let mut used_mask = blocked_mask;
+            let mut overlap = false;
+            for hand in &hand_buf {
+                let hand_mask = cards_mask(hand);
+                if (hand_mask & used_mask) != 0 {
+                    overlap = true;
+                    break;
+                }
+                used_mask |= hand_mask;
+            }
+            if overlap {
+                continue;
+            }
+
+            used.copy_from_slice(&blocked);
+            for (pi, hand) in hand_buf.iter().enumerate() {
+                for &c in hand {
+                    used[c as usize] = true;
+                }
+                out.combo_sets[pi].insert_index(combo_rank_52(hand, choose));
+            }
+        } else {
+            let mut failed = false;
+            used.copy_from_slice(&blocked);
+            let mut used_mask = blocked_mask;
+
+            player_order.shuffle(&mut rng);
+            for &pi in &player_order {
+                let sampler = &samplers[pi];
+                let hand = &mut hand_buf[pi];
+                let ok = match sampler {
+                    Sampler::All {
+                        hand_size,
+                        weight_pct,
+                    } => {
+                        sample_random_hand_weighted(*hand_size, *weight_pct, &used, &mut rng, hand)
+                    }
+                    Sampler::Pool {
+                        pool,
+                        hand_size,
+                        weight_pct,
+                    } => sample_from_pool_weighted(
+                        pool,
+                        *hand_size,
+                        *weight_pct,
+                        used_mask,
+                        &mut rng,
+                        hand,
+                    ),
+                    Sampler::Plan {
+                        hand_size,
+                        plan,
+                        weight_pct,
+                    } => sample_from_plan(
+                        *hand_size,
+                        plan,
+                        *weight_pct,
+                        &used,
+                        &mut rng,
+                        hand,
+                        choose,
+                        &req.board,
+                        is_holdem,
+                    ),
+                };
+                if !ok {
+                    failed = true;
+                    break;
+                }
+                for &c in hand.iter() {
+                    used[c as usize] = true;
+                    used_mask |= 1u64 << c;
+                }
+            }
+            if failed {
+                continue;
+            }
+            for (pi, hand) in hand_buf.iter().enumerate() {
+                out.combo_sets[pi].insert_index(combo_rank_52(hand, choose));
+            }
         }
 
         if !complete_board_runout(&mut board5, known_len, &used, &mut rng) {
@@ -2019,6 +2099,7 @@ fn sample_from_pool(
     if pool.is_empty() {
         return false;
     }
+    // Fast path: repeated random probing remains uniform among valid entries.
     for _ in 0..64 {
         let idx = rng.gen_range(0..pool.len());
         let hand = &pool[idx];
@@ -2028,17 +2109,24 @@ fn sample_from_pool(
             return true;
         }
     }
-    let start = rng.gen_range(0..pool.len());
-    for step in 0..pool.len() {
-        let idx = (start + step) % pool.len();
-        let hand = &pool[idx];
-        if (hand.mask & used_mask) == 0 {
-            out.clear();
-            out.extend_from_slice(&hand.cards[..hand_size]);
-            return true;
+    // Slow path: exact reservoir sample over valid entries (uniform, no index bias).
+    let mut matched = 0usize;
+    let mut chosen: Option<&PoolEntry> = None;
+    for hand in pool {
+        if (hand.mask & used_mask) != 0 {
+            continue;
+        }
+        matched += 1;
+        if matched == 1 || rng.gen_range(0..matched) == 0 {
+            chosen = Some(hand);
         }
     }
-    false
+    let Some(hand) = chosen else {
+        return false;
+    };
+    out.clear();
+    out.extend_from_slice(&hand.cards[..hand_size]);
+    true
 }
 
 fn cards_mask(cards: &[u8]) -> u64 {

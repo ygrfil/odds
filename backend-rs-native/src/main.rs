@@ -292,8 +292,7 @@ const TAG_IDX_SD12: usize = 16;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "odds=info,tower_http=info".to_string()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "odds=info,tower_http=info".to_string()),
         )
         .init();
 
@@ -531,14 +530,8 @@ async fn sim_preview_range(Json(req): Json<PreviewRangeRequest>) -> (StatusCode,
             }),
             weight_pct: None,
         };
-        let cache_key = sampler_cache_key(
-            &variant,
-            hand_size,
-            &board,
-            &[],
-            range_text,
-            &profile_norm,
-        );
+        let cache_key =
+            sampler_cache_key(&variant, hand_size, &board, &[], range_text, &profile_norm);
         sampler_cache_put(cache_key, &sampler);
 
         let cov_variant = variant.clone();
@@ -646,11 +639,8 @@ fn prepare_native_request(cfg: &RunConfig, workers: Option<usize>) -> Result<Nat
         .par_iter()
         .enumerate()
         .map(|(idx, p)| {
-            let seed = DEFAULT_PREP_SEED.wrapping_add(
-                (idx as u32)
-                    .wrapping_add(1)
-                    .wrapping_mul(0x9e37_79b9),
-            );
+            let seed = DEFAULT_PREP_SEED
+                .wrapping_add((idx as u32).wrapping_add(1).wrapping_mul(0x9e37_79b9));
             let mut prep_rng = JsRng::new(seed);
             build_sampler_for_range(
                 &variant,
@@ -680,7 +670,7 @@ fn prepare_native_request(cfg: &RunConfig, workers: Option<usize>) -> Result<Nat
             }
         }),
         confidence_level: cfg.confidence_level.filter(|v| *v > 0.0),
-        seed: Some(DEFAULT_PREP_SEED as u64),
+        seed: Some(rand::random::<u64>()),
     })
 }
 
@@ -1534,7 +1524,11 @@ fn build_tag_coverage_bundle(variant: &str, hand_size: usize, board: &[u8]) -> T
     }
 }
 
-fn tag_coverage_bundle_for(variant: &str, hand_size: usize, board: &[u8]) -> Arc<TagCoverageBundle> {
+fn tag_coverage_bundle_for(
+    variant: &str,
+    hand_size: usize,
+    board: &[u8],
+) -> Arc<TagCoverageBundle> {
     let key = tag_coverage_cache_key(variant, board);
     if let Some(cached) = tag_coverage_cache_get(&key) {
         return cached;
