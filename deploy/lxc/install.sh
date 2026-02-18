@@ -44,10 +44,18 @@ die() {
 
 run_build_user() {
   local cmd="$1"
+  local user
+  local home_dir
   if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
-    sudo -u "${SUDO_USER}" -H bash -lc "$cmd"
+    user="${SUDO_USER}"
+    home_dir="$(getent passwd "${user}" | cut -d: -f6)"
+    [[ -n "${home_dir}" ]] || die "Could not resolve home directory for ${user}"
+    sudo -u "${user}" -H env HOME="${home_dir}" bash -lc "$cmd"
   else
-    bash -lc "$cmd"
+    user="$(id -un)"
+    home_dir="$(getent passwd "${user}" | cut -d: -f6)"
+    [[ -n "${home_dir}" ]] || die "Could not resolve home directory for ${user}"
+    HOME="${home_dir}" bash -lc "$cmd"
   fi
 }
 
@@ -121,10 +129,20 @@ fi
 log "Installing/updating Rust stable toolchain for build user"
 run_build_user '
 set -euo pipefail
-if ! command -v cargo >/dev/null 2>&1; then
+if ! command -v rustup >/dev/null 2>&1; then
   curl https://sh.rustup.rs -sSf | sh -s -- -y
 fi
-source "$HOME/.cargo/env"
+
+cargo_env="${CARGO_HOME:-$HOME/.cargo}/env"
+if [[ -f "$cargo_env" ]]; then
+  source "$cargo_env"
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "cargo not found after rustup install" >&2
+  exit 1
+fi
+
 rustup toolchain install stable --profile minimal >/dev/null
 rustup default stable >/dev/null
 '
@@ -132,7 +150,10 @@ rustup default stable >/dev/null
 log "Building release binary"
 run_build_user "
 set -euo pipefail
-source \"\$HOME/.cargo/env\"
+cargo_env=\"\${CARGO_HOME:-\$HOME/.cargo}/env\"
+if [[ -f \"\$cargo_env\" ]]; then
+  source \"\$cargo_env\"
+fi
 cd \"${REPO_DIR}\"
 cargo build -p odds --release
 "
