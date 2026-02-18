@@ -1,5 +1,9 @@
 import { RANKS, SUITS, rankOf, suitOf } from "./cards.js";
-import { normalizePercentileProfile, resolvePercentileTable } from "./percentile-profiles.js";
+import {
+  ensurePercentileTableLoaded,
+  normalizePercentileProfile,
+  resolvePercentileTable
+} from "./percentile-profiles.js";
 import { normalizeTagToken } from "./tag-utils.js";
 
 const RANK_ORDER = [...RANKS];
@@ -875,6 +879,15 @@ function compileAst(ast, variant, board, options = {}) {
   };
 }
 
+function expressionUsesPercentiles(expr) {
+  return String(expr || "").includes("%");
+}
+
+async function ensurePercentilesLoadedForExpr(expr, variant, options = {}) {
+  if (!expressionUsesPercentiles(expr)) return;
+  await ensurePercentileTableLoaded(variant, options?.percentileProfile);
+}
+
 export function compileRange(rawExpr, variant, boardCards = [], options = {}) {
   const expr = expandExprMacros(stripSpaces(rawExpr || "*"));
   if (!expr) {
@@ -886,10 +899,36 @@ export function compileRange(rawExpr, variant, boardCards = [], options = {}) {
   return compileAst(ast, variant, boardCards, options);
 }
 
+export async function compileRangeAsync(rawExpr, variant, boardCards = [], options = {}) {
+  const expr = expandExprMacros(stripSpaces(rawExpr || "*"));
+  if (!expr) {
+    const ok = { predicate: () => true, weight: 100, cost: 0.05, selectivity: 1 };
+    return ok;
+  }
+  await ensurePercentilesLoadedForExpr(expr, variant, options);
+  const tokens = tokenizeExpr(expr);
+  const ast = parser(tokens);
+  return compileAst(ast, variant, boardCards, options);
+}
+
 export function tryCompileRangeNativePlan(rawExpr, variant, boardCards = [], options = {}) {
   const expr = expandExprMacros(stripSpaces(rawExpr || "*"));
   if (!expr || expr === "*") return null;
   try {
+    const tokens = tokenizeExpr(expr);
+    const ast = parser(tokens);
+    const packed = nativePlanFromAst(ast, variant, boardCards, options);
+    return packed?.node || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function tryCompileRangeNativePlanAsync(rawExpr, variant, boardCards = [], options = {}) {
+  const expr = expandExprMacros(stripSpaces(rawExpr || "*"));
+  if (!expr || expr === "*") return null;
+  try {
+    await ensurePercentilesLoadedForExpr(expr, variant, options);
     const tokens = tokenizeExpr(expr);
     const ast = parser(tokens);
     const packed = nativePlanFromAst(ast, variant, boardCards, options);

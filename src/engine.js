@@ -1,4 +1,4 @@
-import { rawToResult } from "./sim-core.js";
+import { rawToResult } from "./result-format.js";
 
 class BackendUnavailableError extends Error {
   constructor(message) {
