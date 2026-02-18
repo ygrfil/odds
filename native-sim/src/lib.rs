@@ -4,7 +4,6 @@ use aya_poker::{omaha_rank, poker_rank, PokerRankCategory};
 use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use base64::Engine as _;
 use rand::rngs::SmallRng;
-use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
@@ -1616,143 +1615,73 @@ fn simulate_partition(
         .collect();
     let mut score_buf = vec![0u16; pcount];
     let mut winners = vec![false; pcount];
-    let unbiased_hu_sampling = pcount == 2;
-    let mut player_order: Vec<usize> = (0..pcount).collect();
-
     for _ in 0..iter_cap {
-        if unbiased_hu_sampling {
-            let mut failed = false;
-            for pi in 0..pcount {
-                let sampler = &samplers[pi];
-                let hand = &mut hand_buf[pi];
-                let ok = match sampler {
-                    Sampler::All {
-                        hand_size,
-                        weight_pct,
-                    } => sample_random_hand_weighted(
-                        *hand_size,
-                        *weight_pct,
-                        &blocked,
-                        &mut rng,
-                        hand,
-                    ),
-                    Sampler::Pool {
-                        pool,
-                        hand_size,
-                        weight_pct,
-                    } => sample_from_pool_weighted(
-                        pool,
-                        *hand_size,
-                        *weight_pct,
-                        blocked_mask,
-                        &mut rng,
-                        hand,
-                    ),
-                    Sampler::Plan {
-                        hand_size,
-                        plan,
-                        weight_pct,
-                    } => sample_from_plan(
-                        *hand_size,
-                        plan,
-                        *weight_pct,
-                        &blocked,
-                        &mut rng,
-                        hand,
-                        choose,
-                        &req.board,
-                        is_holdem,
-                    ),
-                };
-                if !ok {
-                    failed = true;
-                    break;
-                }
+        let mut failed = false;
+        for pi in 0..pcount {
+            let sampler = &samplers[pi];
+            let hand = &mut hand_buf[pi];
+            let ok = match sampler {
+                Sampler::All {
+                    hand_size,
+                    weight_pct,
+                } => sample_random_hand_weighted(*hand_size, *weight_pct, &blocked, &mut rng, hand),
+                Sampler::Pool {
+                    pool,
+                    hand_size,
+                    weight_pct,
+                } => sample_from_pool_weighted(
+                    pool,
+                    *hand_size,
+                    *weight_pct,
+                    blocked_mask,
+                    &mut rng,
+                    hand,
+                ),
+                Sampler::Plan {
+                    hand_size,
+                    plan,
+                    weight_pct,
+                } => sample_from_plan(
+                    *hand_size,
+                    plan,
+                    *weight_pct,
+                    &blocked,
+                    &mut rng,
+                    hand,
+                    choose,
+                    &req.board,
+                    is_holdem,
+                ),
+            };
+            if !ok {
+                failed = true;
+                break;
             }
-            if failed {
-                continue;
-            }
+        }
+        if failed {
+            continue;
+        }
 
-            let mut used_mask = blocked_mask;
-            let mut overlap = false;
-            for hand in &hand_buf {
-                let hand_mask = cards_mask(hand);
-                if (hand_mask & used_mask) != 0 {
-                    overlap = true;
-                    break;
-                }
-                used_mask |= hand_mask;
+        let mut used_mask = blocked_mask;
+        let mut overlap = false;
+        for hand in &hand_buf {
+            let hand_mask = cards_mask(hand);
+            if (hand_mask & used_mask) != 0 {
+                overlap = true;
+                break;
             }
-            if overlap {
-                continue;
-            }
+            used_mask |= hand_mask;
+        }
+        if overlap {
+            continue;
+        }
 
-            used.copy_from_slice(&blocked);
-            for (pi, hand) in hand_buf.iter().enumerate() {
-                for &c in hand {
-                    used[c as usize] = true;
-                }
-                out.combo_sets[pi].insert_index(combo_rank_52(hand, choose));
+        used.copy_from_slice(&blocked);
+        for (pi, hand) in hand_buf.iter().enumerate() {
+            for &c in hand {
+                used[c as usize] = true;
             }
-        } else {
-            let mut failed = false;
-            used.copy_from_slice(&blocked);
-            let mut used_mask = blocked_mask;
-
-            player_order.shuffle(&mut rng);
-            for &pi in &player_order {
-                let sampler = &samplers[pi];
-                let hand = &mut hand_buf[pi];
-                let ok = match sampler {
-                    Sampler::All {
-                        hand_size,
-                        weight_pct,
-                    } => {
-                        sample_random_hand_weighted(*hand_size, *weight_pct, &used, &mut rng, hand)
-                    }
-                    Sampler::Pool {
-                        pool,
-                        hand_size,
-                        weight_pct,
-                    } => sample_from_pool_weighted(
-                        pool,
-                        *hand_size,
-                        *weight_pct,
-                        used_mask,
-                        &mut rng,
-                        hand,
-                    ),
-                    Sampler::Plan {
-                        hand_size,
-                        plan,
-                        weight_pct,
-                    } => sample_from_plan(
-                        *hand_size,
-                        plan,
-                        *weight_pct,
-                        &used,
-                        &mut rng,
-                        hand,
-                        choose,
-                        &req.board,
-                        is_holdem,
-                    ),
-                };
-                if !ok {
-                    failed = true;
-                    break;
-                }
-                for &c in hand.iter() {
-                    used[c as usize] = true;
-                    used_mask |= 1u64 << c;
-                }
-            }
-            if failed {
-                continue;
-            }
-            for (pi, hand) in hand_buf.iter().enumerate() {
-                out.combo_sets[pi].insert_index(combo_rank_52(hand, choose));
-            }
+            out.combo_sets[pi].insert_index(combo_rank_52(hand, choose));
         }
 
         if !complete_board_runout(&mut board5, known_len, &used, &mut rng) {
