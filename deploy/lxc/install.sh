@@ -182,6 +182,17 @@ if [[ "${ENABLE_NGINX}" == "false" ]] && command -v ss >/dev/null 2>&1; then
   fi
 fi
 
+if [[ "${ENABLE_NGINX}" == "true" ]] && command -v ss >/dev/null 2>&1; then
+  listening_80="$(ss -ltnp "( sport = :80 )" | tail -n +2 || true)"
+  if [[ -n "${listening_80}" ]]; then
+    non_nginx_80="$(printf '%s\n' "${listening_80}" | grep -vi 'nginx' || true)"
+    if [[ -n "${non_nginx_80}" ]]; then
+      printf '[install] Port 80 listeners:\n%s\n' "${listening_80}" >&2
+      die "port 80 is already in use by a non-nginx service. Stop it or run with --no-nginx."
+    fi
+  fi
+fi
+
 CAP_NET_BIND_LINES=""
 if (( PORT < 1024 )); then
   CAP_NET_BIND_LINES=$'AmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE'
@@ -247,8 +258,16 @@ $SUDO systemctl enable --now "${APP_NAME}"
 $SUDO systemctl restart "${APP_NAME}"
 
 if [[ "${ENABLE_NGINX}" == "true" ]]; then
-  $SUDO systemctl enable --now nginx
-  $SUDO systemctl reload nginx
+  if ! $SUDO systemctl enable --now nginx; then
+    $SUDO systemctl status nginx --no-pager -l >&2 || true
+    $SUDO journalctl -u nginx -n 120 --no-pager >&2 || true
+    die "failed to start nginx"
+  fi
+  if ! $SUDO systemctl reload nginx; then
+    $SUDO systemctl status nginx --no-pager -l >&2 || true
+    $SUDO journalctl -u nginx -n 120 --no-pager >&2 || true
+    die "failed to reload nginx"
+  fi
 fi
 
 log "Checking health endpoint"
