@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tower_http::services::ServeDir;
@@ -490,20 +491,25 @@ fn prepare_native_request(cfg: &RunConfig, workers: Option<usize>) -> Result<Nat
     let dead = parse_cards_text(&cfg.dead)?;
     validate_disjoint(&board, &dead)?;
 
-    let mut players = Vec::with_capacity(cfg.players.len());
-    let mut prep_rng = JsRng::new(DEFAULT_PREP_SEED);
-    for p in &cfg.players {
-        let sampler = build_sampler_for_range(
-            &variant,
-            hand_size,
-            &board,
-            &dead,
-            p.range.trim(),
-            cfg.percentile_profile.as_deref(),
-            &mut prep_rng,
-        )?;
-        players.push(sampler);
-    }
+    let profile = cfg.percentile_profile.as_deref();
+    let players = cfg
+        .players
+        .par_iter()
+        .enumerate()
+        .map(|(idx, p)| {
+            let seed = DEFAULT_PREP_SEED.wrapping_add(((idx as u32) + 1) * 0x9e37_79b9);
+            let mut prep_rng = JsRng::new(seed);
+            build_sampler_for_range(
+                &variant,
+                hand_size,
+                &board,
+                &dead,
+                p.range.trim(),
+                profile,
+                &mut prep_rng,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(NativeSimReq {
         variant,
@@ -660,6 +666,11 @@ fn collect_exact_pool_with_limit(
         return ExactPoolCollect::Empty;
     }
 
+    let total = n_choose_k(base.len(), hand_size);
+    if total >= PREVIEW_PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
+        return collect_exact_pool_with_limit_parallel(base, hand_size, board, expr, limit);
+    }
+
     let mut overflow = false;
     let mut hand = vec![0u8; hand_size];
     let mut pool = Vec::<Vec<u8>>::new();
@@ -678,6 +689,56 @@ fn collect_exact_pool_with_limit(
     if overflow {
         ExactPoolCollect::TooLarge
     } else if pool.is_empty() {
+        ExactPoolCollect::Empty
+    } else {
+        ExactPoolCollect::Full(pool)
+    }
+}
+
+fn collect_exact_pool_with_limit_parallel(
+    base: &[u8],
+    hand_size: usize,
+    board: &[u8],
+    expr: &RangeExpr,
+    limit: usize,
+) -> ExactPoolCollect {
+    let max_start = base.len() - hand_size;
+    let matched = AtomicUsize::new(0);
+    let overflow = AtomicBool::new(false);
+
+    let mut pool = (0..=max_start)
+        .into_par_iter()
+        .map(|first_idx| {
+            let mut hand = vec![0u8; hand_size];
+            hand[0] = base[first_idx];
+            let mut local = Vec::<Vec<u8>>::new();
+            collect_exact_pool_with_limit_parallel_rec(
+                base,
+                first_idx + 1,
+                1,
+                &mut hand,
+                board,
+                expr,
+                limit,
+                &matched,
+                &overflow,
+                &mut local,
+            );
+            local
+        })
+        .reduce(Vec::<Vec<u8>>::new, |mut acc, mut part| {
+            acc.append(&mut part);
+            acc
+        });
+
+    if overflow.load(Ordering::Relaxed) {
+        return ExactPoolCollect::TooLarge;
+    }
+    let keep = matched.load(Ordering::Relaxed).min(limit);
+    if pool.len() > keep {
+        pool.truncate(keep);
+    }
+    if pool.is_empty() {
         ExactPoolCollect::Empty
     } else {
         ExactPoolCollect::Full(pool)
@@ -729,6 +790,58 @@ fn collect_exact_pool_with_limit_rec(
             limit,
             pool,
             overflow,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_exact_pool_with_limit_parallel_rec(
+    base: &[u8],
+    start: usize,
+    depth: usize,
+    hand: &mut [u8],
+    board: &[u8],
+    expr: &RangeExpr,
+    limit: usize,
+    matched: &AtomicUsize,
+    overflow: &AtomicBool,
+    local: &mut Vec<Vec<u8>>,
+) {
+    if overflow.load(Ordering::Relaxed) {
+        return;
+    }
+    if depth == hand.len() {
+        if range_expr_match(expr, hand, board) {
+            let prev = matched.fetch_add(1, Ordering::Relaxed);
+            if prev >= limit {
+                overflow.store(true, Ordering::Relaxed);
+                return;
+            }
+            local.push(hand.to_vec());
+        }
+        return;
+    }
+
+    let need = hand.len() - depth;
+    if base.len() < need || start > base.len() - need {
+        return;
+    }
+    for i in start..=base.len() - need {
+        if overflow.load(Ordering::Relaxed) {
+            return;
+        }
+        hand[depth] = base[i];
+        collect_exact_pool_with_limit_parallel_rec(
+            base,
+            i + 1,
+            depth + 1,
+            hand,
+            board,
+            expr,
+            limit,
+            matched,
+            overflow,
+            local,
         );
     }
 }

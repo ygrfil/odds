@@ -22,26 +22,19 @@ Desktop-first web app for poker equity calculations:
 - Local persistence (`localStorage`)
 - Export/import setup+results as `.json`
 - Quick-pick filters (`@tp`, `@2p`, `@set`, `@fd`, `@f`, etc.)
-- Native backend mode (Go + Rust simulator) with automatic frontend fallback to browser engine when backend is not running
+- Native backend mode (Rust) with automatic frontend fallback to browser engine when backend is not running
 
 ## Run locally (recommended)
 Run the native backend from project root:
 
 ```bash
-go run ./backend
-```
-
-Optional (recommended so first request is fast):
-
-```bash
-cargo build --release --manifest-path native-sim/Cargo.toml
+cargo run --release --manifest-path backend-rs-native/Cargo.toml
 ```
 
 Open:
-- `http://localhost:8787/index.html`
+- `http://localhost:8789/index.html`
 
 The UI automatically uses the native backend when available.
-If `native-sim/target/release/native-sim` is missing, backend will auto-build it on first use.
 
 ## Browser-only fallback
 If you want to run without backend:
@@ -54,18 +47,6 @@ Open:
 - `http://localhost:8080/index.html`
 
 In this mode, calculations run fully in the browser.
-
-Rebuild PLO4/PLO5 true-equity percentile tables (native Monte Carlo vs random hand):
-
-```bash
-node scripts/precompute-percentiles-equity.mjs --variants=plo4,plo5 --iterations=500000000
-```
-
-Legacy heuristic-only precompute (faster, less accurate for `%`):
-
-```bash
-node scripts/precompute-percentiles.mjs plo4,plo5
-```
 
 ## Native backend API
 - `GET /api/health`
