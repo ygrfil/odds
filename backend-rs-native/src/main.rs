@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -308,7 +309,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         prewarm_percentile_tables();
     }
 
-    let project_root = std::env::current_dir()?;
+    let static_root = resolve_static_root()?;
 
     let port = std::env::var("PORT")
         .ok()
@@ -321,13 +322,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/sim/preview/tag", post(sim_preview_tag))
         .route("/api/sim/preview/tags", post(sim_preview_tags))
         .route("/api/sim/preview/range", post(sim_preview_range))
-        .fallback_service(ServeDir::new(project_root))
+        .fallback_service(ServeDir::new(static_root.clone()))
         .layer(TraceLayer::new_for_http());
 
-    info!("rust native backend listening on http://localhost:{port}");
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
-    axum::serve(listener, app).await?;
+    let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let bind_addr = format!("{host}:{port}");
+
+    info!(
+        "rust native backend listening on http://{bind_addr} (static root: {})",
+        static_root.display()
+    );
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+fn resolve_static_root() -> Result<PathBuf, std::io::Error> {
+    match std::env::var("APP_STATIC_ROOT") {
+        Ok(value) => Ok(PathBuf::from(value)),
+        Err(_) => std::env::current_dir(),
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                let _ = sigterm.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    info!("shutdown signal received");
 }
 
 fn prewarm_percentile_tables() {

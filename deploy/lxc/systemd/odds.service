@@ -1,0 +1,25 @@
+[Unit]
+Description=Poker Odds Lab backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=odds
+Group=odds
+WorkingDirectory=/opt/odds
+Environment=PORT=8789
+Environment=HOST=127.0.0.1
+Environment=RUST_LOG=odds=info,tower_http=warn
+Environment=PREWARM_PERCENTILES=true
+ExecStart=/opt/odds/odds
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

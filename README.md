@@ -32,7 +32,83 @@ This mode skips backend APIs and runs simulation in-browser.
 - `GET /api/health`
 - `POST /api/sim/run`
 - `POST /api/sim/preview/tag`
+- `POST /api/sim/preview/tags`
 - `POST /api/sim/preview/range`
+
+## Production deploy (Proxmox LXC)
+Recommended path for this project: run the Rust binary directly under `systemd` inside the LXC (no Docker-in-LXC).
+
+Why this is best here:
+- One process serves API + frontend static files.
+- Lower memory/CPU overhead than nested container stacks.
+- Native `systemd` restart policy + journald logs.
+
+### One-command install
+From project root inside your LXC:
+
+```bash
+chmod +x deploy/lxc/install.sh
+./deploy/lxc/install.sh
+```
+
+Optional:
+
+```bash
+./deploy/lxc/install.sh --domain odds.example.com
+./deploy/lxc/install.sh --port 8790
+./deploy/lxc/install.sh --no-nginx
+```
+
+### 1) Build and stage app files
+Run inside your LXC:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential pkg-config libssl-dev ca-certificates curl git nginx
+curl https://sh.rustup.rs -sSf | sh -s -- -y
+source "$HOME/.cargo/env"
+
+git clone <your-repo-url> /tmp/poker-odds-lab
+cd /tmp/poker-odds-lab
+cargo build -p odds --release
+
+sudo useradd --system --home /opt/odds --shell /usr/sbin/nologin odds || true
+sudo mkdir -p /opt/odds
+sudo install -m 755 target/release/odds /opt/odds/odds
+sudo cp index.html /opt/odds/index.html
+sudo cp -R src /opt/odds/src
+sudo chown -R odds:odds /opt/odds
+```
+
+### 2) Install systemd service
+Use `deploy/lxc/systemd/odds.service`:
+
+```bash
+sudo cp deploy/lxc/systemd/odds.service /etc/systemd/system/odds.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now odds
+sudo systemctl status odds --no-pager
+curl http://127.0.0.1:8789/api/health
+```
+
+### 3) Put Nginx in front (recommended)
+Use `deploy/lxc/nginx/odds.conf`:
+
+```bash
+sudo cp deploy/lxc/nginx/odds.conf /etc/nginx/sites-available/odds
+sudo ln -sf /etc/nginx/sites-available/odds /etc/nginx/sites-enabled/odds
+sudo nginx -t
+sudo systemctl restart nginx
+```
+
+Then open `http://<LXC_IP>/index.html`.
+
+### Runtime env vars
+- `PORT` (default `8789`)
+- `HOST` (default `0.0.0.0`)
+- `APP_STATIC_ROOT` (default current working directory)
+- `RUST_LOG` (default `odds=info,tower_http=info`)
+- `PREWARM_PERCENTILES` (default `true`)
 
 ## Project layout
 - `backend-rs-native/`: Axum server + API handlers
