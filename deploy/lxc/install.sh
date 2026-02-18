@@ -92,6 +92,9 @@ done
 
 [[ "$PORT" =~ ^[0-9]+$ ]] || die "PORT must be numeric"
 (( PORT >= 1 && PORT <= 65535 )) || die "PORT must be between 1 and 65535"
+if [[ "${ENABLE_NGINX}" == "true" && "${PORT}" == "80" ]]; then
+  die "--port 80 conflicts with nginx listener. Use a backend port like 8789, or pass --no-nginx."
+fi
 
 [[ -f "${REPO_DIR}/Cargo.toml" ]] || die "Cargo.toml not found in ${REPO_DIR}"
 [[ -f "${REPO_DIR}/index.html" ]] || die "index.html not found in ${REPO_DIR}"
