@@ -497,7 +497,11 @@ fn prepare_native_request(cfg: &RunConfig, workers: Option<usize>) -> Result<Nat
         .par_iter()
         .enumerate()
         .map(|(idx, p)| {
-            let seed = DEFAULT_PREP_SEED.wrapping_add(((idx as u32) + 1) * 0x9e37_79b9);
+            let seed = DEFAULT_PREP_SEED.wrapping_add(
+                (idx as u32)
+                    .wrapping_add(1)
+                    .wrapping_mul(0x9e37_79b9),
+            );
             let mut prep_rng = JsRng::new(seed);
             build_sampler_for_range(
                 &variant,
