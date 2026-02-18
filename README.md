@@ -12,7 +12,7 @@ Rust-native poker equity calculator with a static frontend served by the backend
 From project root:
 
 ```bash
-cargo run --release --manifest-path backend-rs-native/Cargo.toml
+cargo run -p odds --release
 ```
 
 Open:

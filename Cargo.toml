@@ -1,0 +1,13 @@
+[workspace]
+members = ["backend-rs-native", "native-sim"]
+default-members = ["backend-rs-native"]
+resolver = "2"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package.odds]
+opt-level = 3
+
+[profile.dev.package.native-sim]
+opt-level = 3

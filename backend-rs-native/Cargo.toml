@@ -1,5 +1,5 @@
 [package]
-name = "backend-rs-native"
+name = "odds"
 version = "0.1.0"
 edition = "2021"
 
@@ -15,12 +15,3 @@ rand = { version = "0.8.5", features = ["small_rng"] }
 json5 = "0.4.1"
 native-sim = { path = "../native-sim" }
 rayon = "1.10"
-
-[profile.dev]
-opt-level = 1
-
-[profile.dev.package.backend-rs-native]
-opt-level = 3
-
-[profile.dev.package.native-sim]
-opt-level = 3

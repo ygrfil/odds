@@ -245,7 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "backend_rs_native=info,tower_http=info".to_string()),
+                .unwrap_or_else(|_| "odds=info,tower_http=info".to_string()),
         )
         .init();
 
