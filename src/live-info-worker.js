@@ -2,6 +2,8 @@ import { extractNormalizedTags, normalizePureTagToken, splitTagToken } from "./t
 
 const REMOTE_COVERAGE_CACHE = new Map();
 const REMOTE_TAG_COVERAGE_CACHE = new Map();
+const REMOTE_TAG_BUNDLE_CACHE = new Map();
+const REMOTE_TAG_BUNDLE_INFLIGHT = new Map();
 const REMOTE_INFLIGHT_BY_PLAYER = new Map();
 
 function atTagsInRange(rangeText) {
@@ -63,6 +65,19 @@ function coverageText(cov) {
     return `${pct}, ${cov.matched.toLocaleString()}/${cov.total.toLocaleString()} samples`;
   }
   return `${cov.pct.toFixed(1)}%, ${cov.matched.toLocaleString()}/${cov.total.toLocaleString()} combos`;
+}
+
+function cacheSetBounded(map, key, value, maxSize = 4000) {
+  map.set(key, value);
+  if (map.size > maxSize) map.clear();
+}
+
+function coverageFromBundle(bundle, tag) {
+  if (!bundle || typeof bundle !== "object") return null;
+  const key = String(tag || "").trim().toLowerCase();
+  const cov = bundle[key];
+  if (!cov || typeof cov !== "object") return null;
+  return cov;
 }
 
 function canUseBackendPreview() {
@@ -129,13 +144,21 @@ async function previewRangeCoverageFast(boardText, variant, rangeText, percentil
   }
   const cov = payload?.coverage;
   if (!cov || typeof cov !== "object") throw new Error("Range: invalid backend response");
-  REMOTE_COVERAGE_CACHE.set(key, cov);
+  cacheSetBounded(REMOTE_COVERAGE_CACHE, key, cov, 4000);
   return cov;
 }
 
 async function previewTagCoverageFast(boardText, variant, tag, signal) {
-  const key = `${variant}|${String(boardText || "").trim()}|${String(tag || "").trim().toLowerCase()}`;
+  const boardKey = String(boardText || "").trim();
+  const tagToken = String(tag || "").trim().toLowerCase();
+  const key = `${variant}|${boardKey}|${tagToken}`;
   if (REMOTE_TAG_COVERAGE_CACHE.has(key)) return REMOTE_TAG_COVERAGE_CACHE.get(key);
+  const bundle = REMOTE_TAG_BUNDLE_CACHE.get(`${variant}|${boardKey}`);
+  const bundledCov = coverageFromBundle(bundle, tagToken);
+  if (bundledCov) {
+    cacheSetBounded(REMOTE_TAG_COVERAGE_CACHE, key, bundledCov, 6000);
+    return bundledCov;
+  }
   const payload = await fetchBackendJson("/api/sim/preview/tag", {
     boardText,
     variant,
@@ -146,8 +169,37 @@ async function previewTagCoverageFast(boardText, variant, tag, signal) {
   }
   const cov = payload?.coverage;
   if (!cov || typeof cov !== "object") throw new Error("Tag: invalid backend response");
-  REMOTE_TAG_COVERAGE_CACHE.set(key, cov);
+  cacheSetBounded(REMOTE_TAG_COVERAGE_CACHE, key, cov, 6000);
   return cov;
+}
+
+async function previewAllTagCoverageFast(boardText, variant, signal) {
+  const boardKey = String(boardText || "").trim();
+  const key = `${variant}|${boardKey}`;
+  if (REMOTE_TAG_BUNDLE_CACHE.has(key)) return REMOTE_TAG_BUNDLE_CACHE.get(key);
+  if (REMOTE_TAG_BUNDLE_INFLIGHT.has(key)) return REMOTE_TAG_BUNDLE_INFLIGHT.get(key);
+  const inflight = (async () => {
+    const payload = await fetchBackendJson("/api/sim/preview/tags", { boardText, variant }, signal);
+    if (payload?.ok === false) throw new Error(payload?.error || "Tags: invalid board input");
+    const coverageByTag = payload?.coverageByTag;
+    if (!coverageByTag || typeof coverageByTag !== "object") {
+      throw new Error("Tags: invalid backend response");
+    }
+    cacheSetBounded(REMOTE_TAG_BUNDLE_CACHE, key, coverageByTag, 1200);
+    for (const [tagToken, cov] of Object.entries(coverageByTag)) {
+      if (!cov || typeof cov !== "object") continue;
+      const tagKey = `${variant}|${boardKey}|${String(tagToken || "").trim().toLowerCase()}`;
+      cacheSetBounded(REMOTE_TAG_COVERAGE_CACHE, tagKey, cov, 6000);
+    }
+    return coverageByTag;
+  })();
+  REMOTE_TAG_BUNDLE_INFLIGHT.set(key, inflight);
+  try {
+    return await inflight;
+  } finally {
+    const current = REMOTE_TAG_BUNDLE_INFLIGHT.get(key);
+    if (current === inflight) REMOTE_TAG_BUNDLE_INFLIGHT.delete(key);
+  }
 }
 
 async function computeLiveInfo(rangeText, boardText, variant, percentileProfile = "", signal) {
@@ -158,6 +210,9 @@ async function computeLiveInfo(rangeText, boardText, variant, percentileProfile 
   const isHoldem = variant === "holdem";
   const boardCards = Math.floor(String(boardText || "").replace(/\s+/g, "").length / 2);
   const pctSpec = parseSimplePercentSpec(expr);
+  const tagBundlePromise = boardCards >= 3
+    ? previewAllTagCoverageFast(boardText, variant, signal).catch(() => null)
+    : null;
   const parts = [];
   let covExpr = null;
 
@@ -204,6 +259,7 @@ async function computeLiveInfo(rangeText, boardText, variant, percentileProfile 
 
   if (!tags.length) return { parts, coverage: covExpr };
   const pureTag = normalizedPureTag(expr);
+  const tagBundle = tagBundlePromise ? await tagBundlePromise : null;
 
   for (const tag of tags) {
     const tagInfo = splitTagToken(tag);
@@ -219,11 +275,11 @@ async function computeLiveInfo(rangeText, boardText, variant, percentileProfile 
     try {
       const cov = (pureTag && pureTag === tag && covExpr && typeof covExpr === "object")
         ? covExpr
-        : await previewTagCoverageFast(boardText, variant, tag, signal);
+        : (coverageFromBundle(tagBundle, tag) || await previewTagCoverageFast(boardText, variant, tag, signal));
       const stat = coverageText(cov);
       let extra = "";
       if (!isHoldem && tagInfo.base === "@sd") {
-        const c4 = await previewTagCoverageFast(boardText, variant, "@sd4", signal);
+        const c4 = coverageFromBundle(tagBundle, "@sd4") || await previewTagCoverageFast(boardText, variant, "@sd4", signal);
         if (cov.pct > c4.pct + 0.2) extra = " + blocker-only <4 out draws";
       }
       if (pureTag && pureTag === tag && tags.length === 1) {

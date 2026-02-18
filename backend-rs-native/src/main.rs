@@ -61,6 +61,15 @@ struct PreviewTagRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct PreviewTagsRequest {
+    #[serde(default)]
+    board_text: String,
+    #[serde(default)]
+    variant: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PreviewRangeRequest {
     #[serde(default)]
     board_text: String,
@@ -239,6 +248,45 @@ const PREVIEW_PARALLEL_THRESHOLD: usize = 400_000;
 const EXACT_PLAN_POOL_LIMIT_HOLDEM: usize = 40_000;
 const EXACT_PLAN_POOL_LIMIT_PLO4: usize = 180_000;
 const EXACT_PLAN_POOL_LIMIT_PLO5: usize = 260_000;
+const CARD_COUNT: usize = 52;
+const TAG_COVERAGE_CACHE_MAX: usize = 192;
+const TAG_COVERAGE_TOKEN_ORDER: [&str; 17] = [
+    "@tp",
+    "@tp+",
+    "@overpair",
+    "@overpair+",
+    "@2p",
+    "@2p+",
+    "@set",
+    "@set+",
+    "@s",
+    "@s+",
+    "@f",
+    "@f+",
+    "@fd",
+    "@sd",
+    "@sd4",
+    "@sd8",
+    "@sd12",
+];
+const TAG_COVERAGE_COUNT: usize = TAG_COVERAGE_TOKEN_ORDER.len();
+const TAG_IDX_TP: usize = 0;
+const TAG_IDX_TP_PLUS: usize = 1;
+const TAG_IDX_OVERPAIR: usize = 2;
+const TAG_IDX_OVERPAIR_PLUS: usize = 3;
+const TAG_IDX_2P: usize = 4;
+const TAG_IDX_2P_PLUS: usize = 5;
+const TAG_IDX_SET: usize = 6;
+const TAG_IDX_SET_PLUS: usize = 7;
+const TAG_IDX_STRAIGHT: usize = 8;
+const TAG_IDX_STRAIGHT_PLUS: usize = 9;
+const TAG_IDX_FLUSH: usize = 10;
+const TAG_IDX_FLUSH_PLUS: usize = 11;
+const TAG_IDX_FD: usize = 12;
+const TAG_IDX_SD: usize = 13;
+const TAG_IDX_SD4: usize = 14;
+const TAG_IDX_SD8: usize = 15;
+const TAG_IDX_SD12: usize = 16;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -272,6 +320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/health", get(health))
         .route("/api/sim/run", post(sim_run))
         .route("/api/sim/preview/tag", post(sim_preview_tag))
+        .route("/api/sim/preview/tags", post(sim_preview_tags))
         .route("/api/sim/preview/range", post(sim_preview_range))
         .fallback_service(ServeDir::new(project_root))
         .layer(TraceLayer::new_for_http());
@@ -355,7 +404,7 @@ async fn sim_preview_tag(Json(req): Json<PreviewTagRequest>) -> (StatusCode, Jso
     let tag = match normalize_tag_token(&req.tag) {
         Some(t) => t,
         None => {
-            let empty = json!({ "matched": 0, "total": 0, "pct": 0, "approx": false });
+            let empty = coverage_json(0, 0);
             return (
                 StatusCode::OK,
                 Json(json!({ "ok": true, "combos": [], "coverage": empty })),
@@ -363,15 +412,10 @@ async fn sim_preview_tag(Json(req): Json<PreviewTagRequest>) -> (StatusCode, Jso
         }
     };
 
-    let combos = preview_tag_core_combos(&board, &variant, tag);
-    let base = base_deck(&board, &[]);
-    let total = n_choose_k(base.len(), hand_size);
+    let cov_variant = variant.clone();
     let cov_board = board.clone();
-    let cov_base = base.clone();
-    let (matched, approx) = match tokio::task::spawn_blocking(move || {
-        estimate_coverage(&cov_base, hand_size, total, |hand| {
-            full_tag_match(tag, hand, &cov_board)
-        })
+    let bundle = match tokio::task::spawn_blocking(move || {
+        tag_coverage_bundle_for(&cov_variant, hand_size, &cov_board)
     })
     .await
     {
@@ -379,19 +423,74 @@ async fn sim_preview_tag(Json(req): Json<PreviewTagRequest>) -> (StatusCode, Jso
         Err(e) => {
             return error_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("preview tag coverage task failed: {e}"),
+                &format!("preview tag bundle task failed: {e}"),
             )
         }
     };
-    let coverage = json!({
-        "matched": matched,
-        "total": total,
-        "pct": if total > 0 { (matched as f64 * 100.0) / total as f64 } else { 0.0 },
-        "approx": approx
-    });
+    let combos = preview_tag_core_combos_from_bundle(&bundle, tag);
+    let matched = tag_coverage_index(tag)
+        .and_then(|idx| bundle.matched_by_tag.get(idx).copied())
+        .unwrap_or(0);
+    let coverage = coverage_json(matched, bundle.total);
     (
         StatusCode::OK,
         Json(json!({ "ok": true, "combos": combos, "coverage": coverage })),
+    )
+}
+
+async fn sim_preview_tags(Json(req): Json<PreviewTagsRequest>) -> (StatusCode, Json<Value>) {
+    let variant = req.variant.trim().to_lowercase();
+    let hand_size = match variant_hand_size(&variant) {
+        Some(v) => v,
+        None => return error_json(StatusCode::BAD_REQUEST, "unsupported variant"),
+    };
+    let board = match parse_cards_text(&req.board_text) {
+        Ok(v) => v,
+        Err(msg) => return error_json(StatusCode::BAD_REQUEST, &msg),
+    };
+
+    let mut coverage_by_tag = serde_json::Map::<String, Value>::new();
+    if board.len() < 3 || board.len() > 5 {
+        for tag in TAG_COVERAGE_TOKEN_ORDER {
+            coverage_by_tag.insert(tag.to_string(), coverage_json(0, 0));
+        }
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "total": 0,
+                "coverageByTag": coverage_by_tag
+            })),
+        );
+    }
+
+    let cov_variant = variant.clone();
+    let cov_board = board.clone();
+    let bundle = match tokio::task::spawn_blocking(move || {
+        tag_coverage_bundle_for(&cov_variant, hand_size, &cov_board)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("preview tags bundle task failed: {e}"),
+            )
+        }
+    };
+
+    for (idx, tag) in TAG_COVERAGE_TOKEN_ORDER.iter().enumerate() {
+        let matched = bundle.matched_by_tag.get(idx).copied().unwrap_or(0);
+        coverage_by_tag.insert((*tag).to_string(), coverage_json(matched, bundle.total));
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "total": bundle.total,
+            "coverageByTag": coverage_by_tag
+        })),
     )
 }
 
@@ -414,6 +513,56 @@ async fn sim_preview_range(Json(req): Json<PreviewRangeRequest>) -> (StatusCode,
     let total = n_choose_k(base.len(), hand_size);
 
     let range_text = req.range_text.trim();
+    let range_compact = range_text
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>();
+    if let Some(tag) = normalize_tag_token(&range_compact) {
+        let profile_norm = normalize_percentile_profile(
+            &variant,
+            req.percentile_profile.as_deref().unwrap_or_default(),
+        );
+        let sampler = NativePlayerReq {
+            mode: "plan".to_string(),
+            hand_size,
+            pool: None,
+            plan: Some(native_sim::PlanNodeReq::Tag {
+                tag: plan_tag_from_atom(tag),
+            }),
+            weight_pct: None,
+        };
+        let cache_key = sampler_cache_key(
+            &variant,
+            hand_size,
+            &board,
+            &[],
+            range_text,
+            &profile_norm,
+        );
+        sampler_cache_put(cache_key, &sampler);
+
+        let cov_variant = variant.clone();
+        let cov_board = board.clone();
+        let bundle = match tokio::task::spawn_blocking(move || {
+            tag_coverage_bundle_for(&cov_variant, hand_size, &cov_board)
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return error_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("preview pure-tag task failed: {e}"),
+                )
+            }
+        };
+        let matched = tag_coverage_index(tag)
+            .and_then(|idx| bundle.matched_by_tag.get(idx).copied())
+            .unwrap_or(0);
+        let out = coverage_json(matched, bundle.total);
+        return (StatusCode::OK, Json(json!({ "ok": true, "coverage": out })));
+    }
+
     let profile_norm = normalize_percentile_profile(
         &variant,
         req.percentile_profile.as_deref().unwrap_or_default(),
@@ -1194,6 +1343,242 @@ fn sampler_cache_put(key: String, sampler: &NativePlayerReq) {
     guard.insert(key, sampler.clone());
 }
 
+fn tag_coverage_cache_key(variant: &str, board: &[u8]) -> String {
+    let mut board_sorted = board.to_vec();
+    board_sorted.sort_unstable();
+    format!("{variant}|b:{}", cards_key(&board_sorted))
+}
+
+fn tag_coverage_cache_get(key: &str) -> Option<Arc<TagCoverageBundle>> {
+    let cache = TAG_COVERAGE_CACHE.get_or_init(|| Mutex::new(TagCoverageCacheStore::default()));
+    let mut guard = cache.lock().ok()?;
+    guard.get(key)
+}
+
+fn tag_coverage_cache_put(key: String, bundle: Arc<TagCoverageBundle>) {
+    let cache = TAG_COVERAGE_CACHE.get_or_init(|| Mutex::new(TagCoverageCacheStore::default()));
+    let mut guard = match cache.lock() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    guard.insert(key, bundle);
+}
+
+fn tag_bit(idx: usize) -> u32 {
+    1u32 << idx
+}
+
+fn tag_coverage_index(tag: TagAtom) -> Option<usize> {
+    match tag {
+        TagAtom::TopPair { plus: false } => Some(TAG_IDX_TP),
+        TagAtom::TopPair { plus: true } => Some(TAG_IDX_TP_PLUS),
+        TagAtom::Overpair { plus: false } => Some(TAG_IDX_OVERPAIR),
+        TagAtom::Overpair { plus: true } => Some(TAG_IDX_OVERPAIR_PLUS),
+        TagAtom::TwoPair { plus: false } => Some(TAG_IDX_2P),
+        TagAtom::TwoPair { plus: true } => Some(TAG_IDX_2P_PLUS),
+        TagAtom::Set { plus: false } => Some(TAG_IDX_SET),
+        TagAtom::Set { plus: true } => Some(TAG_IDX_SET_PLUS),
+        TagAtom::Straight { plus: false } => Some(TAG_IDX_STRAIGHT),
+        TagAtom::Straight { plus: true } => Some(TAG_IDX_STRAIGHT_PLUS),
+        TagAtom::Flush { plus: false } => Some(TAG_IDX_FLUSH),
+        TagAtom::Flush { plus: true } => Some(TAG_IDX_FLUSH_PLUS),
+        TagAtom::FlushDraw => Some(TAG_IDX_FD),
+        TagAtom::StraightDraw { min_outs: 1 } => Some(TAG_IDX_SD),
+        TagAtom::StraightDraw { min_outs: 4 } => Some(TAG_IDX_SD4),
+        TagAtom::StraightDraw { min_outs: 8 } => Some(TAG_IDX_SD8),
+        TagAtom::StraightDraw { min_outs: 12 } => Some(TAG_IDX_SD12),
+        _ => None,
+    }
+}
+
+fn add_counts_from_mask(mut mask: u32, out: &mut [usize; TAG_COVERAGE_COUNT]) {
+    while mask != 0 {
+        let bit = mask.trailing_zeros() as usize;
+        if bit < TAG_COVERAGE_COUNT {
+            out[bit] = out[bit].saturating_add(1);
+        }
+        mask &= mask - 1;
+    }
+}
+
+fn core_tag_mask_for_coverage(core: [u8; 2], board: &[u8], is_holdem: bool) -> u32 {
+    if board.len() < 3 {
+        return 0;
+    }
+    let (made_flush, flush_draw) = core_flush_flags(core, board, is_holdem);
+    let straight_now = if is_holdem {
+        has_holdem_straight_by_ranks(&core, board)
+    } else {
+        has_omaha_core_straight(core, board)
+    };
+    let outs = if board.len() < 5 && !straight_now {
+        core_straight_outs(core, board, is_holdem)
+    } else {
+        0
+    };
+    let ready = evaluate_core_ready_state(core, board, is_holdem);
+
+    let mut mask = 0u32;
+    let is_top_pair = ready.class_id == 1 && ready.pair_rank == ready.top_board;
+    let is_top_pair_plus = ready.class_id == 1 && ready.pair_rank >= ready.top_board;
+
+    if is_top_pair {
+        mask |= tag_bit(TAG_IDX_TP);
+    }
+    if ready.class_id >= 2 || is_top_pair_plus {
+        mask |= tag_bit(TAG_IDX_TP_PLUS);
+    }
+
+    if is_holdem {
+        if ready.is_overpair {
+            mask |= tag_bit(TAG_IDX_OVERPAIR);
+        }
+        if ready.is_overpair || ready.class_id >= 2 {
+            mask |= tag_bit(TAG_IDX_OVERPAIR_PLUS);
+        }
+    }
+
+    if ready.class_id == 2 {
+        mask |= tag_bit(TAG_IDX_2P);
+    }
+    if ready.class_id >= 2 {
+        mask |= tag_bit(TAG_IDX_2P_PLUS);
+    }
+    if ready.class_id == 3 {
+        mask |= tag_bit(TAG_IDX_SET);
+    }
+    if ready.class_id >= 3 {
+        mask |= tag_bit(TAG_IDX_SET_PLUS);
+    }
+
+    if straight_now {
+        mask |= tag_bit(TAG_IDX_STRAIGHT);
+    }
+    if ready.class_id >= 4 {
+        mask |= tag_bit(TAG_IDX_STRAIGHT_PLUS);
+    }
+
+    if made_flush {
+        mask |= tag_bit(TAG_IDX_FLUSH);
+    }
+    if ready.class_id >= 5 {
+        mask |= tag_bit(TAG_IDX_FLUSH_PLUS);
+    }
+    if flush_draw {
+        mask |= tag_bit(TAG_IDX_FD);
+    }
+
+    if board.len() < 5 && !straight_now {
+        if outs >= 1 {
+            mask |= tag_bit(TAG_IDX_SD);
+        }
+        if outs >= 4 {
+            mask |= tag_bit(TAG_IDX_SD4);
+        }
+        if outs >= 8 {
+            mask |= tag_bit(TAG_IDX_SD8);
+        }
+        if outs >= 12 {
+            mask |= tag_bit(TAG_IDX_SD12);
+        }
+    }
+    mask
+}
+
+fn build_tag_coverage_bundle(variant: &str, hand_size: usize, board: &[u8]) -> TagCoverageBundle {
+    let base = base_deck(board, &[]);
+    let total = n_choose_k(base.len(), hand_size);
+    let is_holdem = variant == "holdem";
+
+    let mut pair_tag_masks = vec![0u32; CARD_COUNT * CARD_COUNT];
+    for i in 0..base.len() {
+        let c1 = base[i];
+        for j in (i + 1)..base.len() {
+            let c2 = base[j];
+            let mask = core_tag_mask_for_coverage([c1, c2], board, is_holdem);
+            let idx12 = c1 as usize * CARD_COUNT + c2 as usize;
+            let idx21 = c2 as usize * CARD_COUNT + c1 as usize;
+            pair_tag_masks[idx12] = mask;
+            pair_tag_masks[idx21] = mask;
+        }
+    }
+
+    let mut matched_by_tag = [0usize; TAG_COVERAGE_COUNT];
+    if hand_size == 2 {
+        for i in 0..base.len() {
+            let c1 = base[i];
+            for j in (i + 1)..base.len() {
+                let c2 = base[j];
+                let idx = c1 as usize * CARD_COUNT + c2 as usize;
+                add_counts_from_mask(pair_tag_masks[idx], &mut matched_by_tag);
+            }
+        }
+    } else {
+        enumerate_hands(&base, hand_size, |hand| {
+            let mut hand_mask = 0u32;
+            for i in 0..hand.len().saturating_sub(1) {
+                let row = hand[i] as usize * CARD_COUNT;
+                for j in (i + 1)..hand.len() {
+                    hand_mask |= pair_tag_masks[row + hand[j] as usize];
+                }
+            }
+            add_counts_from_mask(hand_mask, &mut matched_by_tag);
+        });
+    }
+
+    TagCoverageBundle {
+        base,
+        total,
+        matched_by_tag,
+        pair_tag_masks,
+    }
+}
+
+fn tag_coverage_bundle_for(variant: &str, hand_size: usize, board: &[u8]) -> Arc<TagCoverageBundle> {
+    let key = tag_coverage_cache_key(variant, board);
+    if let Some(cached) = tag_coverage_cache_get(&key) {
+        return cached;
+    }
+    let built = Arc::new(build_tag_coverage_bundle(variant, hand_size, board));
+    tag_coverage_cache_put(key, built.clone());
+    built
+}
+
+fn preview_tag_core_combos_from_bundle(bundle: &TagCoverageBundle, tag: TagAtom) -> Vec<String> {
+    let Some(idx) = tag_coverage_index(tag) else {
+        return Vec::new();
+    };
+    let target_bit = tag_bit(idx);
+    let use_suit = tag_uses_suit_labels(tag);
+    let mut labels = BTreeSet::<String>::new();
+    for i in 0..bundle.base.len() {
+        let c1 = bundle.base[i];
+        for j in (i + 1)..bundle.base.len() {
+            let c2 = bundle.base[j];
+            let mask = bundle.pair_tag_masks[c1 as usize * CARD_COUNT + c2 as usize];
+            if (mask & target_bit) == 0 {
+                continue;
+            }
+            let label = if use_suit {
+                core_suit_label(c1, c2)
+            } else {
+                core_rank_label(c1, c2)
+            };
+            labels.insert(label);
+        }
+    }
+    labels.into_iter().collect()
+}
+
+fn coverage_json(matched: usize, total: usize) -> Value {
+    json!({
+        "matched": matched,
+        "total": total,
+        "pct": if total > 0 { (matched as f64 * 100.0) / total as f64 } else { 0.0 },
+        "approx": false
+    })
+}
+
 fn estimate_coverage<F>(base: &[u8], hand_size: usize, total: usize, predicate: F) -> (usize, bool)
 where
     F: Fn(&[u8]) -> bool + Sync,
@@ -1345,12 +1730,60 @@ fn percentile_seed(variant: &str) -> u64 {
 
 static PERCENTILE_CACHE: OnceLock<Mutex<HashMap<String, Vec<f64>>>> = OnceLock::new();
 static SAMPLER_CACHE: OnceLock<Mutex<SamplerCacheStore>> = OnceLock::new();
+static TAG_COVERAGE_CACHE: OnceLock<Mutex<TagCoverageCacheStore>> = OnceLock::new();
 static PLAN_POOL_TOO_LARGE_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static EXACT_PERCENTILE_TABLES: OnceLock<
     Mutex<HashMap<String, HashMap<String, Arc<PercentileTable>>>>,
 > = OnceLock::new();
 static CHOOSE_52_TABLE: OnceLock<[[usize; 7]; 53]> = OnceLock::new();
 const SAMPLER_CACHE_MAX: usize = 96;
+
+#[derive(Clone)]
+struct TagCoverageBundle {
+    base: Vec<u8>,
+    total: usize,
+    matched_by_tag: [usize; TAG_COVERAGE_COUNT],
+    pair_tag_masks: Vec<u32>,
+}
+
+#[derive(Default)]
+struct TagCoverageCacheStore {
+    map: HashMap<String, Arc<TagCoverageBundle>>,
+    lru: VecDeque<String>,
+}
+
+impl TagCoverageCacheStore {
+    fn touch(&mut self, key: &str) {
+        if let Some(pos) = self.lru.iter().position(|k| k == key) {
+            self.lru.remove(pos);
+        }
+        self.lru.push_back(key.to_string());
+    }
+
+    fn get(&mut self, key: &str) -> Option<Arc<TagCoverageBundle>> {
+        let out = self.map.get(key).cloned();
+        if out.is_some() {
+            self.touch(key);
+        }
+        out
+    }
+
+    fn insert(&mut self, key: String, bundle: Arc<TagCoverageBundle>) {
+        if self.map.contains_key(&key) {
+            self.map.insert(key.clone(), bundle);
+            self.touch(&key);
+            return;
+        }
+        while self.map.len() >= TAG_COVERAGE_CACHE_MAX {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            self.map.remove(&oldest);
+        }
+        self.touch(&key);
+        self.map.insert(key, bundle);
+    }
+}
 
 fn plan_pool_too_large_contains(key: &str) -> bool {
     let cache = PLAN_POOL_TOO_LARGE_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
@@ -3166,38 +3599,6 @@ fn is_five_rank_straight(r1: u8, r2: u8, r3: u8, r4: u8, r5: u8) -> bool {
         }
     }
     seen[14] && seen[5] && seen[4] && seen[3] && seen[2]
-}
-
-fn preview_tag_core_combos(board: &[u8], variant: &str, tag: TagAtom) -> Vec<String> {
-    let is_holdem = variant == "holdem";
-    let use_suit = tag_uses_suit_labels(tag);
-    let mut blocked = [false; 52];
-    for c in board {
-        blocked[*c as usize] = true;
-    }
-
-    let mut labels = BTreeSet::<String>::new();
-    for c1 in 0u8..52u8 {
-        if blocked[c1 as usize] {
-            continue;
-        }
-        for c2 in (c1 + 1)..52u8 {
-            if blocked[c2 as usize] {
-                continue;
-            }
-            if !core_tag_match(tag, [c1, c2], board, is_holdem) {
-                continue;
-            }
-            let label = if use_suit {
-                core_suit_label(c1, c2)
-            } else {
-                core_rank_label(c1, c2)
-            };
-            labels.insert(label);
-        }
-    }
-
-    labels.into_iter().collect()
 }
 
 fn tag_uses_suit_labels(tag: TagAtom) -> bool {
