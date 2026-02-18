@@ -59,6 +59,26 @@ Optional:
 ./deploy/lxc/install.sh --no-nginx
 ```
 
+### One-command update
+After you push new changes to GitHub, run this on the LXC:
+
+```bash
+./deploy/lxc/update.sh
+```
+
+It will:
+- `git pull --ff-only` from your current branch
+- auto-detect your deployed port and nginx mode
+- rerun install/redeploy with those settings
+
+Optional:
+
+```bash
+./deploy/lxc/update.sh --no-pull
+./deploy/lxc/update.sh --branch master
+./deploy/lxc/update.sh --port 8080 --no-nginx
+```
+
 ### 1) Build and stage app files
 Run inside your LXC:
 
