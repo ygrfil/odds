@@ -1,5 +1,4 @@
 import { runSimulation } from "./engine.js";
-import { previewTagCoreCombos } from "./sim-core.js";
 import { extractNormalizedTags, splitTagToken } from "./tag-utils.js";
 import {
   normalizePercentileProfile,
@@ -29,6 +28,8 @@ const liveInfoState = {
   coverageByPlayer: new Map(),
   coverageReadyByPlayer: new Map()
 };
+const TAG_SHORTCUT_REMOTE_CACHE = new Map();
+const TAG_SHORTCUT_REMOTE_INFLIGHT = new Map();
 
 const el = {
   variant: document.querySelector("#variant"),
@@ -98,19 +99,85 @@ function tagHintText(tagToken) {
   return TAG_BASE_HINTS[tagInfo.base] || "";
 }
 
-function tagShortcutPreviewText(tagToken, boardText, variant, maxItems = 24) {
+function canUseBackendPreview() {
+  if (typeof fetch !== "function") return false;
+  const proto = String(window?.location?.protocol || "");
+  return proto.startsWith("http");
+}
+
+function cacheSetBounded(map, key, value, maxSize = 2000) {
+  map.set(key, value);
+  if (map.size > maxSize) map.clear();
+}
+
+async function fetchTagShortcutPayload(tagToken, boardText, variant) {
+  const normalizedTag = String(tagToken || "").trim().toLowerCase();
+  const boardKey = String(boardText || "").trim();
+  const cacheKey = `${variant}|${boardKey}|${normalizedTag}`;
+  if (TAG_SHORTCUT_REMOTE_CACHE.has(cacheKey)) return TAG_SHORTCUT_REMOTE_CACHE.get(cacheKey);
+  if (TAG_SHORTCUT_REMOTE_INFLIGHT.has(cacheKey)) return TAG_SHORTCUT_REMOTE_INFLIGHT.get(cacheKey);
+
+  const inflight = (async () => {
+    if (!canUseBackendPreview()) return { status: "helper-unavailable", combos: [] };
+    let res;
+    try {
+      res = await fetch("/api/sim/preview/tag", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          boardText: boardKey,
+          variant,
+          tag: normalizedTag
+        })
+      });
+    } catch {
+      return { status: "helper-unavailable", combos: [] };
+    }
+    if (!res.ok) {
+      if (res.status === 404 || res.status === 405) return { status: "helper-unavailable", combos: [] };
+      return { status: "invalid-board", combos: [] };
+    }
+    let payload = null;
+    try {
+      payload = await res.json();
+    } catch {
+      return { status: "invalid-board", combos: [] };
+    }
+    if (!payload || payload.ok === false) return { status: "invalid-board", combos: [] };
+    const combos = Array.isArray(payload.combos)
+      ? payload.combos.map((c) => String(c || "").trim()).filter(Boolean)
+      : [];
+    return { status: "ok", combos };
+  })();
+
+  TAG_SHORTCUT_REMOTE_INFLIGHT.set(cacheKey, inflight);
+  try {
+    const out = await inflight;
+    cacheSetBounded(TAG_SHORTCUT_REMOTE_CACHE, cacheKey, out, 3000);
+    return out;
+  } finally {
+    const current = TAG_SHORTCUT_REMOTE_INFLIGHT.get(cacheKey);
+    if (current === inflight) TAG_SHORTCUT_REMOTE_INFLIGHT.delete(cacheKey);
+  }
+}
+
+function shortcutTextFromPayload(payload, maxItems = 24) {
+  if (!payload || typeof payload !== "object") return "invalid board";
+  if (payload.status === "helper-unavailable") return "helper unavailable";
+  if (payload.status !== "ok") return "invalid board";
+  const combos = Array.isArray(payload.combos) ? payload.combos : [];
+  if (!combos.length) return "-";
+  const shown = combos.slice(0, maxItems).join(",");
+  const tail = combos.length > maxItems ? ",..." : "";
+  return `${shown}${tail}`;
+}
+
+async function tagShortcutPreviewText(tagToken, boardText, variant, maxItems = 24) {
   const boardLen = Math.floor(String(boardText || "").replace(/\s+/g, "").length / 2);
   if (boardLen < 3) return "needs flop+";
   if (boardLen > 5) return "invalid board";
-  try {
-    const combos = previewTagCoreCombos(boardText, variant, tagToken);
-    if (!Array.isArray(combos) || combos.length === 0) return "-";
-    const shown = combos.slice(0, maxItems).join(",");
-    const tail = combos.length > maxItems ? ",..." : "";
-    return `${shown}${tail}`;
-  } catch {
-    return "invalid board";
-  }
+  const payload = await fetchTagShortcutPayload(tagToken, boardText, variant);
+  return shortcutTextFromPayload(payload, maxItems);
 }
 
 const PRECISION_PRESETS = {
@@ -167,17 +234,58 @@ function syncOrderingProfileControl() {
   el.orderingProfile.title = percentileProfileLabel(normalized);
 }
 
-function rangeTagHints(rangeText, variant, boardText = "", showShortcuts = false) {
+function rangeTagHints(rangeText, variant) {
   const uniq = extractNormalizedTags(rangeText).filter((t) => !!tagHintText(t));
   if (!uniq.length) return "";
-  const gameRule = variant === "holdem"
-    ? "Game rule: Hold'em hand evaluation can use any 5-card combination."
-    : "Game rule: Omaha hand evaluation always uses exactly 2 hole cards + 3 board cards.";
-  const plusRule = "Tip: use '+' only on ready-hand tags (@tp, @overpair, @2p, @set, @s, @f) to include stronger made hands.";
-  const lines = uniq.map((t) => showShortcuts
-    ? `${t}: ${tagShortcutPreviewText(t, boardText, variant)}`
-    : `${t}: ${tagHintText(t)}`);
-  return `${lines.join("\n")}\n${plusRule}\n${gameRule}`;
+  const lines = uniq.map((t) => `${t}: ${tagHintText(t)}`);
+  return lines.join("\n");
+}
+
+async function rangeTagHintsWithShortcuts(rangeText, variant, boardText = "") {
+  const uniq = extractNormalizedTags(rangeText).filter((t) => !!tagHintText(t));
+  if (!uniq.length) return { text: "", comboText: "" };
+  const comboSet = new Set();
+  const lines = [];
+  for (const tag of uniq) {
+    const payload = await fetchTagShortcutPayload(tag, boardText, variant);
+    const lineText = shortcutTextFromPayload(payload, 24);
+    lines.push(`${tag}: ${lineText}`);
+    if (payload?.status === "ok" && Array.isArray(payload.combos)) {
+      for (const combo of payload.combos) comboSet.add(combo);
+    }
+  }
+  return {
+    text: lines.join("\n"),
+    comboText: [...comboSet].join(",")
+  };
+}
+
+async function copyTextToClipboard(text) {
+  const value = String(text || "");
+  if (!value) return false;
+  try {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch {
+    // fallback below
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = value;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return !!ok;
+  } catch {
+    return false;
+  }
 }
 
 function renderLiveInfo(node, parts) {
@@ -511,14 +619,23 @@ function renderPlayers() {
       document.querySelectorAll(".tag-hint-popover").forEach((n) => n.remove());
       document.querySelectorAll(".tag-hint[aria-expanded='true']").forEach((n) => n.setAttribute("aria-expanded", "false"));
       if (existing) return;
-      const help = rangeTagHints(p.range, el.variant.value, el.board.value.trim(), true);
-
       const pop = document.createElement("div");
       pop.className = "tag-hint-popover";
-      pop.textContent = help || "No @tag used in this range.";
+      pop.textContent = "Loading tag structures...";
       pop.addEventListener("click", (e) => e.stopPropagation());
       row.appendChild(pop);
       hint.setAttribute("aria-expanded", "true");
+      (async () => {
+        try {
+          const out = await rangeTagHintsWithShortcuts(p.range, el.variant.value, el.board.value.trim());
+          await copyTextToClipboard(out.comboText);
+          if (!row.contains(pop)) return;
+          pop.textContent = out.text || "No @tag used in this range.";
+        } catch {
+          if (!row.contains(pop)) return;
+          pop.textContent = rangeTagHints(p.range, el.variant.value) || "No @tag used in this range.";
+        }
+      })();
     });
     main.appendChild(hint);
     row.appendChild(main);
