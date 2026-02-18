@@ -9,6 +9,7 @@ ENV_DIR="/etc/odds"
 SERVICE_PATH="/etc/systemd/system/${APP_NAME}.service"
 NGINX_SITE="/etc/nginx/sites-available/${APP_NAME}"
 NGINX_LINK="/etc/nginx/sites-enabled/${APP_NAME}"
+UPDATE_ALIAS_PATH="/usr/local/bin/odds-update"
 
 PORT="8789"
 DOMAIN="_"
@@ -269,6 +270,14 @@ if [[ "${ENABLE_NGINX}" == "true" ]]; then
     die "failed to reload nginx"
   fi
 fi
+
+log "Installing global update command at ${UPDATE_ALIAS_PATH}"
+$SUDO tee "${UPDATE_ALIAS_PATH}" >/dev/null <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "${REPO_DIR}/deploy/lxc/update.sh" --repo-dir "${REPO_DIR}" "\$@"
+EOF
+$SUDO chmod 755 "${UPDATE_ALIAS_PATH}"
 
 log "Checking health endpoint"
 healthy="false"

@@ -79,6 +79,12 @@ Optional:
 ./deploy/lxc/update.sh --port 8080 --no-nginx
 ```
 
+The installer also creates a global alias command:
+
+```bash
+odds-update
+```
+
 ### 1) Build and stage app files
 Run inside your LXC:
 
