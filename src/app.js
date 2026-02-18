@@ -603,24 +603,7 @@ async function run() {
         backendTotalMs: Number(t.totalMs || 0),
         backendPrepareMs: Number(t.prepareMs || 0),
         backendSimMs: Number(t.nativeMs || 0),
-        backendInitMs: Math.max(0, Number(t.totalMs || 0) - Number(t.prepareMs || 0) - Number(t.nativeMs || 0)),
-        bridgeWallMs: Number(t.bridgeWallMs || 0),
-        bridgeOverheadMs: Number(t.bridgeOverheadMs || 0),
-        ensureMs: Number(t.ensureMs || 0),
-        ensureSourceHashMs: Number(t.ensureSourceHashMs || 0),
-        ensureStampCheckMs: Number(t.ensureStampCheckMs || 0),
-        ensureCargoCleanMs: Number(t.ensureCargoCleanMs || 0),
-        ensureCargoBuildMs: Number(t.ensureCargoBuildMs || 0),
-        ensureStampWriteMs: Number(t.ensureStampWriteMs || 0),
-        ensureCacheHit: !!t.ensureCacheHit,
-        ensureRebuilt: !!t.ensureRebuilt,
-        nativeCommandMs: Number(t.nativeCommandMs || 0),
-        nativeCommandPayloadMs: Number(t.nativeCommandPayloadMs || 0),
-        nativeCommandProcessMs: Number(t.nativeCommandProcessMs || 0),
-        nativeCommandParseMs: Number(t.nativeCommandParseMs || 0),
-        nativeCommandStdinBytes: Number(t.nativeCommandStdinBytes || 0),
-        nativeCommandStdoutBytes: Number(t.nativeCommandStdoutBytes || 0),
-        preparePlayersMs: Array.isArray(t.preparePlayersMs) ? t.preparePlayersMs.map((v) => Number(v || 0)) : []
+        backendInitMs: Math.max(0, Number(t.totalMs || 0) - Number(t.prepareMs || 0) - Number(t.nativeMs || 0))
       });
     }
     state.lastResult = result;

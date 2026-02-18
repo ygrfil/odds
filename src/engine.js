@@ -57,25 +57,6 @@ async function runSimulationBackend(config, onProgress, signal) {
       prepareMs: Number(payload?.timings?.prepareMs || 0),
       nativeMs: Number(payload?.timings?.nativeMs || 0),
       totalMs: Number(payload?.timings?.totalMs || 0),
-      preparePlayersMs: Array.isArray(payload?.timings?.preparePlayersMs)
-        ? payload.timings.preparePlayersMs.map((v) => Number(v || 0))
-        : [],
-      ensureMs: Number(payload?.timings?.ensureMs || 0),
-      ensureSourceHashMs: Number(payload?.timings?.ensureSourceHashMs || 0),
-      ensureStampCheckMs: Number(payload?.timings?.ensureStampCheckMs || 0),
-      ensureCargoCleanMs: Number(payload?.timings?.ensureCargoCleanMs || 0),
-      ensureCargoBuildMs: Number(payload?.timings?.ensureCargoBuildMs || 0),
-      ensureStampWriteMs: Number(payload?.timings?.ensureStampWriteMs || 0),
-      ensureCacheHit: !!payload?.timings?.ensureCacheHit,
-      ensureRebuilt: !!payload?.timings?.ensureRebuilt,
-      nativeCommandMs: Number(payload?.timings?.nativeCommandMs || 0),
-      nativeCommandPayloadMs: Number(payload?.timings?.nativeCommandPayloadMs || 0),
-      nativeCommandProcessMs: Number(payload?.timings?.nativeCommandProcessMs || 0),
-      nativeCommandParseMs: Number(payload?.timings?.nativeCommandParseMs || 0),
-      nativeCommandStdinBytes: Number(payload?.timings?.nativeCommandStdinBytes || 0),
-      nativeCommandStdoutBytes: Number(payload?.timings?.nativeCommandStdoutBytes || 0),
-      bridgeWallMs: Number(payload?.timings?.bridgeWallMs || 0),
-      bridgeOverheadMs: Number(payload?.timings?.bridgeOverheadMs || 0),
       wallMs
     };
     result.backend = true;

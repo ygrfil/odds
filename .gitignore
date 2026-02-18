@@ -1,3 +1,2 @@
 .DS_Store
-backend-rs-native/target/
-native-sim/target/
+target/
