@@ -98,14 +98,25 @@ fi
 
 log "Installing OS packages"
 $SUDO apt-get update
-$SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  build-essential \
-  pkg-config \
-  libssl-dev \
-  ca-certificates \
-  curl \
-  git \
-  nginx
+if [[ -n "${SUDO}" ]]; then
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    curl \
+    git \
+    nginx
+else
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    curl \
+    git \
+    nginx
+fi
 
 log "Installing/updating Rust stable toolchain for build user"
 run_build_user '
