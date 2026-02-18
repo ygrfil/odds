@@ -12,6 +12,7 @@ Environment=PORT=8789
 Environment=HOST=127.0.0.1
 Environment=RUST_LOG=odds=info,tower_http=warn
 Environment=PREWARM_PERCENTILES=true
+Environment=PREWARM_PERCENTILES_BLOCKING=false
 ExecStart=/opt/odds/odds
 Restart=on-failure
 RestartSec=3

@@ -135,6 +135,27 @@ Then open `http://<LXC_IP>/index.html`.
 - `APP_STATIC_ROOT` (default current working directory)
 - `RUST_LOG` (default `odds=info,tower_http=info`)
 - `PREWARM_PERCENTILES` (default `true`)
+- `PREWARM_PERCENTILES_BLOCKING` (default `false`, when `true` warms tables before accepting traffic)
+
+## Benchmark
+Run repeatable local benchmarks (startup, percentile cold/warm latency, sim API, static transfer):
+
+```bash
+chmod +x scripts/bench.sh
+./scripts/bench.sh
+```
+
+Optional overrides:
+
+```bash
+RUNS=10 ITER_CAP=300000 PORT_BASE=9100 ./scripts/bench.sh
+```
+
+Compare two benchmark summaries:
+
+```bash
+./scripts/bench.sh compare /path/to/before/summary.json /path/to/after/summary.json
+```
 
 ## Project layout
 - `backend-rs-native/`: Axum server + API handlers

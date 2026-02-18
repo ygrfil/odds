@@ -174,6 +174,7 @@ $SUDO install -d -m 755 "${ENV_DIR}"
 $SUDO tee "${ENV_DIR}/${APP_NAME}.env" >/dev/null <<EOF
 RUST_LOG=odds=info,tower_http=warn
 PREWARM_PERCENTILES=true
+PREWARM_PERCENTILES_BLOCKING=false
 EOF
 $SUDO chmod 640 "${ENV_DIR}/${APP_NAME}.env"
 

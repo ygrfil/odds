@@ -1,4 +1,7 @@
-use axum::http::StatusCode;
+use axum::extract::Request;
+use axum::http::{header::CACHE_CONTROL, HeaderValue, Method, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rand::rngs::SmallRng;
@@ -12,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
+use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -297,16 +301,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    // Warm percentile tables once so first simulation prep stays fast.
-    let prewarm = std::env::var("PREWARM_PERCENTILES")
-        .ok()
-        .map(|v| {
-            let t = v.trim().to_ascii_lowercase();
-            !(t == "0" || t == "false" || t == "off" || t == "no")
-        })
-        .unwrap_or(true);
+    // Warm percentile tables to reduce first-percentile request latency.
+    // By default this runs in the background so server startup stays fast.
+    let prewarm = env_flag("PREWARM_PERCENTILES", true);
+    let prewarm_blocking = env_flag("PREWARM_PERCENTILES_BLOCKING", false);
     if prewarm {
-        prewarm_percentile_tables();
+        if prewarm_blocking {
+            let started = Instant::now();
+            prewarm_percentile_tables();
+            info!(
+                "percentile prewarm completed in {:.1} ms (blocking)",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        } else {
+            tokio::task::spawn_blocking(|| {
+                let started = Instant::now();
+                prewarm_percentile_tables();
+                info!(
+                    "percentile prewarm completed in {:.1} ms (background)",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            });
+        }
     }
 
     let static_root = resolve_static_root()?;
@@ -323,6 +339,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/sim/preview/tags", post(sim_preview_tags))
         .route("/api/sim/preview/range", post(sim_preview_range))
         .fallback_service(ServeDir::new(static_root.clone()))
+        .layer(middleware::from_fn(static_cache_headers))
+        .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http());
 
     let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
@@ -339,11 +357,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let t = v.trim().to_ascii_lowercase();
+            !(t == "0" || t == "false" || t == "off" || t == "no")
+        })
+        .unwrap_or(default)
+}
+
 fn resolve_static_root() -> Result<PathBuf, std::io::Error> {
     match std::env::var("APP_STATIC_ROOT") {
         Ok(value) => Ok(PathBuf::from(value)),
         Err(_) => std::env::current_dir(),
     }
+}
+
+async fn static_cache_headers(req: Request, next: Next) -> Response {
+    let is_get_or_head = *req.method() == Method::GET || *req.method() == Method::HEAD;
+    let path = req.uri().path().to_string();
+    let is_api = path.starts_with("/api/");
+
+    let mut res = next.run(req).await;
+
+    if !is_get_or_head || is_api || !res.status().is_success() {
+        return res;
+    }
+
+    let headers = res.headers_mut();
+    if path == "/" || path.ends_with(".html") {
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        return res;
+    }
+
+    if path.starts_with("/src/percentile-tables") && path.ends_with(".js") {
+        headers.insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+        return res;
+    }
+
+    if path.ends_with(".js")
+        || path.ends_with(".mjs")
+        || path.ends_with(".css")
+        || path.ends_with(".wasm")
+        || path.ends_with(".svg")
+        || path.ends_with(".ico")
+    {
+        headers.insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=86400"),
+        );
+    }
+    res
 }
 
 async fn shutdown_signal() {
