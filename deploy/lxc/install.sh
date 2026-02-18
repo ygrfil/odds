@@ -109,24 +109,22 @@ fi
 
 log "Installing OS packages"
 $SUDO apt-get update
+apt_packages=(
+  build-essential
+  pkg-config
+  libssl-dev
+  ca-certificates
+  curl
+  git
+)
+if [[ "${ENABLE_NGINX}" == "true" ]]; then
+  apt_packages+=(nginx)
+fi
+
 if [[ -n "${SUDO}" ]]; then
-  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    build-essential \
-    pkg-config \
-    libssl-dev \
-    ca-certificates \
-    curl \
-    git \
-    nginx
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y "${apt_packages[@]}"
 else
-  DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    build-essential \
-    pkg-config \
-    libssl-dev \
-    ca-certificates \
-    curl \
-    git \
-    nginx
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "${apt_packages[@]}"
 fi
 
 log "Installing/updating Rust stable toolchain for build user"
@@ -178,6 +176,17 @@ PREWARM_PERCENTILES=true
 EOF
 $SUDO chmod 640 "${ENV_DIR}/${APP_NAME}.env"
 
+if [[ "${ENABLE_NGINX}" == "false" ]] && command -v ss >/dev/null 2>&1; then
+  if ss -ltn "( sport = :${PORT} )" | tail -n +2 | grep -q .; then
+    die "port ${PORT} is already in use. Stop the service using that port or choose a different --port."
+  fi
+fi
+
+CAP_NET_BIND_LINES=""
+if (( PORT < 1024 )); then
+  CAP_NET_BIND_LINES=$'AmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE'
+fi
+
 log "Installing systemd service"
 $SUDO tee "${SERVICE_PATH}" >/dev/null <<EOF
 [Unit]
@@ -198,6 +207,7 @@ ExecStart=${APP_DIR}/odds
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
+${CAP_NET_BIND_LINES}
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
