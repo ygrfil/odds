@@ -928,6 +928,52 @@ async function ensurePercentilesLoadedForExpr(expr, variant, options = {}) {
   await ensurePercentileTableLoaded(variant, options?.percentileProfile);
 }
 
+function validateAtomSyntax(rawAtom, variant) {
+  let atom = expandShortcuts(stripSpaces(rawAtom), variant);
+  if (!atom || atom === "*") return;
+
+  const weightedSuffix = atom.match(/@([0-9]{1,3})$/);
+  if (weightedSuffix) atom = atom.slice(0, atom.length - weightedSuffix[0].length);
+  if (!atom || atom === "*") return;
+
+  const lowAtom = atom.toLowerCase();
+  if (normalizeTagToken(lowAtom)) return;
+
+  const PCT_TOKEN_RE = "(?:100(?:\\.0+)?|[0-9]{1,2}(?:\\.[0-9]+)?)";
+  if (new RegExp(`^(${PCT_TOKEN_RE})%-(${PCT_TOKEN_RE})%$`).test(atom)) return;
+  if (new RegExp(`^(${PCT_TOKEN_RE})%$`).test(atom)) return;
+
+  const expanded = expandSpan(atom);
+  for (const leaf of expanded) parseLeafSpecs(leaf);
+}
+
+function walkAstForSyntax(ast, variant) {
+  if (!ast || typeof ast !== "object") return;
+  if (ast.kind === "atom") {
+    validateAtomSyntax(ast.value, variant);
+    return;
+  }
+  walkAstForSyntax(ast.left, variant);
+  walkAstForSyntax(ast.right, variant);
+}
+
+export function validateRangeSyntax(rawExpr, variant) {
+  const expr = expandExprMacros(stripSpaces(rawExpr || "*"));
+  if (!expr || expr === "*") return { ok: true };
+  try {
+    const tokens = tokenizeExpr(expr);
+    const ast = parser(tokens);
+    walkAstForSyntax(ast, variant);
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err?.message || String(err),
+      expression: expr
+    };
+  }
+}
+
 export function compileRange(rawExpr, variant, boardCards = [], options = {}) {
   const expr = expandExprMacros(stripSpaces(rawExpr || "*"));
   if (!expr) {

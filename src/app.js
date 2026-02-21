@@ -1,4 +1,5 @@
 import { runSimulation } from "./engine.js";
+import { validateRangeSyntax } from "./parser.js";
 import { extractNormalizedTags, splitTagToken } from "./tag-utils.js";
 import {
   normalizePercentileProfile,
@@ -37,6 +38,7 @@ const el = {
   orderingProfile: document.querySelector("#orderingProfile"),
   board: document.querySelector("#board"),
   dead: document.querySelector("#dead"),
+  boardPretty: document.querySelector("#boardPretty"),
   addPlayer: document.querySelector("#addPlayer"),
   removePlayer: document.querySelector("#removePlayer"),
   players: document.querySelector("#players"),
@@ -49,9 +51,30 @@ const el = {
   helpModal: document.querySelector("#helpModal"),
   exportSetup: document.querySelector("#exportSetup"),
   importSetup: document.querySelector("#importSetup"),
+  clearAll: document.querySelector("#clearAll"),
   importFile: document.querySelector("#importFile"),
   rangePicks: document.querySelector("#rangePicks")
 };
+const uiState = {
+  rangeInputsByPlayer: new Map(),
+  refreshByPlayer: new Map()
+};
+const validationPreviewState = {
+  timers: new Map(),
+  requestSeqByPlayer: new Map()
+};
+const SUIT_SYMBOLS = Object.freeze({
+  c: "♣",
+  d: "♦",
+  h: "♥",
+  s: "♠"
+});
+const SUIT_SYMBOL_CLASSES = Object.freeze({
+  "♣": "suit-club",
+  "♦": "suit-diamond",
+  "♥": "suit-heart",
+  "♠": "suit-spade"
+});
 
 const quickPicks = [
   { label: "Top Pair", token: "@tp", group: "ready" },
@@ -68,6 +91,26 @@ const quickPicks = [
   { label: "Single Suited", token: "$ss", group: "macro" },
   { label: "No Pair", token: "$np", group: "macro" }
 ];
+const autocompleteEntries = [
+  { token: "@2p", description: "Two-pair board-core structures." },
+  { token: "@set", description: "Set/trips core structures." },
+  { token: "@tp", description: "Top-pair board-core structures." },
+  { token: "@overpair", description: "Pocket overpair (Hold'em)." },
+  { token: "@f", description: "Flush core structures." },
+  { token: "@s", description: "Straight core structures." },
+  { token: "@fd", description: "Flush draw structures." },
+  { token: "@sd", description: "Straight draw (1+ outs)." },
+  { token: "@sd8", description: "Straight draw (8+ outs)." },
+  { token: "@sd12", description: "Straight draw (12+ outs)." },
+  { token: "$ds", description: "Double suited filter." },
+  { token: "$ss", description: "Single suited filter." },
+  { token: "$np", description: "No-pair rank structure." },
+  { token: "$op", description: "One-pair rank structure." },
+  { token: "$tp", description: "Two-pair rank structure." },
+  { token: "15%", description: "Top 15% by selected ordering." },
+  { token: "30%-50%", description: "Percentile slice." }
+];
+const tokenRegexCache = new Map();
 
 const TAG_BASE_HINTS = {
   "@tp": "Top-pair core structure (with any side cards). In Omaha this can include stronger made hands when side cards improve the result.",
@@ -91,6 +134,520 @@ const TAG_PLUS_HINTS = {
   "@s": "Straight structures plus stronger made-hand structures.",
   "@f": "Flush structures plus stronger made-hand structures."
 };
+
+function escapeRegex(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function standaloneTokenRegex(token, global = false) {
+  const normalized = String(token || "").trim().toLowerCase();
+  const key = `${normalized}|${global ? "g" : "s"}`;
+  if (tokenRegexCache.has(key)) return tokenRegexCache.get(key);
+  const pattern = `(^|[,:!(])${escapeRegex(normalized)}(?=$|[,:)!])`;
+  const re = new RegExp(pattern, global ? "gi" : "i");
+  tokenRegexCache.set(key, re);
+  return re;
+}
+
+function tokenizeRangeExpressionLoose(expr) {
+  const tokens = [];
+  let atom = "";
+  let bracketDepth = 0;
+  for (let i = 0; i < expr.length; i++) {
+    const ch = expr[i];
+    if (ch === "[") {
+      bracketDepth++;
+      atom += ch;
+      continue;
+    }
+    if (ch === "]") {
+      atom += ch;
+      if (bracketDepth > 0) bracketDepth--;
+      continue;
+    }
+    if (bracketDepth === 0 && [",", ":", "!", "(", ")", "&"].includes(ch)) {
+      if (atom) {
+        tokens.push({ type: "atom", value: atom });
+        atom = "";
+      }
+      tokens.push({ type: ch === "&" ? ":" : ch, value: ch });
+      continue;
+    }
+    atom += ch;
+  }
+  if (atom) tokens.push({ type: "atom", value: atom });
+  return tokens;
+}
+
+function normalizeRangeAtom(atomText) {
+  const atom = String(atomText || "");
+  let out = "";
+  let i = 0;
+  while (i < atom.length) {
+    const ch = atom[i];
+    if (ch === "@") {
+      let j = i + 1;
+      while (j < atom.length && /[a-z0-9_+]/i.test(atom[j])) j++;
+      out += atom.slice(i, j).toLowerCase();
+      i = j;
+      continue;
+    }
+    if (ch === "$") {
+      let j = i + 1;
+      while (j < atom.length && /[a-z0-9]/i.test(atom[j])) j++;
+      out += atom.slice(i, j).toLowerCase();
+      i = j;
+      continue;
+    }
+    if (/[akqjtron]/i.test(ch)) {
+      out += ch.toUpperCase();
+      i++;
+      continue;
+    }
+    if (/[cdhsxyzw]/i.test(ch)) {
+      out += ch.toLowerCase();
+      i++;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+function normalizeRangeText(rangeText) {
+  const compact = String(rangeText || "").replace(/\s+/g, "");
+  if (!compact || compact === "*") return "*";
+
+  const tokens = tokenizeRangeExpressionLoose(compact);
+  const out = [];
+  let expectAtom = true;
+  let openParens = 0;
+
+  for (const token of tokens) {
+    if (token.type === "atom") {
+      const atom = normalizeRangeAtom(token.value);
+      if (!atom) continue;
+      if (!expectAtom) out.push(",");
+      out.push(atom);
+      expectAtom = false;
+      continue;
+    }
+    if (token.type === "(") {
+      if (!expectAtom) out.push(",");
+      out.push("(");
+      openParens++;
+      expectAtom = true;
+      continue;
+    }
+    if (token.type === ")") {
+      if (expectAtom || openParens <= 0) continue;
+      out.push(")");
+      openParens--;
+      expectAtom = false;
+      continue;
+    }
+    if (expectAtom) continue;
+    out.push(token.type);
+    expectAtom = true;
+  }
+
+  while (out.length) {
+    const tail = out[out.length - 1];
+    if (![",", ":", "!", "("].includes(tail)) break;
+    out.pop();
+    if (tail === "(" && openParens > 0) openParens--;
+  }
+  while (out.length && [",", ":", "!"].includes(out[0])) out.shift();
+  while (openParens > 0 && !expectAtom) {
+    out.push(")");
+    openParens--;
+  }
+
+  return out.join("") || "*";
+}
+
+function normalizeRangeTextForTyping(rangeText) {
+  const compact = String(rangeText || "").replace(/\s+/g, "");
+  if (!compact) return "";
+  const tailMatch = compact.match(/[,:!(]+$/);
+  const tail = tailMatch ? tailMatch[0] : "";
+  if (!tail) return normalizeRangeText(compact);
+  const coreRaw = compact.slice(0, compact.length - tail.length);
+  const normalizedCore = coreRaw ? normalizeRangeText(coreRaw) : "";
+  const base = normalizedCore === "*" ? "" : normalizedCore;
+  return `${base}${tail}`;
+}
+
+function withSuitSymbols(rawText) {
+  return String(rawText || "").replace(/([2-9TJQKA])([cdhs])/gi, (_m, rank, suit) => {
+    const symbol = SUIT_SYMBOLS[String(suit || "").toLowerCase()];
+    if (!symbol) return `${String(rank || "").toUpperCase()}${String(suit || "").toLowerCase()}`;
+    return `${String(rank || "").toUpperCase()}${symbol}`;
+  });
+}
+
+function setSuitStyledText(node, text) {
+  if (!node) return;
+  const src = String(text || "");
+  if (!src) {
+    node.textContent = "";
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  let chunk = "";
+  const flushChunk = () => {
+    if (!chunk) return;
+    fragment.appendChild(document.createTextNode(chunk));
+    chunk = "";
+  };
+
+  for (const ch of src) {
+    const suitClass = SUIT_SYMBOL_CLASSES[ch];
+    if (!suitClass) {
+      chunk += ch;
+      continue;
+    }
+    flushChunk();
+    const span = document.createElement("span");
+    span.className = `suit-symbol ${suitClass}`;
+    span.textContent = ch;
+    fragment.appendChild(span);
+  }
+  flushChunk();
+  node.replaceChildren(fragment);
+}
+
+function cardsPrettyLine(rawText, label) {
+  const compact = String(rawText || "").replace(/\s+/g, "");
+  if (!compact) return `${label}: -`;
+  let out = [];
+  let i = 0;
+  while (i + 1 < compact.length) {
+    const rank = compact[i].toUpperCase();
+    const suit = compact[i + 1].toLowerCase();
+    if (!/[2-9TJQKA]/.test(rank) || !SUIT_SYMBOLS[suit]) return `${label}: ${withSuitSymbols(compact)}`;
+    out.push(`${rank}${SUIT_SYMBOLS[suit]}`);
+    i += 2;
+  }
+  if (i < compact.length) out.push(`${compact[i].toUpperCase()}_`);
+  return `${label}: ${out.join(" ") || "-"}`;
+}
+
+function updateBoardPrettyPreview() {
+  if (el.boardPretty) setSuitStyledText(el.boardPretty, cardsPrettyLine(el.board.value, "Board"));
+}
+
+function handSizeForVariant(variant) {
+  const v = String(variant || "").toLowerCase();
+  if (v === "holdem") return 2;
+  if (v === "plo4") return 4;
+  if (v === "plo5") return 5;
+  return 6;
+}
+
+function parseCardsText(rawText) {
+  const compact = String(rawText || "").replace(/\s+/g, "");
+  if (!compact) return { cards: [], invalid: false };
+  const m = compact.match(/[2-9TJQKA][cdhs]/gi);
+  if (!m || m.join("").toLowerCase() !== compact.toLowerCase()) {
+    return { cards: [], invalid: true };
+  }
+  return { cards: m.map((x) => `${x[0].toUpperCase()}${x[1].toLowerCase()}`), invalid: false };
+}
+
+function exactCardsFromRange(rangeText, variant) {
+  const compact = String(rangeText || "").replace(/\s+/g, "");
+  if (!compact || compact === "*") return null;
+  if (/[,:!()@%$\[\]{}+\-]/.test(compact)) return null;
+  const parsed = parseCardsText(compact);
+  if (parsed.invalid) return null;
+  if (parsed.cards.length !== handSizeForVariant(variant)) return null;
+  return parsed.cards;
+}
+
+function prettyCard(cardText) {
+  return withSuitSymbols(String(cardText || ""));
+}
+
+function isRankChar(ch) {
+  return /[2-9TJQKA]/i.test(ch);
+}
+
+function isSuitChar(ch) {
+  return /[cdhs]/i.test(ch);
+}
+
+function isExplicitCardRun(text) {
+  const run = String(text || "");
+  if (!run || run.length % 2 !== 0) return false;
+  for (let i = 0; i < run.length; i += 2) {
+    if (!isRankChar(run[i]) || !isSuitChar(run[i + 1])) return false;
+  }
+  return true;
+}
+
+function prettyRangeDisplayText(rangeText) {
+  const src = String(rangeText || "").trim();
+  if (!src) return "";
+  let out = "";
+  let i = 0;
+  while (i < src.length) {
+    const ch = src[i];
+    if (/[2-9TJQKAcdhs]/i.test(ch)) {
+      let j = i + 1;
+      while (j < src.length && /[2-9TJQKAcdhs]/i.test(src[j])) j++;
+      const run = src.slice(i, j);
+      if (isExplicitCardRun(run)) {
+        for (let k = 0; k < run.length; k += 2) {
+          const rank = run[k].toUpperCase();
+          const suit = run[k + 1].toLowerCase();
+          out += `${rank}${SUIT_SYMBOLS[suit] || suit}`;
+        }
+      } else {
+        out += run;
+      }
+      i = j;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+function rangeConflictMessage(playerIndex, rangeText, variant, boardText, deadText) {
+  const selfExact = exactCardsFromRange(rangeText, variant);
+  if (!selfExact || !selfExact.length) return "";
+
+  const selfSet = new Set();
+  for (const card of selfExact) {
+    if (selfSet.has(card)) return `Duplicate exact card ${prettyCard(card)} in this range.`;
+    selfSet.add(card);
+  }
+
+  const board = parseCardsText(boardText);
+  if (!board.invalid) {
+    const boardSet = new Set(board.cards);
+    for (const card of selfExact) {
+      if (boardSet.has(card)) return `Exact card ${prettyCard(card)} conflicts with board.`;
+    }
+  }
+
+  const dead = parseCardsText(deadText);
+  if (!dead.invalid) {
+    const deadSet = new Set(dead.cards);
+    for (const card of selfExact) {
+      if (deadSet.has(card)) return `Exact card ${prettyCard(card)} conflicts with dead cards.`;
+    }
+  }
+
+  for (let i = 0; i < state.players.length; i++) {
+    if (i === playerIndex) continue;
+    const otherExact = exactCardsFromRange(state.players[i]?.range || "", variant);
+    if (!otherExact || !otherExact.length) continue;
+    const otherSet = new Set(otherExact);
+    for (const card of selfExact) {
+      if (otherSet.has(card)) {
+        return `Exact card ${prettyCard(card)} overlaps with P${i + 1} range.`;
+      }
+    }
+  }
+
+  return "";
+}
+
+function rangeHasStandaloneToken(rangeText, token) {
+  const compact = String(rangeText || "").replace(/\s+/g, "");
+  if (!compact || compact === "*") return false;
+  const re = standaloneTokenRegex(token, false);
+  re.lastIndex = 0;
+  return re.test(compact);
+}
+
+function removeStandaloneToken(rangeText, token) {
+  const compact = String(rangeText || "").replace(/\s+/g, "");
+  if (!compact || compact === "*") return "*";
+  const stripped = compact.replace(standaloneTokenRegex(token, true), "$1");
+  return normalizeRangeText(stripped);
+}
+
+function lastNonSpaceChar(text) {
+  for (let i = text.length - 1; i >= 0; i--) {
+    if (text[i] !== " ") return text[i];
+  }
+  return "";
+}
+
+function firstNonSpaceChar(text) {
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== " ") return text[i];
+  }
+  return "";
+}
+
+function insertTokenAtCursor(rangeText, token, start, end) {
+  const text = String(rangeText || "");
+  const safeStart = Number.isFinite(start) ? Math.max(0, Math.min(text.length, start)) : text.length;
+  const safeEnd = Number.isFinite(end) ? Math.max(safeStart, Math.min(text.length, end)) : safeStart;
+  const left = text.slice(0, safeStart);
+  const right = text.slice(safeEnd);
+  const prev = lastNonSpaceChar(left);
+  const next = firstNonSpaceChar(right);
+  const needsBefore = !!left.trim() && !["(", ",", ":", "!"].includes(prev);
+  const needsAfter = !!right.trim() && ![")", ",", ":", "!"].includes(next);
+  const inserted = `${needsBefore ? "," : ""}${token}${needsAfter ? "," : ""}`;
+  const value = `${left}${inserted}${right}`;
+  const cursor = left.length + (needsBefore ? 1 : 0) + token.length;
+  return { value, cursor };
+}
+
+function syntaxFeedback(rangeText, variant) {
+  const syntax = validateRangeSyntax(rangeText, variant);
+  if (syntax.ok) return { ok: true, message: "" };
+  const msg = String(syntax.error || "Syntax error");
+  const unexpectedLeaf = msg.match(/^Unexpected token '([^']+)' in (.+)$/);
+  if (unexpectedLeaf) {
+    return { ok: false, message: `Unexpected token '${unexpectedLeaf[1]}' in '${unexpectedLeaf[2]}'.` };
+  }
+  if (/Missing '\)'/.test(msg)) return { ok: false, message: "Missing ')' in expression." };
+  if (/Expected range atom/.test(msg)) return { ok: false, message: "Expected range atom after an operator." };
+  if (/Unexpected trailing expression/.test(msg)) return { ok: false, message: "Unexpected trailing expression." };
+  return { ok: false, message: msg };
+}
+
+function setValidationNodeText(node, text, mode = "ok") {
+  setSuitStyledText(node, String(text || ""));
+  node.classList.remove("is-error", "is-ok", "is-loading");
+  if (mode === "error") node.classList.add("is-error");
+  else if (mode === "loading") node.classList.add("is-loading");
+  else node.classList.add("is-ok");
+}
+
+function boardCardCount(boardText) {
+  return Math.floor(String(boardText || "").replace(/\s+/g, "").length / 2);
+}
+
+function pruneValidationPreviewState() {
+  const maxPlayers = state.players.length;
+  for (const [idx, timer] of validationPreviewState.timers.entries()) {
+    if (idx >= maxPlayers) {
+      clearTimeout(timer);
+      validationPreviewState.timers.delete(idx);
+    }
+  }
+  for (const idx of validationPreviewState.requestSeqByPlayer.keys()) {
+    if (idx >= maxPlayers) validationPreviewState.requestSeqByPlayer.delete(idx);
+  }
+}
+
+function queueValidationPreview(playerIndex, node, hint, rangeText, variant, boardText, deadText, immediate = false) {
+  const nextSeq = (validationPreviewState.requestSeqByPlayer.get(playerIndex) || 0) + 1;
+  validationPreviewState.requestSeqByPlayer.set(playerIndex, nextSeq);
+
+  const prevTimer = validationPreviewState.timers.get(playerIndex);
+  if (prevTimer) clearTimeout(prevTimer);
+  validationPreviewState.timers.delete(playerIndex);
+
+  const feedback = syntaxFeedback(rangeText, variant);
+  hint.classList.toggle("is-valid", feedback.ok);
+  hint.classList.toggle("is-error", !feedback.ok);
+  hint.classList.remove("is-empty");
+  if (!feedback.ok) {
+    setValidationNodeText(node, feedback.message, "error");
+    return;
+  }
+
+  const conflict = rangeConflictMessage(playerIndex, rangeText, variant, boardText, deadText);
+  if (conflict) {
+    setValidationNodeText(node, conflict, "error");
+    hint.classList.remove("is-valid");
+    hint.classList.add("is-error");
+    return;
+  }
+
+  const tags = extractNormalizedTags(rangeText).filter((t) => !!tagHintText(t));
+  if (!tags.length) {
+    const fallback = prettyRangeDisplayText(rangeText);
+    setValidationNodeText(node, fallback || "-", "ok");
+    return;
+  }
+  const boardLen = boardCardCount(boardText);
+  if (boardLen < 3) {
+    setValidationNodeText(node, "Combos need flop+ board.", "ok");
+    return;
+  }
+  if (boardLen > 5) {
+    setValidationNodeText(node, "Invalid board input.", "error");
+    return;
+  }
+
+  setValidationNodeText(node, "Loading combos...", "loading");
+  const delay = immediate ? 0 : 140;
+  const timer = setTimeout(async () => {
+    try {
+      const lines = [];
+      for (const tag of tags) {
+        const payload = await fetchTagShortcutPayload(tag, boardText, variant);
+        const lineText = shortcutTextFromPayload(payload, 18);
+        lines.push(`${tag}: ${lineText}`);
+      }
+      if (validationPreviewState.requestSeqByPlayer.get(playerIndex) !== nextSeq) return;
+      setValidationNodeText(node, lines.join(" | "), "ok");
+    } catch {
+      if (validationPreviewState.requestSeqByPlayer.get(playerIndex) !== nextSeq) return;
+      setValidationNodeText(node, "Unable to load combos.", "error");
+    } finally {
+      const active = validationPreviewState.timers.get(playerIndex);
+      if (active === timer) validationPreviewState.timers.delete(playerIndex);
+    }
+  }, delay);
+
+  validationPreviewState.timers.set(playerIndex, timer);
+}
+
+function autocompleteMatches(fragment) {
+  const part = String(fragment || "").trim().toLowerCase();
+  if (!part) return [];
+  if (!/^[@$%0-9]/.test(part)) return [];
+  const exactPrefix = autocompleteEntries.filter((x) => x.token.toLowerCase().startsWith(part));
+  if (exactPrefix.length) return exactPrefix.slice(0, 8);
+  if (part === "%" || /^[0-9]+$/.test(part)) {
+    return autocompleteEntries.filter((x) => x.token.includes("%")).slice(0, 4);
+  }
+  return autocompleteEntries.filter((x) => x.token.toLowerCase().includes(part)).slice(0, 8);
+}
+
+function cursorFragment(input) {
+  const text = String(input?.value || "");
+  const end = Number.isFinite(input?.selectionStart) ? input.selectionStart : text.length;
+  let start = end;
+  while (start > 0) {
+    const ch = text[start - 1];
+    if (/[,:!()\s]/.test(ch)) break;
+    start--;
+  }
+  return {
+    start,
+    end,
+    fragment: text.slice(start, end)
+  };
+}
+
+function refreshQuickPickStates() {
+  const idx = Math.max(0, Math.min(state.players.length - 1, state.focusedPlayer));
+  const rangeText = String(state.players[idx]?.range || "");
+  el.rangePicks.querySelectorAll("button[data-token]").forEach((button) => {
+    const token = String(button.dataset.token || "").toLowerCase();
+    const isActive = token ? rangeHasStandaloneToken(rangeText, token) : false;
+    button.classList.toggle("is-active", isActive);
+  });
+}
+
+function setFocusedPlayer(index) {
+  state.focusedPlayer = Math.max(0, Math.min(state.players.length - 1, Number(index) || 0));
+  refreshQuickPickStates();
+}
 
 function tagHintText(tagToken) {
   const tagInfo = splitTagToken(tagToken);
@@ -167,7 +724,7 @@ function shortcutTextFromPayload(payload, maxItems = 24) {
   if (payload.status !== "ok") return "invalid board";
   const combos = Array.isArray(payload.combos) ? payload.combos : [];
   if (!combos.length) return "-";
-  const shown = combos.slice(0, maxItems).join(",");
+  const shown = combos.slice(0, maxItems).map((c) => withSuitSymbols(c)).join(", ");
   const tail = combos.length > maxItems ? ",..." : "";
   return `${shown}${tail}`;
 }
@@ -438,6 +995,7 @@ function loadLocal() {
   } catch {
     // ignore corrupt local storage
   }
+  updateBoardPrettyPreview();
 }
 
 function renderQuickPicks() {
@@ -454,20 +1012,50 @@ function renderQuickPicks() {
     const b = document.createElement("button");
     b.type = "button";
     b.textContent = p.label;
+    b.dataset.token = String(p.token || "").toLowerCase();
     if (p.group) b.classList.add(`pick-${p.group}`);
     b.addEventListener("click", () => applyQuickPick(p.token));
     el.rangePicks.appendChild(b);
   }
+  refreshQuickPickStates();
 }
 
 function applyQuickPick(token) {
   const idx = Math.max(0, Math.min(state.players.length - 1, state.focusedPlayer));
   const player = state.players[idx];
   if (!player) return;
-  const current = String(player.range || "").trim();
-  if (!current || current === "*") player.range = token;
-  else player.range = `${current},${token}`;
-  renderPlayers();
+  const tokenText = String(token || "").trim();
+  if (!tokenText) return;
+
+  const input = uiState.rangeInputsByPlayer.get(idx);
+  const refresh = uiState.refreshByPlayer.get(idx);
+  const current = String(player.range || "");
+
+  let nextRange;
+  let nextCursor = null;
+  if (rangeHasStandaloneToken(current, tokenText)) {
+    nextRange = removeStandaloneToken(current, tokenText);
+    const prevCursor = Number.isFinite(input?.selectionStart) ? input.selectionStart : String(current).length;
+    nextCursor = Math.max(0, Math.min(String(nextRange || "").length, prevCursor));
+  } else if (input && document.activeElement === input) {
+    const insertion = insertTokenAtCursor(current, tokenText, input.selectionStart, input.selectionEnd);
+    nextRange = normalizeRangeText(insertion.value);
+    nextCursor = Math.max(0, Math.min(nextRange.length, insertion.cursor));
+  } else {
+    const base = normalizeRangeText(current);
+    nextRange = normalizeRangeText(base === "*" ? tokenText : `${base},${tokenText}`);
+    nextCursor = nextRange.length;
+  }
+
+  player.range = nextRange || "*";
+  if (input) {
+    input.value = player.range;
+    input.focus();
+    const pos = Number.isFinite(nextCursor) ? nextCursor : player.range.length;
+    input.setSelectionRange(pos, pos);
+  }
+  if (refresh) refresh(true);
+  else renderPlayers();
   saveLocal();
 }
 
@@ -585,6 +1173,12 @@ async function collectRangeCoverageSnapshot(config, signal) {
 function renderPlayers() {
   el.players.innerHTML = "";
   liveInfoState.nodeByPlayer.clear();
+  uiState.rangeInputsByPlayer.clear();
+  uiState.refreshByPlayer.clear();
+  for (const timer of validationPreviewState.timers.values()) clearTimeout(timer);
+  validationPreviewState.timers.clear();
+  validationPreviewState.requestSeqByPlayer.clear();
+  if (state.focusedPlayer >= state.players.length) state.focusedPlayer = Math.max(0, state.players.length - 1);
   const results = state.lastResult?.players || [];
 
   state.players.forEach((p, i) => {
@@ -604,11 +1198,13 @@ function renderPlayers() {
     range.value = p.range;
     range.placeholder = "Range syntax, e.g. AA,AK$s,15%";
     range.addEventListener("focus", () => {
-      state.focusedPlayer = i;
+      setFocusedPlayer(i);
     });
+    uiState.rangeInputsByPlayer.set(i, range);
 
     main.appendChild(tag);
     main.appendChild(range);
+
     const hint = document.createElement("button");
     hint.type = "button";
     hint.className = "tag-hint";
@@ -622,7 +1218,7 @@ function renderPlayers() {
       if (existing) return;
       const pop = document.createElement("div");
       pop.className = "tag-hint-popover";
-      pop.textContent = "Loading tag structures...";
+      setSuitStyledText(pop, "Loading tag structures...");
       pop.addEventListener("click", (e) => e.stopPropagation());
       row.appendChild(pop);
       hint.setAttribute("aria-expanded", "true");
@@ -631,34 +1227,189 @@ function renderPlayers() {
           const out = await rangeTagHintsWithShortcuts(p.range, el.variant.value, el.board.value.trim());
           await copyTextToClipboard(out.comboText);
           if (!row.contains(pop)) return;
-          pop.textContent = out.text || "No @tag used in this range.";
+          setSuitStyledText(pop, out.text || "No @tag used in this range.");
         } catch {
           if (!row.contains(pop)) return;
-          pop.textContent = rangeTagHints(p.range, el.variant.value) || "No @tag used in this range.";
+          setSuitStyledText(pop, rangeTagHints(p.range, el.variant.value) || "No @tag used in this range.");
         }
       })();
     });
     main.appendChild(hint);
     row.appendChild(main);
+
+    const auto = document.createElement("div");
+    auto.className = "range-autocomplete hidden";
+    row.appendChild(auto);
+
+    const validation = document.createElement("div");
+    validation.className = "player-validation";
+    row.appendChild(validation);
+
     const info = document.createElement("div");
     info.className = "player-live-note";
     row.appendChild(info);
     liveInfoState.nodeByPlayer.set(i, info);
-    const refreshDerived = (immediate = false) => {
-      const h = rangeTagHints(p.range, el.variant.value);
-      hint.classList.toggle("is-empty", !h);
-      queueLiveInfoUpdate(i, p.range, immediate);
+
+    let autoItems = [];
+    let autoActive = 0;
+    let activeFragment = { start: 0, end: 0, fragment: "" };
+
+    const closeAutocomplete = () => {
+      autoItems = [];
+      autoActive = 0;
+      auto.classList.add("hidden");
+      auto.innerHTML = "";
     };
-    range.addEventListener("input", () => {
-      p.range = range.value;
+
+    const paintAutocomplete = () => {
+      if (!autoItems.length) {
+        closeAutocomplete();
+        return;
+      }
+      auto.innerHTML = "";
+      autoItems.forEach((entry, idx) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "range-autocomplete-item";
+        if (idx === autoActive) button.classList.add("is-active");
+
+        const tokenNode = document.createElement("span");
+        tokenNode.className = "auto-token";
+        tokenNode.textContent = entry.token;
+        const descNode = document.createElement("span");
+        descNode.className = "auto-desc";
+        descNode.textContent = entry.description;
+
+        button.appendChild(tokenNode);
+        button.appendChild(descNode);
+        button.addEventListener("mousedown", (event) => {
+          event.preventDefault();
+        });
+        button.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          autoActive = idx;
+          const before = range.value.slice(0, activeFragment.start);
+          const after = range.value.slice(activeFragment.end);
+          const next = `${before}${entry.token}${after}`;
+          p.range = normalizeRangeText(next);
+          range.value = p.range;
+          const cursorPos = Math.max(0, Math.min(p.range.length, before.length + entry.token.length));
+          range.focus();
+          range.setSelectionRange(cursorPos, cursorPos);
+          closeAutocomplete();
+          saveLocal();
+          refreshDerived(false);
+        });
+        auto.appendChild(button);
+      });
+      auto.classList.remove("hidden");
+    };
+
+    const refreshAutocomplete = () => {
+      activeFragment = cursorFragment(range);
+      const matches = autocompleteMatches(activeFragment.fragment);
+      if (!matches.length) {
+        closeAutocomplete();
+        return;
+      }
+      autoItems = matches;
+      if (autoActive >= autoItems.length) autoActive = 0;
+      paintAutocomplete();
+    };
+
+    const refreshDerived = (immediate = false) => {
+      queueValidationPreview(i, validation, hint, p.range, el.variant.value, el.board.value.trim(), el.dead.value.trim(), immediate);
+      queueLiveInfoUpdate(i, p.range, immediate);
+      refreshQuickPickStates();
+    };
+    uiState.refreshByPlayer.set(i, refreshDerived);
+
+    range.addEventListener("input", (event) => {
+      let nextValue = range.value;
+      const inserted = typeof event?.data === "string" ? event.data : "";
+      const isDelimiterTyped = inserted.includes(",") || inserted.includes(" ");
+      if (isDelimiterTyped) {
+        const cursorAtEnd = Number.isFinite(range.selectionStart)
+          && Number.isFinite(range.selectionEnd)
+          && range.selectionStart === range.selectionEnd
+          && range.selectionEnd === nextValue.length;
+        if (cursorAtEnd) {
+          const normalizedTyping = normalizeRangeTextForTyping(nextValue);
+          if (normalizedTyping !== nextValue) {
+            nextValue = normalizedTyping;
+            range.value = nextValue;
+            range.setSelectionRange(nextValue.length, nextValue.length);
+          }
+        } else if (inserted.includes(" ")) {
+          const compact = nextValue.replace(/\s+/g, "");
+          if (compact !== nextValue) {
+            nextValue = compact;
+            range.value = nextValue;
+          }
+        }
+      }
+      p.range = nextValue;
       saveLocal();
       refreshDerived(false);
+      refreshAutocomplete();
+    });
+    range.addEventListener("click", refreshAutocomplete);
+    range.addEventListener("keyup", (event) => {
+      if (["ArrowUp", "ArrowDown", "Enter", "Escape"].includes(event.key)) return;
+      refreshAutocomplete();
+    });
+    range.addEventListener("keydown", (event) => {
+      const isOpen = !auto.classList.contains("hidden") && autoItems.length > 0;
+      if (!isOpen) return;
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        autoActive = (autoActive + 1) % autoItems.length;
+        paintAutocomplete();
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        autoActive = (autoActive - 1 + autoItems.length) % autoItems.length;
+        paintAutocomplete();
+        return;
+      }
+      if (event.key === "Enter") {
+        event.preventDefault();
+        const before = range.value.slice(0, activeFragment.start);
+        const after = range.value.slice(activeFragment.end);
+        const chosen = autoItems[autoActive];
+        const next = `${before}${chosen.token}${after}`;
+        p.range = normalizeRangeText(next);
+        range.value = p.range;
+        const cursorPos = Math.max(0, Math.min(p.range.length, before.length + chosen.token.length));
+        range.setSelectionRange(cursorPos, cursorPos);
+        closeAutocomplete();
+        saveLocal();
+        refreshDerived(false);
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeAutocomplete();
+      }
+    });
+    range.addEventListener("blur", () => {
+      setTimeout(() => closeAutocomplete(), 120);
+      const normalizedFinal = normalizeRangeText(range.value);
+      if (normalizedFinal === range.value) return;
+      p.range = normalizedFinal;
+      range.value = normalizedFinal;
+      saveLocal();
+      refreshDerived(true);
     });
     refreshDerived(false);
     row.appendChild(playerOutputRow(results[i], i, results));
     el.players.appendChild(row);
   });
   pruneLiveInfoState();
+  pruneValidationPreviewState();
+  refreshQuickPickStates();
 }
 
 function currentConfig() {
@@ -755,6 +1506,22 @@ function stopRun() {
   setStatus("Stopping...");
 }
 
+function clearAllFields() {
+  if (state.isRunning) return;
+  el.board.value = "";
+  el.dead.value = "";
+  state.lastResult = null;
+  state.players = state.players.map((p, i) => ({
+    name: p.name || `P${i + 1}`,
+    range: "*"
+  }));
+  renderSummary(state.lastResult);
+  renderPlayers();
+  updateBoardPrettyPreview();
+  saveLocal();
+  setStatus("Cleared board, dead cards, ranges, and results.");
+}
+
 function exportSetup() {
   const payload = {
     version: 1,
@@ -789,6 +1556,7 @@ function importSetup(file) {
       syncOrderingProfileControl();
       el.board.value = setup.board || "";
       el.dead.value = setup.dead || "";
+      updateBoardPrettyPreview();
       state.players = setup.players.slice(0, 6).map((p, i) => ({
         name: p.name || `P${i + 1}`,
         range: p.range || "*"
@@ -807,9 +1575,13 @@ function importSetup(file) {
 }
 
 function wire() {
-  document.addEventListener("click", () => {
+  document.addEventListener("click", (event) => {
     document.querySelectorAll(".tag-hint-popover").forEach((n) => n.remove());
     document.querySelectorAll(".tag-hint[aria-expanded='true']").forEach((n) => n.setAttribute("aria-expanded", "false"));
+    const target = event.target;
+    const keepAutocomplete = !!(target instanceof Element && target.closest(".player-range-input, .range-autocomplete"));
+    if (keepAutocomplete) return;
+    document.querySelectorAll(".range-autocomplete").forEach((n) => n.classList.add("hidden"));
   });
 
   el.addPlayer.addEventListener("click", () => {
@@ -836,6 +1608,7 @@ function wire() {
 
   el.run.addEventListener("click", run);
   el.stop.addEventListener("click", stopRun);
+  if (el.clearAll) el.clearAll.addEventListener("click", clearAllFields);
   el.helpOpen.addEventListener("click", openHelp);
   el.helpClose.addEventListener("click", closeHelp);
   el.helpModal.addEventListener("click", (event) => {
@@ -857,6 +1630,7 @@ function wire() {
     if (!node) return;
     node.addEventListener("input", saveLocal);
   });
+  el.board.addEventListener("input", updateBoardPrettyPreview);
   el.variant.addEventListener("change", () => {
     syncOrderingProfileControl();
     saveLocal();
@@ -870,10 +1644,12 @@ function wire() {
     });
   }
   el.board.addEventListener("input", renderPlayers);
+  el.dead.addEventListener("input", renderPlayers);
 }
 
 loadLocal();
 syncOrderingProfileControl();
+updateBoardPrettyPreview();
 initLiveInfoWorker();
 renderQuickPicks();
 renderSummary(state.lastResult);
