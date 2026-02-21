@@ -255,6 +255,7 @@ const EXACT_PLAN_POOL_LIMIT_PLO4: usize = 180_000;
 const EXACT_PLAN_POOL_LIMIT_PLO5: usize = 260_000;
 const CARD_COUNT: usize = 52;
 const TAG_COVERAGE_CACHE_MAX: usize = 192;
+const TAG_EXPR_COVERAGE_CACHE_MAX: usize = 384;
 const TAG_COVERAGE_TOKEN_ORDER: [&str; 17] = [
     "@tp",
     "@tp+",
@@ -274,7 +275,6 @@ const TAG_COVERAGE_TOKEN_ORDER: [&str; 17] = [
     "@sd8",
     "@sd12",
 ];
-const TAG_COVERAGE_COUNT: usize = TAG_COVERAGE_TOKEN_ORDER.len();
 const TAG_IDX_TP: usize = 0;
 const TAG_IDX_TP_PLUS: usize = 1;
 const TAG_IDX_OVERPAIR: usize = 2;
@@ -292,6 +292,8 @@ const TAG_IDX_SD: usize = 13;
 const TAG_IDX_SD4: usize = 14;
 const TAG_IDX_SD8: usize = 15;
 const TAG_IDX_SD12: usize = 16;
+const TAG_STRAIGHT_DRAW_MASK: u32 =
+    (1u32 << TAG_IDX_SD) | (1u32 << TAG_IDX_SD4) | (1u32 << TAG_IDX_SD8) | (1u32 << TAG_IDX_SD12);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -508,6 +510,7 @@ async fn sim_preview_tag(Json(req): Json<PreviewTagRequest>) -> (StatusCode, Jso
             Json(json!({ "ok": true, "combos": [], "coverage": empty })),
         );
     }
+    let total_cov = n_choose_k(base_deck(&board, &[]).len(), hand_size);
 
     let tag = match normalize_tag_token(&req.tag) {
         Some(t) => t,
@@ -522,8 +525,10 @@ async fn sim_preview_tag(Json(req): Json<PreviewTagRequest>) -> (StatusCode, Jso
 
     let cov_variant = variant.clone();
     let cov_board = board.clone();
-    let bundle = match tokio::task::spawn_blocking(move || {
-        tag_coverage_bundle_for(&cov_variant, hand_size, &cov_board)
+    let (combos, matched) = match tokio::task::spawn_blocking(move || {
+        let combos = tag_shortcut_labels_for(&cov_variant, hand_size, &cov_board, tag);
+        let matched = tag_alias_coverage_for(&cov_variant, hand_size, &cov_board, tag);
+        (combos, matched)
     })
     .await
     {
@@ -531,15 +536,11 @@ async fn sim_preview_tag(Json(req): Json<PreviewTagRequest>) -> (StatusCode, Jso
         Err(e) => {
             return error_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("preview tag bundle task failed: {e}"),
+                &format!("preview tag task failed: {e}"),
             )
         }
     };
-    let combos = preview_tag_core_combos_from_bundle(&bundle, tag);
-    let matched = tag_coverage_index(tag)
-        .and_then(|idx| bundle.matched_by_tag.get(idx).copied())
-        .unwrap_or(0);
-    let coverage = coverage_json(matched, bundle.total);
+    let coverage = coverage_json(matched, total_cov);
     (
         StatusCode::OK,
         Json(json!({ "ok": true, "combos": combos, "coverage": coverage })),
@@ -571,11 +572,19 @@ async fn sim_preview_tags(Json(req): Json<PreviewTagsRequest>) -> (StatusCode, J
             })),
         );
     }
+    let total_cov = n_choose_k(base_deck(&board, &[]).len(), hand_size);
 
     let cov_variant = variant.clone();
     let cov_board = board.clone();
-    let bundle = match tokio::task::spawn_blocking(move || {
-        tag_coverage_bundle_for(&cov_variant, hand_size, &cov_board)
+    let matched_by_tag = match tokio::task::spawn_blocking(move || {
+        let mut matched = Vec::<usize>::with_capacity(TAG_COVERAGE_TOKEN_ORDER.len());
+        for raw_tag in TAG_COVERAGE_TOKEN_ORDER {
+            let v = normalize_tag_token(raw_tag)
+                .map(|tag| tag_alias_coverage_for(&cov_variant, hand_size, &cov_board, tag))
+                .unwrap_or(0);
+            matched.push(v);
+        }
+        matched
     })
     .await
     {
@@ -583,20 +592,20 @@ async fn sim_preview_tags(Json(req): Json<PreviewTagsRequest>) -> (StatusCode, J
         Err(e) => {
             return error_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("preview tags bundle task failed: {e}"),
+                &format!("preview tags task failed: {e}"),
             )
         }
     };
 
     for (idx, tag) in TAG_COVERAGE_TOKEN_ORDER.iter().enumerate() {
-        let matched = bundle.matched_by_tag.get(idx).copied().unwrap_or(0);
-        coverage_by_tag.insert((*tag).to_string(), coverage_json(matched, bundle.total));
+        let matched = matched_by_tag.get(idx).copied().unwrap_or(0);
+        coverage_by_tag.insert((*tag).to_string(), coverage_json(matched, total_cov));
     }
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
-            "total": bundle.total,
+            "total": total_cov,
             "coverageByTag": coverage_by_tag
         })),
     )
@@ -625,51 +634,12 @@ async fn sim_preview_range(Json(req): Json<PreviewRangeRequest>) -> (StatusCode,
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect::<String>();
-    if let Some(tag) = normalize_tag_token(&range_compact) {
-        let profile_norm = normalize_percentile_profile(
-            &variant,
-            req.percentile_profile.as_deref().unwrap_or_default(),
-        );
-        let sampler = NativePlayerReq {
-            mode: "plan".to_string(),
-            hand_size,
-            pool: None,
-            plan: Some(native_sim::PlanNodeReq::Tag {
-                tag: plan_tag_from_atom(tag),
-            }),
-            weight_pct: None,
-        };
-        let cache_key =
-            sampler_cache_key(&variant, hand_size, &board, &[], range_text, &profile_norm);
-        sampler_cache_put(cache_key, &sampler);
-
-        let cov_variant = variant.clone();
-        let cov_board = board.clone();
-        let bundle = match tokio::task::spawn_blocking(move || {
-            tag_coverage_bundle_for(&cov_variant, hand_size, &cov_board)
-        })
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                return error_json(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("preview pure-tag task failed: {e}"),
-                )
-            }
-        };
-        let matched = tag_coverage_index(tag)
-            .and_then(|idx| bundle.matched_by_tag.get(idx).copied())
-            .unwrap_or(0);
-        let out = coverage_json(matched, bundle.total);
-        return (StatusCode::OK, Json(json!({ "ok": true, "coverage": out })));
-    }
 
     let profile_norm = normalize_percentile_profile(
         &variant,
         req.percentile_profile.as_deref().unwrap_or_default(),
     );
-    let compiled = match compile_range_expr(
+    let compiled_raw = match compile_range_expr(
         range_text,
         &variant,
         hand_size,
@@ -686,6 +656,10 @@ async fn sim_preview_range(Json(req): Json<PreviewRangeRequest>) -> (StatusCode,
             );
         }
     };
+    let compiled = CompiledRangeExpr {
+        expr: rewrite_expr_tags_to_shortcuts(&compiled_raw.expr, &variant, hand_size, &board),
+        weight_pct: compiled_raw.weight_pct,
+    };
 
     cache_sampler_from_preview(
         &variant,
@@ -698,6 +672,45 @@ async fn sim_preview_range(Json(req): Json<PreviewRangeRequest>) -> (StatusCode,
 
     if is_any_expr(&compiled.expr) {
         let out = json!({ "matched": total, "total": total, "pct": 100, "approx": false });
+        return (StatusCode::OK, Json(json!({ "ok": true, "coverage": out })));
+    }
+
+    if is_tag_only_expr(&compiled.expr) {
+        let cache_key = tag_expr_coverage_cache_key(&variant, hand_size, &board, &range_compact);
+        if let Some(matched) = tag_expr_coverage_cache_get(&cache_key) {
+            let out = json!({
+                "matched": matched,
+                "total": total,
+                "pct": if total > 0 { (matched as f64 * 100.0) / total as f64 } else { 0.0 },
+                "approx": false
+            });
+            return (StatusCode::OK, Json(json!({ "ok": true, "coverage": out })));
+        }
+
+        let cov_variant = variant.clone();
+        let cov_board = board.clone();
+        let cov_expr = compiled.expr.clone();
+        let matched = match tokio::task::spawn_blocking(move || {
+            estimate_tag_expr_coverage(&cov_variant, hand_size, &cov_board, &cov_expr)
+        })
+        .await
+        {
+            Ok(Some(v)) => v,
+            Ok(None) => 0,
+            Err(e) => {
+                return error_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("preview tag-expr coverage task failed: {e}"),
+                )
+            }
+        };
+        tag_expr_coverage_cache_put(cache_key, matched);
+        let out = json!({
+            "matched": matched,
+            "total": total,
+            "pct": if total > 0 { (matched as f64 * 100.0) / total as f64 } else { 0.0 },
+            "approx": false
+        });
         return (StatusCode::OK, Json(json!({ "ok": true, "coverage": out })));
     }
 
@@ -805,7 +818,11 @@ fn build_sampler_for_range(
         }
     }
 
-    let compiled = compile_range_expr(range, variant, hand_size, percentile_profile)?;
+    let compiled_raw = compile_range_expr(range, variant, hand_size, percentile_profile)?;
+    let compiled = CompiledRangeExpr {
+        expr: rewrite_expr_tags_to_shortcuts(&compiled_raw.expr, variant, hand_size, board),
+        weight_pct: compiled_raw.weight_pct,
+    };
     let expr = &compiled.expr;
     let weight_pct = compiled.weight_pct;
     if weight_pct == 0 {
@@ -827,7 +844,11 @@ fn build_sampler_for_range(
     }
 
     if let Some(plan) = range_expr_to_plan(expr) {
-        let limit = exact_plan_pool_limit(variant);
+        let limit = if is_tag_only_expr(expr) && !is_single_tag_expr(expr) {
+            0
+        } else {
+            exact_plan_pool_limit_for_expr(variant, expr)
+        };
         if limit > 0 {
             let base = base_deck(board, dead);
             match collect_exact_pool_with_limit(&base, hand_size, board, expr, limit) {
@@ -905,6 +926,27 @@ fn exact_plan_pool_limit(variant: &str) -> usize {
         "plo5" => EXACT_PLAN_POOL_LIMIT_PLO5,
         _ => 0,
     }
+}
+
+fn exact_plan_pool_limit_for_expr(variant: &str, expr: &RangeExpr) -> usize {
+    let base = exact_plan_pool_limit(variant);
+    if base == 0 {
+        return 0;
+    }
+
+    if variant != "holdem" {
+        if let RangeExpr::Atom(RangeAtom::Tag(TagAtom::StraightDraw { min_outs })) = expr {
+            if *min_outs >= 8 {
+                return match variant {
+                    "plo4" => base.max(260_000),
+                    "plo5" => base.max(560_000),
+                    _ => base,
+                };
+            }
+        }
+    }
+
+    base
 }
 
 fn collect_exact_pool_with_limit(
@@ -1463,6 +1505,38 @@ fn tag_coverage_cache_put(key: String, bundle: Arc<TagCoverageBundle>) {
     guard.insert(key, bundle);
 }
 
+fn tag_expr_coverage_cache_key(
+    variant: &str,
+    hand_size: usize,
+    board: &[u8],
+    expr_norm: &str,
+) -> String {
+    let mut board_sorted = board.to_vec();
+    board_sorted.sort_unstable();
+    format!(
+        "{variant}|h:{hand_size}|b:{}|e:{}",
+        cards_key(&board_sorted),
+        expr_norm.to_lowercase()
+    )
+}
+
+fn tag_expr_coverage_cache_get(key: &str) -> Option<usize> {
+    let cache =
+        TAG_EXPR_COVERAGE_CACHE.get_or_init(|| Mutex::new(TagExprCoverageCacheStore::default()));
+    let mut guard = cache.lock().ok()?;
+    guard.get(key)
+}
+
+fn tag_expr_coverage_cache_put(key: String, matched: usize) {
+    let cache =
+        TAG_EXPR_COVERAGE_CACHE.get_or_init(|| Mutex::new(TagExprCoverageCacheStore::default()));
+    let mut guard = match cache.lock() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    guard.insert(key, matched);
+}
+
 fn tag_bit(idx: usize) -> u32 {
     1u32 << idx
 }
@@ -1490,14 +1564,72 @@ fn tag_coverage_index(tag: TagAtom) -> Option<usize> {
     }
 }
 
-fn add_counts_from_mask(mut mask: u32, out: &mut [usize; TAG_COVERAGE_COUNT]) {
-    while mask != 0 {
-        let bit = mask.trailing_zeros() as usize;
-        if bit < TAG_COVERAGE_COUNT {
-            out[bit] = out[bit].saturating_add(1);
-        }
-        mask &= mask - 1;
+fn straight_draw_bits_for_outs(outs: u8) -> u32 {
+    let mut bits = 0u32;
+    if outs >= 1 {
+        bits |= tag_bit(TAG_IDX_SD);
     }
+    if outs >= 4 {
+        bits |= tag_bit(TAG_IDX_SD4);
+    }
+    if outs >= 8 {
+        bits |= tag_bit(TAG_IDX_SD8);
+    }
+    if outs >= 12 {
+        bits |= tag_bit(TAG_IDX_SD12);
+    }
+    bits
+}
+
+fn outs_from_rank_mask(rank_mask: u16, used_rank_count: &[u8; 15]) -> u8 {
+    let mut outs = 0u8;
+    for offset in 0..13usize {
+        if (rank_mask & (1u16 << offset)) == 0 {
+            continue;
+        }
+        let rank = offset + 2;
+        outs = outs.saturating_add(4u8.saturating_sub(used_rank_count[rank]));
+    }
+    outs
+}
+
+fn hand_tag_mask_from_pair_masks(
+    pair_tag_masks: &[u32],
+    pair_straight_rank_masks: &[u16],
+    hand: &[u8],
+    board: &[u8],
+    is_holdem: bool,
+) -> u32 {
+    if hand.len() < 2 {
+        return 0;
+    }
+    let mut hand_mask = 0u32;
+    let mut straight_rank_mask = 0u16;
+    for i in 0..hand.len().saturating_sub(1) {
+        let row = hand[i] as usize * CARD_COUNT;
+        for j in (i + 1)..hand.len() {
+            let idx = row + hand[j] as usize;
+            hand_mask |= pair_tag_masks[idx];
+            straight_rank_mask |= pair_straight_rank_masks[idx];
+        }
+    }
+    let base_mask = hand_mask & !TAG_STRAIGHT_DRAW_MASK;
+    if straight_rank_mask == 0 {
+        return base_mask;
+    }
+
+    if !is_holdem && has_omaha_straight(hand, board) {
+        return base_mask;
+    }
+
+    let mut used_rank_count = [0u8; 15];
+    for &c in board.iter().chain(hand.iter()) {
+        let r = card_rank_value(c) as usize;
+        used_rank_count[r] = used_rank_count[r].saturating_add(1);
+    }
+
+    let outs = outs_from_rank_mask(straight_rank_mask, &used_rank_count);
+    base_mask | straight_draw_bits_for_outs(outs)
 }
 
 fn core_tag_mask_for_coverage(core: [u8; 2], board: &[u8], is_holdem: bool) -> u32 {
@@ -1584,52 +1716,31 @@ fn core_tag_mask_for_coverage(core: [u8; 2], board: &[u8], is_holdem: bool) -> u
     mask
 }
 
-fn build_tag_coverage_bundle(variant: &str, hand_size: usize, board: &[u8]) -> TagCoverageBundle {
+fn build_tag_coverage_bundle(variant: &str, _hand_size: usize, board: &[u8]) -> TagCoverageBundle {
     let base = base_deck(board, &[]);
-    let total = n_choose_k(base.len(), hand_size);
     let is_holdem = variant == "holdem";
 
     let mut pair_tag_masks = vec![0u32; CARD_COUNT * CARD_COUNT];
+    let mut pair_straight_rank_masks = vec![0u16; CARD_COUNT * CARD_COUNT];
     for i in 0..base.len() {
         let c1 = base[i];
         for j in (i + 1)..base.len() {
             let c2 = base[j];
             let mask = core_tag_mask_for_coverage([c1, c2], board, is_holdem);
+            let straight_rank_mask = core_straight_out_rank_mask([c1, c2], board, is_holdem);
             let idx12 = c1 as usize * CARD_COUNT + c2 as usize;
             let idx21 = c2 as usize * CARD_COUNT + c1 as usize;
             pair_tag_masks[idx12] = mask;
             pair_tag_masks[idx21] = mask;
+            pair_straight_rank_masks[idx12] = straight_rank_mask;
+            pair_straight_rank_masks[idx21] = straight_rank_mask;
         }
-    }
-
-    let mut matched_by_tag = [0usize; TAG_COVERAGE_COUNT];
-    if hand_size == 2 {
-        for i in 0..base.len() {
-            let c1 = base[i];
-            for j in (i + 1)..base.len() {
-                let c2 = base[j];
-                let idx = c1 as usize * CARD_COUNT + c2 as usize;
-                add_counts_from_mask(pair_tag_masks[idx], &mut matched_by_tag);
-            }
-        }
-    } else {
-        enumerate_hands(&base, hand_size, |hand| {
-            let mut hand_mask = 0u32;
-            for i in 0..hand.len().saturating_sub(1) {
-                let row = hand[i] as usize * CARD_COUNT;
-                for j in (i + 1)..hand.len() {
-                    hand_mask |= pair_tag_masks[row + hand[j] as usize];
-                }
-            }
-            add_counts_from_mask(hand_mask, &mut matched_by_tag);
-        });
     }
 
     TagCoverageBundle {
         base,
-        total,
-        matched_by_tag,
         pair_tag_masks,
+        pair_straight_rank_masks,
     }
 }
 
@@ -1647,7 +1758,18 @@ fn tag_coverage_bundle_for(
     built
 }
 
-fn preview_tag_core_combos_from_bundle(bundle: &TagCoverageBundle, tag: TagAtom) -> Vec<String> {
+fn preview_tag_core_combos_from_bundle(
+    bundle: &TagCoverageBundle,
+    board: &[u8],
+    tag: TagAtom,
+    is_holdem: bool,
+) -> Vec<String> {
+    if !is_holdem {
+        if let TagAtom::StraightDraw { min_outs } = tag {
+            return omaha_straight_draw_shortcut_labels(board, min_outs);
+        }
+    }
+
     let Some(idx) = tag_coverage_index(tag) else {
         return Vec::new();
     };
@@ -1834,6 +1956,7 @@ fn percentile_seed(variant: &str) -> u64 {
 static PERCENTILE_CACHE: OnceLock<Mutex<HashMap<String, Vec<f64>>>> = OnceLock::new();
 static SAMPLER_CACHE: OnceLock<Mutex<SamplerCacheStore>> = OnceLock::new();
 static TAG_COVERAGE_CACHE: OnceLock<Mutex<TagCoverageCacheStore>> = OnceLock::new();
+static TAG_EXPR_COVERAGE_CACHE: OnceLock<Mutex<TagExprCoverageCacheStore>> = OnceLock::new();
 static PLAN_POOL_TOO_LARGE_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static EXACT_PERCENTILE_TABLES: OnceLock<
     Mutex<HashMap<String, HashMap<String, Arc<PercentileTable>>>>,
@@ -1844,9 +1967,8 @@ const SAMPLER_CACHE_MAX: usize = 96;
 #[derive(Clone)]
 struct TagCoverageBundle {
     base: Vec<u8>,
-    total: usize,
-    matched_by_tag: [usize; TAG_COVERAGE_COUNT],
     pair_tag_masks: Vec<u32>,
+    pair_straight_rank_masks: Vec<u16>,
 }
 
 #[derive(Default)]
@@ -1885,6 +2007,45 @@ impl TagCoverageCacheStore {
         }
         self.touch(&key);
         self.map.insert(key, bundle);
+    }
+}
+
+#[derive(Default)]
+struct TagExprCoverageCacheStore {
+    map: HashMap<String, usize>,
+    lru: VecDeque<String>,
+}
+
+impl TagExprCoverageCacheStore {
+    fn touch(&mut self, key: &str) {
+        if let Some(pos) = self.lru.iter().position(|k| k == key) {
+            self.lru.remove(pos);
+        }
+        self.lru.push_back(key.to_string());
+    }
+
+    fn get(&mut self, key: &str) -> Option<usize> {
+        let out = self.map.get(key).copied();
+        if out.is_some() {
+            self.touch(key);
+        }
+        out
+    }
+
+    fn insert(&mut self, key: String, matched: usize) {
+        if self.map.contains_key(&key) {
+            self.map.insert(key.clone(), matched);
+            self.touch(&key);
+            return;
+        }
+        while self.map.len() >= TAG_EXPR_COVERAGE_CACHE_MAX {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            self.map.remove(&oldest);
+        }
+        self.touch(&key);
+        self.map.insert(key, matched);
     }
 }
 
@@ -2971,8 +3132,198 @@ fn normalize_tag_token(raw: &str) -> Option<TagAtom> {
     }
 }
 
+fn tag_shortcut_labels_for(
+    variant: &str,
+    hand_size: usize,
+    board: &[u8],
+    tag: TagAtom,
+) -> Vec<String> {
+    if board.len() < 3 || board.len() > 5 {
+        return Vec::new();
+    }
+
+    let is_holdem = variant == "holdem";
+    if !is_holdem {
+        if let TagAtom::StraightDraw { min_outs } = tag {
+            return omaha_straight_draw_shortcut_labels(board, min_outs);
+        }
+    }
+
+    let bundle = tag_coverage_bundle_for(variant, hand_size, board);
+    preview_tag_core_combos_from_bundle(&bundle, board, tag, is_holdem)
+}
+
+fn tag_shortcut_expr(
+    variant: &str,
+    hand_size: usize,
+    board: &[u8],
+    tag: TagAtom,
+) -> RangeExpr {
+    if board.len() < 3 || board.len() > 5 {
+        return RangeExpr::Atom(RangeAtom::Never);
+    }
+
+    let labels = tag_shortcut_labels_for(variant, hand_size, board, tag);
+    let mut atoms = Vec::<RangeAtom>::new();
+    for label in labels {
+        if let Ok((atom, _)) = compile_atom(&label, variant, hand_size, "ours") {
+            atoms.push(atom);
+        }
+    }
+    if atoms.is_empty() {
+        return RangeExpr::Atom(RangeAtom::Never);
+    }
+
+    let mut expr = RangeExpr::Atom(atoms[0].clone());
+    for atom in atoms.into_iter().skip(1) {
+        expr = RangeExpr::Or(Box::new(expr), Box::new(RangeExpr::Atom(atom)));
+    }
+    expr
+}
+
+fn rewrite_expr_tags_to_shortcuts(
+    expr: &RangeExpr,
+    variant: &str,
+    hand_size: usize,
+    board: &[u8],
+) -> RangeExpr {
+    match expr {
+        RangeExpr::Or(left, right) => RangeExpr::Or(
+            Box::new(rewrite_expr_tags_to_shortcuts(left, variant, hand_size, board)),
+            Box::new(rewrite_expr_tags_to_shortcuts(right, variant, hand_size, board)),
+        ),
+        RangeExpr::And(left, right) => RangeExpr::And(
+            Box::new(rewrite_expr_tags_to_shortcuts(left, variant, hand_size, board)),
+            Box::new(rewrite_expr_tags_to_shortcuts(right, variant, hand_size, board)),
+        ),
+        RangeExpr::Not(left, right) => RangeExpr::Not(
+            Box::new(rewrite_expr_tags_to_shortcuts(left, variant, hand_size, board)),
+            Box::new(rewrite_expr_tags_to_shortcuts(right, variant, hand_size, board)),
+        ),
+        RangeExpr::Atom(RangeAtom::Tag(tag)) => tag_shortcut_expr(variant, hand_size, board, *tag),
+        RangeExpr::Atom(atom) => RangeExpr::Atom(atom.clone()),
+    }
+}
+
+fn tag_alias_cache_expr_token(tag: TagAtom) -> String {
+    if let Some(idx) = tag_coverage_index(tag) {
+        return format!("alias:{}", TAG_COVERAGE_TOKEN_ORDER[idx]);
+    }
+    format!("alias:{tag:?}")
+}
+
+fn tag_alias_coverage_for(variant: &str, hand_size: usize, board: &[u8], tag: TagAtom) -> usize {
+    if board.len() < 3 || board.len() > 5 {
+        return 0;
+    }
+    let expr_token = tag_alias_cache_expr_token(tag);
+    let cache_key = tag_expr_coverage_cache_key(variant, hand_size, board, &expr_token);
+    if let Some(matched) = tag_expr_coverage_cache_get(&cache_key) {
+        return matched;
+    }
+
+    let expr = tag_shortcut_expr(variant, hand_size, board, tag);
+    let base = base_deck(board, &[]);
+    let total = n_choose_k(base.len(), hand_size);
+    let (matched, _) = estimate_coverage(&base, hand_size, total, |hand| {
+        range_expr_match(&expr, hand, board)
+    });
+    tag_expr_coverage_cache_put(cache_key, matched);
+    matched
+}
+
 fn is_any_expr(expr: &RangeExpr) -> bool {
     matches!(expr, RangeExpr::Atom(RangeAtom::Any))
+}
+
+fn is_single_tag_expr(expr: &RangeExpr) -> bool {
+    matches!(expr, RangeExpr::Atom(RangeAtom::Tag(_)))
+}
+
+fn is_tag_only_expr(expr: &RangeExpr) -> bool {
+    match expr {
+        RangeExpr::Or(left, right) | RangeExpr::And(left, right) | RangeExpr::Not(left, right) => {
+            is_tag_only_expr(left) && is_tag_only_expr(right)
+        }
+        RangeExpr::Atom(atom) => {
+            matches!(atom, RangeAtom::Tag(_) | RangeAtom::Any | RangeAtom::Never)
+        }
+    }
+}
+
+fn range_expr_match_tag_mask(expr: &RangeExpr, hand_mask: u32) -> bool {
+    match expr {
+        RangeExpr::Or(left, right) => {
+            range_expr_match_tag_mask(left, hand_mask)
+                || range_expr_match_tag_mask(right, hand_mask)
+        }
+        RangeExpr::And(left, right) => {
+            range_expr_match_tag_mask(left, hand_mask)
+                && range_expr_match_tag_mask(right, hand_mask)
+        }
+        RangeExpr::Not(left, right) => {
+            range_expr_match_tag_mask(left, hand_mask)
+                && !range_expr_match_tag_mask(right, hand_mask)
+        }
+        RangeExpr::Atom(atom) => match atom {
+            RangeAtom::Any => true,
+            RangeAtom::Never => false,
+            RangeAtom::Tag(tag) => tag_coverage_index(*tag)
+                .map(|idx| (hand_mask & tag_bit(idx)) != 0)
+                .unwrap_or(false),
+            _ => false,
+        },
+    }
+}
+
+fn estimate_tag_expr_coverage(
+    variant: &str,
+    hand_size: usize,
+    board: &[u8],
+    expr: &RangeExpr,
+) -> Option<usize> {
+    if !is_tag_only_expr(expr) {
+        return None;
+    }
+
+    let is_holdem = variant == "holdem";
+    let bundle = tag_coverage_bundle_for(variant, hand_size, board);
+    let mut matched = 0usize;
+
+    if hand_size == 2 {
+        for i in 0..bundle.base.len() {
+            let c1 = bundle.base[i];
+            for j in (i + 1)..bundle.base.len() {
+                let c2 = bundle.base[j];
+                let hand = [c1, c2];
+                let mask = hand_tag_mask_from_pair_masks(
+                    &bundle.pair_tag_masks,
+                    &bundle.pair_straight_rank_masks,
+                    &hand,
+                    board,
+                    is_holdem,
+                );
+                if range_expr_match_tag_mask(expr, mask) {
+                    matched = matched.saturating_add(1);
+                }
+            }
+        }
+        return Some(matched);
+    }
+
+    enumerate_hands(&bundle.base, hand_size, |hand| {
+        let mask = hand_tag_mask_from_pair_masks(
+            &bundle.pair_tag_masks,
+            &bundle.pair_straight_rank_masks,
+            hand,
+            board,
+            is_holdem,
+        );
+        if range_expr_match_tag_mask(expr, mask) {
+            matched = matched.saturating_add(1);
+        }
+    });
+    Some(matched)
 }
 
 fn range_expr_match(expr: &RangeExpr, hand: &[u8], board: &[u8]) -> bool {
@@ -3515,8 +3866,17 @@ fn straight_high_from_counts(rank_counts: &[u8; 15]) -> u8 {
     0
 }
 
-fn core_straight_outs(core: [u8; 2], board: &[u8], is_holdem: bool) -> u8 {
+fn core_straight_out_rank_mask(core: [u8; 2], board: &[u8], is_holdem: bool) -> u16 {
     if board.len() >= 5 {
+        return 0;
+    }
+
+    let has_straight_now = if is_holdem {
+        has_holdem_straight_by_ranks(&core, board)
+    } else {
+        has_omaha_core_straight(core, board)
+    };
+    if has_straight_now {
         return 0;
     }
 
@@ -3534,7 +3894,7 @@ fn core_straight_outs(core: [u8; 2], board: &[u8], is_holdem: bool) -> u8 {
         used_rank_count[r as usize] = used_rank_count[r as usize].saturating_add(1);
     }
 
-    let mut outs = 0u8;
+    let mut out_mask = 0u16;
     for r in 2u8..=14u8 {
         let remain = 4u8.saturating_sub(used_rank_count[r as usize]);
         if remain == 0 {
@@ -3548,10 +3908,159 @@ fn core_straight_outs(core: [u8; 2], board: &[u8], is_holdem: bool) -> u8 {
         };
         board_ranks.pop();
         if makes {
-            outs = outs.saturating_add(remain);
+            out_mask |= 1u16 << (r - 2);
         }
     }
-    outs
+    out_mask
+}
+
+fn core_straight_outs(core: [u8; 2], board: &[u8], is_holdem: bool) -> u8 {
+    let rank_mask = core_straight_out_rank_mask(core, board, is_holdem);
+    if rank_mask == 0 {
+        return 0;
+    }
+    let mut used_rank_count = [0u8; 15];
+    used_rank_count[card_rank_value(core[0]) as usize] =
+        used_rank_count[card_rank_value(core[0]) as usize].saturating_add(1);
+    used_rank_count[card_rank_value(core[1]) as usize] =
+        used_rank_count[card_rank_value(core[1]) as usize].saturating_add(1);
+    for &c in board {
+        let r = card_rank_value(c) as usize;
+        used_rank_count[r] = used_rank_count[r].saturating_add(1);
+    }
+    outs_from_rank_mask(rank_mask, &used_rank_count)
+}
+
+fn core_straight_out_rank_mask_by_ranks(hr1: u8, hr2: u8, board_ranks: &[u8]) -> u16 {
+    if board_ranks.len() >= 5 {
+        return 0;
+    }
+    if has_omaha_core_straight_ranks(hr1, hr2, board_ranks) {
+        return 0;
+    }
+
+    let mut used_rank_count = [0u8; 15];
+    used_rank_count[hr1 as usize] = used_rank_count[hr1 as usize].saturating_add(1);
+    used_rank_count[hr2 as usize] = used_rank_count[hr2 as usize].saturating_add(1);
+    for &r in board_ranks {
+        used_rank_count[r as usize] = used_rank_count[r as usize].saturating_add(1);
+    }
+
+    let mut tmp_board = board_ranks.to_vec();
+    let mut out_mask = 0u16;
+    for r in 2u8..=14u8 {
+        let remain = 4u8.saturating_sub(used_rank_count[r as usize]);
+        if remain == 0 {
+            continue;
+        }
+        tmp_board.push(r);
+        let makes = has_omaha_core_straight_ranks(hr1, hr2, &tmp_board);
+        tmp_board.pop();
+        if makes {
+            out_mask |= 1u16 << (r - 2);
+        }
+    }
+    out_mask
+}
+
+fn rank_char_from_value(rank: u8) -> char {
+    const RANK_CHARS: &str = "??23456789TJQKA";
+    RANK_CHARS.chars().nth(rank as usize).unwrap_or('?')
+}
+
+fn rank_pair_label_from_values(r1: u8, r2: u8) -> String {
+    let high = r1.max(r2);
+    let low = r1.min(r2);
+    let has_face_num_mix = high >= 11 && low <= 10;
+    let (a, b) = if has_face_num_mix {
+        (low, high)
+    } else {
+        (high, low)
+    };
+    format!("{}{}", rank_char_from_value(a), rank_char_from_value(b))
+}
+
+fn rank_triplet_label_from_values(r1: u8, r2: u8, r3: u8) -> String {
+    let mut ranks = [r1, r2, r3];
+    ranks.sort_unstable();
+    format!(
+        "{}{}{}",
+        rank_char_from_value(ranks[0]),
+        rank_char_from_value(ranks[1]),
+        rank_char_from_value(ranks[2]),
+    )
+}
+
+fn omaha_straight_draw_shortcut_labels(board: &[u8], min_outs: u8) -> Vec<String> {
+    if board.len() < 3 || board.len() >= 5 {
+        return Vec::new();
+    }
+
+    let mut board_ranks = Vec::<u8>::with_capacity(board.len());
+    let mut board_used_rank_count = [0u8; 15];
+    for &c in board {
+        let r = card_rank_value(c);
+        board_ranks.push(r);
+        board_used_rank_count[r as usize] = board_used_rank_count[r as usize].saturating_add(1);
+    }
+
+    let mut pair_labels = BTreeSet::<String>::new();
+    let mut triplet_labels = BTreeSet::<String>::new();
+    let mut pair_masks = [[0u16; 15]; 15];
+    let mut pair_selected = [[false; 15]; 15];
+
+    for r1 in 2u8..=14u8 {
+        for r2 in (r1 + 1)..=14u8 {
+            let out_mask = core_straight_out_rank_mask_by_ranks(r1, r2, &board_ranks);
+            pair_masks[r1 as usize][r2 as usize] = out_mask;
+            pair_masks[r2 as usize][r1 as usize] = out_mask;
+            if out_mask == 0 {
+                continue;
+            }
+            let mut used_rank_count = board_used_rank_count;
+            used_rank_count[r1 as usize] = used_rank_count[r1 as usize].saturating_add(1);
+            used_rank_count[r2 as usize] = used_rank_count[r2 as usize].saturating_add(1);
+            let outs = outs_from_rank_mask(out_mask, &used_rank_count);
+            if outs >= min_outs {
+                pair_selected[r1 as usize][r2 as usize] = true;
+                pair_selected[r2 as usize][r1 as usize] = true;
+                pair_labels.insert(rank_pair_label_from_values(r1, r2));
+            }
+        }
+    }
+
+    for r1 in 2u8..=14u8 {
+        for r2 in (r1 + 1)..=14u8 {
+            for r3 in (r2 + 1)..=14u8 {
+                // Do not emit redundant 3-card shortcuts when any 2-card subset
+                // is already an alias match on this board.
+                if pair_selected[r1 as usize][r2 as usize]
+                    || pair_selected[r1 as usize][r3 as usize]
+                    || pair_selected[r2 as usize][r3 as usize]
+                {
+                    continue;
+                }
+                let out_mask = pair_masks[r1 as usize][r2 as usize]
+                    | pair_masks[r1 as usize][r3 as usize]
+                    | pair_masks[r2 as usize][r3 as usize];
+                if out_mask == 0 {
+                    continue;
+                }
+                let mut used_rank_count = board_used_rank_count;
+                used_rank_count[r1 as usize] = used_rank_count[r1 as usize].saturating_add(1);
+                used_rank_count[r2 as usize] = used_rank_count[r2 as usize].saturating_add(1);
+                used_rank_count[r3 as usize] = used_rank_count[r3 as usize].saturating_add(1);
+                let outs = outs_from_rank_mask(out_mask, &used_rank_count);
+                if outs >= min_outs {
+                    triplet_labels.insert(rank_triplet_label_from_values(r1, r2, r3));
+                }
+            }
+        }
+    }
+
+    let mut labels = pair_labels;
+    labels.extend(triplet_labels);
+    labels.into_iter().collect()
 }
 
 fn straight_outs_for_hand(hand: &[u8], board: &[u8], is_holdem: bool) -> u8 {

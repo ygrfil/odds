@@ -77,10 +77,10 @@ const TAG_BASE_HINTS = {
   "@s": "Straight core structures (with any side cards).",
   "@f": "Flush core structures (with any side cards). Omaha flush cores use exactly 2 hole + 3 board cards.",
   "@fd": "Flush-draw core structures (with any side cards).",
-  "@sd": "Straight-draw core structures with 1+ outs (with any side cards).",
-  "@sd4": "Straight-draw core structures with 4+ outs (with any side cards).",
-  "@sd8": "Straight-draw core structures with 8+ outs (with any side cards).",
-  "@sd12": "Straight-draw core structures with 12+ outs (with any side cards)."
+  "@sd": "Straight-draw shortcut structures with 1+ outs on the current board.",
+  "@sd4": "Straight-draw shortcut structures with 4+ outs on the current board.",
+  "@sd8": "Straight-draw shortcut structures with 8+ outs on the current board.",
+  "@sd12": "Straight-draw shortcut structures with 12+ outs on the current board."
 };
 
 const TAG_PLUS_HINTS = {
