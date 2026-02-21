@@ -404,30 +404,26 @@ async fn static_cache_headers(req: Request, next: Next) -> Response {
     }
 
     let headers = res.headers_mut();
-    if path == "/" || path.ends_with(".html") {
-        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-        return res;
-    }
-
-    if path.starts_with("/src/percentile-tables") && path.ends_with(".js") {
-        headers.insert(
-            CACHE_CONTROL,
-            HeaderValue::from_static("public, max-age=31536000, immutable"),
-        );
-        return res;
-    }
-
-    if path.ends_with(".js")
+    if path == "/"
+        || path.ends_with(".html")
+        || path.ends_with(".js")
         || path.ends_with(".mjs")
         || path.ends_with(".css")
         || path.ends_with(".wasm")
         || path.ends_with(".svg")
         || path.ends_with(".ico")
+        || path.ends_with(".png")
+        || path.ends_with(".jpg")
+        || path.ends_with(".jpeg")
+        || path.ends_with(".gif")
+        || path.ends_with(".webp")
+        || path.ends_with(".woff")
+        || path.ends_with(".woff2")
+        || path.ends_with(".ttf")
     {
-        headers.insert(
-            CACHE_CONTROL,
-            HeaderValue::from_static("public, max-age=86400"),
-        );
+        // Non-fingerprinted assets should always revalidate so deploys are visible immediately.
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache, must-revalidate"));
+        return res;
     }
     res
 }
