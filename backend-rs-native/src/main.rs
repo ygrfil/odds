@@ -425,7 +425,7 @@ async fn static_cache_headers(req: Request, next: Next) -> Response {
         // Non-fingerprinted assets should never be cached at intermediaries.
         headers.insert(
             CACHE_CONTROL,
-            HeaderValue::from_static("no-store, no-cache, must-revalidate, max-age=0"),
+            HeaderValue::from_static("no-cache, must-revalidate, max-age=0"),
         );
         return res;
     }
