@@ -136,6 +136,7 @@ Then open `http://<LXC_IP>/index.html`.
 - `RUST_LOG` (default `odds=info,tower_http=info`)
 - `PREWARM_PERCENTILES` (default `true`)
 - `PREWARM_PERCENTILES_BLOCKING` (default `false`, when `true` warms tables before accepting traffic)
+- `SIM_MAX_RUNTIME_MS` (default unset; LXC installer sets `55000` to stop long-running sims before proxy timeouts)
 
 ## Benchmark
 Run repeatable local benchmarks (startup, percentile cold/warm latency, sim API, static transfer):

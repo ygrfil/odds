@@ -175,6 +175,7 @@ $SUDO tee "${ENV_DIR}/${APP_NAME}.env" >/dev/null <<EOF
 RUST_LOG=odds=info,tower_http=warn
 PREWARM_PERCENTILES=true
 PREWARM_PERCENTILES_BLOCKING=false
+SIM_MAX_RUNTIME_MS=55000
 EOF
 $SUDO chmod 640 "${ENV_DIR}/${APP_NAME}.env"
 
@@ -240,6 +241,10 @@ server {
     location / {
         proxy_pass http://127.0.0.1:${PORT};
         proxy_http_version 1.1;
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 180s;
+        proxy_read_timeout 180s;
+        send_timeout 180s;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;

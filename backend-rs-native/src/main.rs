@@ -51,6 +51,8 @@ struct RunConfig {
     confidence_min_iterations: Option<i64>,
     #[serde(default)]
     confidence_level: Option<f64>,
+    #[serde(default)]
+    max_runtime_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +115,8 @@ struct NativeSimReq {
     confidence_min_iters: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     confidence_level: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_runtime_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     seed: Option<u64>,
 }
@@ -367,6 +371,18 @@ fn env_flag(name: &str, default: bool) -> bool {
             !(t == "0" || t == "false" || t == "off" || t == "no")
         })
         .unwrap_or(default)
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+}
+
+fn sim_max_runtime_ms_env() -> Option<u64> {
+    static VALUE: OnceLock<Option<u64>> = OnceLock::new();
+    *VALUE.get_or_init(|| env_u64("SIM_MAX_RUNTIME_MS"))
 }
 
 fn resolve_static_root() -> Result<PathBuf, std::io::Error> {
@@ -792,6 +808,10 @@ fn prepare_native_request(cfg: &RunConfig, workers: Option<usize>) -> Result<Nat
             }
         }),
         confidence_level: cfg.confidence_level.filter(|v| *v > 0.0),
+        max_runtime_ms: cfg
+            .max_runtime_ms
+            .filter(|v| *v > 0)
+            .or_else(sim_max_runtime_ms_env),
         seed: Some(rand::random::<u64>()),
     })
 }
@@ -4262,6 +4282,7 @@ fn to_native_sim_request(payload: &NativeSimReq) -> native_sim::SimRequest {
         confidence_target_pct: payload.confidence_target_pct,
         confidence_min_iters: payload.confidence_min_iters,
         confidence_level: payload.confidence_level,
+        max_runtime_ms: payload.max_runtime_ms,
     }
 }
 

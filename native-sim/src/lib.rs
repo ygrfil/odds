@@ -10,6 +10,7 @@ use rayon::ThreadPoolBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 type ChooseTable = [[usize; 7]; 53];
 
@@ -27,6 +28,7 @@ pub struct SimRequest {
     pub confidence_target_pct: Option<f64>,
     pub confidence_min_iters: Option<usize>,
     pub confidence_level: Option<f64>,
+    pub max_runtime_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +57,7 @@ struct Request {
     confidence_target_pct: Option<f64>,
     confidence_min_iters: Option<usize>,
     confidence_level: Option<f64>,
+    max_runtime_ms: Option<u64>,
     #[serde(default)]
     hand_size: usize,
     pool_cap: Option<usize>,
@@ -359,6 +362,7 @@ fn sim_request_to_internal(req: SimRequest) -> Request {
         confidence_target_pct: req.confidence_target_pct,
         confidence_min_iters: req.confidence_min_iters,
         confidence_level: req.confidence_level,
+        max_runtime_ms: req.max_runtime_ms,
         hand_size: 0,
         pool_cap: None,
         plan: None,
@@ -428,7 +432,8 @@ fn run_sim_mode(req: &Request) -> Result<Response> {
     let conf = confidence_cfg(req);
     let choose = build_choose_table();
     let combo_space = choose[52][variant_hand_size(&req.variant)];
-    let start = std::time::Instant::now();
+    let start = Instant::now();
+    let deadline = simulation_deadline(start, req.max_runtime_ms);
 
     let thread_pool = ThreadPoolBuilder::new()
         .num_threads(workers)
@@ -442,6 +447,9 @@ fn run_sim_mode(req: &Request) -> Result<Response> {
     let round_iters = choose_round_iters(req.iteration_cap, workers, conf.enabled);
 
     while remaining > 0 {
+        if deadline_reached(deadline) {
+            break;
+        }
         let run_now = if conf.enabled {
             remaining.min(round_iters)
         } else {
@@ -460,7 +468,15 @@ fn run_sim_mode(req: &Request) -> Result<Response> {
                     let worker_seed = seed
                         .wrapping_add(((idx as u64) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15))
                         .wrapping_add((round as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
-                    simulate_partition(req, &samplers, iters, worker_seed, &choose, combo_space)
+                    simulate_partition(
+                        req,
+                        &samplers,
+                        iters,
+                        worker_seed,
+                        &choose,
+                        combo_space,
+                        deadline,
+                    )
                 })
                 .collect()
         });
@@ -481,6 +497,9 @@ fn run_sim_mode(req: &Request) -> Result<Response> {
             if done {
                 break;
             }
+        }
+        if deadline_reached(deadline) {
+            break;
         }
     }
 
@@ -1589,6 +1608,7 @@ fn simulate_partition(
     seed: u64,
     choose: &ChooseTable,
     combo_space: usize,
+    deadline: Option<Instant>,
 ) -> Partial {
     let pcount = req.players.len();
     let mut out = new_partial(pcount, combo_space);
@@ -1615,7 +1635,10 @@ fn simulate_partition(
         .collect();
     let mut score_buf = vec![0u16; pcount];
     let mut winners = vec![false; pcount];
-    for _ in 0..iter_cap {
+    for iter in 0..iter_cap {
+        if (iter & 0xFF) == 0 && deadline_reached(deadline) {
+            break;
+        }
         let mut failed = false;
         for pi in 0..pcount {
             let sampler = &samplers[pi];
@@ -1738,6 +1761,18 @@ fn simulate_partition(
     }
 
     out
+}
+
+fn simulation_deadline(start: Instant, max_runtime_ms: Option<u64>) -> Option<Instant> {
+    let ms = max_runtime_ms?;
+    if ms == 0 {
+        return None;
+    }
+    start.checked_add(Duration::from_millis(ms))
+}
+
+fn deadline_reached(deadline: Option<Instant>) -> bool {
+    deadline.map(|d| Instant::now() >= d).unwrap_or(false)
 }
 
 fn merge_in_place(out: &mut Partial, p: Partial) {
