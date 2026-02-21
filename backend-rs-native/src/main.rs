@@ -407,6 +407,7 @@ async fn static_cache_headers(req: Request, next: Next) -> Response {
     if path == "/"
         || path.ends_with(".html")
         || path.ends_with(".js")
+        || path.ends_with(".json")
         || path.ends_with(".mjs")
         || path.ends_with(".css")
         || path.ends_with(".wasm")

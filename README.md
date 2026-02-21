@@ -85,6 +85,12 @@ The installer also creates a global alias command:
 odds-update
 ```
 
+Check what version is currently served:
+
+```bash
+curl http://127.0.0.1/build-info.json
+```
+
 ### 1) Build and stage app files
 Run inside your LXC:
 

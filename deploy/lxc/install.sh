@@ -160,6 +160,11 @@ cd \"${REPO_DIR}\"
 cargo build -p odds --release
 "
 
+DEPLOY_GIT_SHA="$(cd "${REPO_DIR}" && git rev-parse --short=12 HEAD)"
+DEPLOY_GIT_BRANCH="$(cd "${REPO_DIR}" && git branch --show-current || true)"
+DEPLOY_GIT_BRANCH="${DEPLOY_GIT_BRANCH:-detached}"
+DEPLOY_TIME_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
 log "Creating service account and staging app files in ${APP_DIR}"
 $SUDO useradd --system --home "${APP_DIR}" --shell /usr/sbin/nologin "${APP_USER}" 2>/dev/null || true
 $SUDO install -d -m 755 -o "${APP_USER}" -g "${APP_GROUP}" "${APP_DIR}"
@@ -167,6 +172,14 @@ $SUDO install -m 755 "${REPO_DIR}/target/release/odds" "${APP_DIR}/odds"
 $SUDO cp "${REPO_DIR}/index.html" "${APP_DIR}/index.html"
 $SUDO rm -rf "${APP_DIR}/src"
 $SUDO cp -R "${REPO_DIR}/src" "${APP_DIR}/src"
+$SUDO tee "${APP_DIR}/build-info.json" >/dev/null <<EOF
+{
+  "app": "${APP_NAME}",
+  "branch": "${DEPLOY_GIT_BRANCH}",
+  "gitSha": "${DEPLOY_GIT_SHA}",
+  "deployedAtUtc": "${DEPLOY_TIME_UTC}"
+}
+EOF
 $SUDO chown -R "${APP_USER}:${APP_GROUP}" "${APP_DIR}"
 
 log "Writing environment file"
@@ -313,3 +326,4 @@ fi
 
 log "Install complete"
 printf '\nService: %s\nHealth:  http://127.0.0.1:%s/api/health\nOpen:    %s\n\n' "${APP_NAME}" "${PORT}" "${PUBLIC_URL}"
+printf 'Version: %s (%s)\n' "${DEPLOY_GIT_SHA}" "${DEPLOY_GIT_BRANCH}"
