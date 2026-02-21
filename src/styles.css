@@ -6,12 +6,23 @@
   --border: #21324a;
   --accent: #14b8a6;
   --accent-2: #f59e0b;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+}
+
+html {
+  height: 100%;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 * { box-sizing: border-box; }
 body {
   margin: 0;
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
   font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
   color: var(--text);
@@ -20,9 +31,13 @@ body {
 
 .app-shell {
   max-width: 1320px;
-  height: 100vh;
+  height: 100%;
   margin: 0 auto;
-  padding: 8px;
+  padding:
+    calc(8px + var(--safe-top))
+    calc(8px + var(--safe-right))
+    calc(8px + var(--safe-bottom))
+    calc(8px + var(--safe-left));
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
   gap: 8px;
@@ -95,6 +110,7 @@ input, select, button, textarea {
   font-size: 13px;
   color: var(--text);
   background: #0a1320;
+  -webkit-tap-highlight-color: transparent;
 }
 
 input, select { min-width: 130px; }
@@ -111,6 +127,7 @@ input, select { min-width: 130px; }
 button {
   cursor: pointer;
   font-weight: 600;
+  touch-action: manipulation;
 }
 
 button.primary {
@@ -130,6 +147,7 @@ button.primary {
   gap: 5px;
   overflow: auto;
   min-height: 0;
+  -webkit-overflow-scrolling: touch;
 }
 
 .player-row {
@@ -420,8 +438,13 @@ th { color: var(--muted); font-weight: 700; }
 }
 
 .help-modal {
-  position: absolute;
+  position: fixed;
   inset: 0;
+  padding:
+    calc(8px + var(--safe-top))
+    calc(8px + var(--safe-right))
+    calc(8px + var(--safe-bottom))
+    calc(8px + var(--safe-left));
   background: rgba(3, 8, 16, 0.78);
   display: flex;
   align-items: center;
@@ -432,13 +455,14 @@ th { color: var(--muted); font-weight: 700; }
 .help-modal.hidden { display: none; }
 
 .help-card {
-  width: min(1080px, 96vw);
-  max-height: 88vh;
+  width: min(1080px, 100%);
+  max-height: 100%;
   overflow: auto;
   background: #0d1726;
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 12px;
+  -webkit-overflow-scrolling: touch;
 }
 
 .help-head {
@@ -480,9 +504,70 @@ th { color: var(--muted); font-weight: 700; }
 
 @media (max-width: 960px) {
   .topbar { flex-direction: column; gap: 10px; }
+  .topbar h1 { font-size: 22px; }
+  .mode-chip { align-self: flex-start; }
   .content-grid { grid-template-columns: 1fr; }
+  .control-row {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+  label { width: 100%; }
+  .spacer { display: none; }
+  input, select, textarea {
+    width: 100%;
+    min-width: 0;
+    font-size: 16px;
+    min-height: 44px;
+  }
+  button {
+    font-size: 15px;
+    min-height: 44px;
+  }
   .cards-short { width: 100%; min-width: 0; }
-  body { overflow: auto; height: auto; }
-  .app-shell { height: auto; overflow: visible; }
-  .panel { overflow: auto; }
+  .action-row { gap: 8px; }
+  .action-row button { flex: 1 1 calc(50% - 4px); }
+  #run { flex-basis: 100%; }
+  .range-picks {
+    max-height: none;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 2px;
+    -webkit-overflow-scrolling: touch;
+  }
+  .range-picks button { flex: 0 0 auto; }
+  .range-pick-sep { flex: 0 0 1px; }
+  .output-head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .status-line { max-width: 100%; }
+  body {
+    overflow-x: hidden;
+    overflow-y: auto;
+    height: auto;
+    min-height: 100vh;
+    min-height: 100dvh;
+  }
+  .app-shell {
+    height: auto;
+    min-height: 100%;
+    overflow: visible;
+  }
+  .panel {
+    overflow: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+}
+
+@supports (-webkit-touch-callout: none) {
+  body {
+    min-height: -webkit-fill-available;
+  }
+  .app-shell {
+    min-height: -webkit-fill-available;
+  }
 }
