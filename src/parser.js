@@ -31,6 +31,12 @@ const MACRO_REPLACEMENTS = {
   "$1g": "(AKQT-,AKJT-,AQJT-)",
   "$2g": "(AKQ9-,AKT9-,AJT9-)"
 };
+const MACRO_REPLACEMENTS_LOWER = new Map(
+  Object.entries(MACRO_REPLACEMENTS).map(([k, v]) => [k.toLowerCase(), v])
+);
+const MACRO_KEYS_DESC = [...MACRO_REPLACEMENTS_LOWER.keys()].sort((a, b) => b.length - a.length);
+const MACRO_AND_KEYS = new Set(["$s", "$o", "$ds", "$ss", "$op", "$tp"]);
+const MACRO_NOT_KEYS = new Set(["$np", "$nt"]);
 
 const RANK_VARS = new Set(["R", "O", "N"]);
 const SUIT_VARS = new Set(["x", "y", "z", "w"]);
@@ -485,11 +491,45 @@ function parseLeafSpecs(leaf) {
 }
 
 function expandExprMacros(expr) {
-  let s = expr;
-  for (const [k, v] of Object.entries(MACRO_REPLACEMENTS)) {
-    s = s.split(k).join(v);
+  let out = "";
+  let i = 0;
+
+  while (i < expr.length) {
+    if (expr[i] !== "$") {
+      out += expr[i];
+      i++;
+      continue;
+    }
+
+    const remainingLower = expr.slice(i).toLowerCase();
+    const key = MACRO_KEYS_DESC.find((k) => remainingLower.startsWith(k));
+    if (!key) {
+      out += expr[i];
+      i++;
+      continue;
+    }
+
+    const replacement = MACRO_REPLACEMENTS_LOWER.get(key) || "";
+    const prev = out[out.length - 1] || "";
+
+    if (MACRO_AND_KEYS.has(key)) {
+      const payload = replacement.startsWith(":") ? replacement.slice(1) : replacement;
+      if (!prev || prev === "," || prev === "(") out += `*:${payload}`;
+      else if (prev === ":") out += payload;
+      else out += `:${payload}`;
+    } else if (MACRO_NOT_KEYS.has(key)) {
+      const payload = replacement.startsWith("!") ? replacement.slice(1) : replacement;
+      if (!prev || prev === "," || prev === "(" || prev === ":") out += `*!${payload}`;
+      else if (prev === "!") out += payload;
+      else out += `!${payload}`;
+    } else {
+      out += replacement;
+    }
+
+    i += key.length;
   }
-  return s;
+
+  return out;
 }
 
 function expandShortcuts(atom, variant) {

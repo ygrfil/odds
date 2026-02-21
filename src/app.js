@@ -464,8 +464,9 @@ function applyQuickPick(token) {
   const idx = Math.max(0, Math.min(state.players.length - 1, state.focusedPlayer));
   const player = state.players[idx];
   if (!player) return;
-  if (!player.range || player.range.trim() === "*") player.range = token;
-  else player.range = `${player.range}:${token}`;
+  const current = String(player.range || "").trim();
+  if (!current || current === "*") player.range = token;
+  else player.range = `${current},${token}`;
   renderPlayers();
   saveLocal();
 }
