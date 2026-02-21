@@ -422,8 +422,11 @@ async fn static_cache_headers(req: Request, next: Next) -> Response {
         || path.ends_with(".woff2")
         || path.ends_with(".ttf")
     {
-        // Non-fingerprinted assets should always revalidate so deploys are visible immediately.
-        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache, must-revalidate"));
+        // Non-fingerprinted assets should never be cached at intermediaries.
+        headers.insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("no-store, no-cache, must-revalidate, max-age=0"),
+        );
         return res;
     }
     res
