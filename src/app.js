@@ -1058,6 +1058,9 @@ async function runBombpot() {
     setBombpotStatus("Bombpot supports only PLO4 and PLO5.");
     return;
   }
+  const precisionPreset = normalizePrecisionPreset(el.precision?.value);
+  if (el.precision) el.precision.value = precisionPreset;
+  const precisionConfig = PRECISION_PRESETS[precisionPreset] || PRECISION_PRESETS[DEFAULT_PRECISION_PRESET];
 
   const requestId = bombpotState.requestId + 1;
   bombpotState.requestId = requestId;
@@ -1077,6 +1080,9 @@ async function runBombpot() {
         board: String(el.board?.value || "").trim(),
         dead: String(el.dead?.value || "").trim(),
         heroRange: String(state.players?.[0]?.range || "*").trim() || "*",
+        iterationCap: precisionConfig.iterationCap,
+        minIterations: precisionConfig.min,
+        targetHalfWidthPct: precisionConfig.target,
         progressToken
       })
     });
