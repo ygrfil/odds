@@ -67,6 +67,7 @@
           <button id="addPlayer" type="button">+ Player</button>
           <button id="removePlayer" type="button">- Player</button>
           <button id="clearAll" type="button">Clear All</button>
+          <button id="bombpotRun" type="button">Bombpot</button>
           <button id="run" type="button" class="primary">Run Simulation</button>
           <button id="stop" type="button">Stop</button>
           <button id="exportSetup" type="button">Export Setup</button>
@@ -174,6 +175,23 @@
               <li><code>(@fd,@sd):15%</code></li>
             </ul>
           </div>
+        </div>
+      </div>
+
+      <div id="bombpotModal" class="help-modal hidden" role="dialog" aria-modal="true" aria-labelledby="bombpotTitle">
+        <div class="help-card bombpot-card">
+          <div class="help-head">
+            <h2 id="bombpotTitle">Bombpot Odds</h2>
+            <button id="bombpotClose" type="button">Close</button>
+          </div>
+          <div class="bombpot-meta-wrap">
+            <div id="bombpotStatus" class="small">Idle.</div>
+            <div id="bombpotProgressWrap" class="bombpot-progress hidden" aria-hidden="true">
+              <div id="bombpotProgressBar" class="bombpot-progress-fill"></div>
+            </div>
+            <div id="bombpotMeta" class="small"></div>
+          </div>
+          <div id="bombpotResult" class="table-wrap bombpot-result-wrap"></div>
         </div>
       </div>
     </div>

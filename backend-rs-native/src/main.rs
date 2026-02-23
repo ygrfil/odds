@@ -1,10 +1,11 @@
-use axum::extract::Request;
+use axum::extract::{Path, Request};
 use axum::http::{header::CACHE_CONTROL, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rand::rngs::SmallRng;
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -86,6 +87,78 @@ struct PreviewRangeRequest {
     range_text: String,
     #[serde(default)]
     percentile_profile: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BombpotRequest {
+    #[serde(default)]
+    variant: String,
+    #[serde(default)]
+    percentile_profile: Option<String>,
+    #[serde(default)]
+    board: String,
+    #[serde(default)]
+    dead: String,
+    #[serde(default)]
+    hero_range: String,
+    #[serde(default)]
+    iteration_cap: Option<usize>,
+    #[serde(default)]
+    min_iterations: Option<usize>,
+    #[serde(default)]
+    target_half_width_pct: Option<f64>,
+    #[serde(default)]
+    workers: Option<usize>,
+    #[serde(default)]
+    progress_token: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+struct BombpotCategoryOut {
+    id: &'static str,
+    label: &'static str,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BombpotRowOut {
+    players: usize,
+    opponents: usize,
+    values: Vec<f64>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BombpotResultOut {
+    variant: String,
+    iterations: usize,
+    max_half_width_pct: f64,
+    categories: Vec<BombpotCategoryOut>,
+    hero_range: String,
+    board_text: String,
+    dead_text: String,
+    table_rows: Vec<BombpotRowOut>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BombpotProgressOut {
+    token: String,
+    status: String,
+    iterations: usize,
+    iteration_cap: usize,
+    min_iterations: usize,
+    target_half_width_pct: f64,
+    max_half_width_pct: Option<f64>,
+    percent_of_cap: f64,
+    percent_of_min: f64,
+    elapsed_ms: f64,
+    ips: f64,
+    eta_cap_seconds: Option<f64>,
+    workers: usize,
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -298,6 +371,58 @@ const TAG_IDX_SD8: usize = 15;
 const TAG_IDX_SD12: usize = 16;
 const TAG_STRAIGHT_DRAW_MASK: u32 =
     (1u32 << TAG_IDX_SD) | (1u32 << TAG_IDX_SD4) | (1u32 << TAG_IDX_SD8) | (1u32 << TAG_IDX_SD12);
+const BOMBPOT_DEFAULT_ITER_CAP: usize = 220_000;
+const BOMBPOT_DEFAULT_MIN_ITER: usize = 25_000;
+const BOMBPOT_DEFAULT_TARGET_HALF_WIDTH_PCT: f64 = 0.35;
+const BOMBPOT_DEFAULT_WORKERS_MAX: usize = 16;
+const BOMBPOT_PROGRESS_BATCH_BASE_ITERS: usize = 2048;
+const BOMBPOT_HERO_ACCEPTANCE_POOL_THRESHOLD: f64 = 0.04;
+const BOMBPOT_HERO_MAX_SAMPLE_ATTEMPTS: usize = 20_000;
+const BOMBPOT_CI95_Z: f64 = 1.959_963_984_540_054;
+const BOMBPOT_PROGRESS_KEEP_DONE_SECS: u64 = 600;
+const BOMBPOT_PROGRESS_KEEP_RUNNING_SECS: u64 = 7200;
+const BOMBPOT_CAT_2P: usize = 0;
+const BOMBPOT_CAT_2P_PLUS: usize = 1;
+const BOMBPOT_CAT_SET: usize = 2;
+const BOMBPOT_CAT_FH: usize = 3;
+const BOMBPOT_CAT_FLUSH: usize = 4;
+const BOMBPOT_CAT_NUT_FLUSH: usize = 5;
+const BOMBPOT_CAT_NUT_FLUSH_DRAW: usize = 6;
+const BOMBPOT_CAT_SD12: usize = 7;
+const BOMBPOT_CATEGORY_DEFS: [BombpotCategoryOut; 8] = [
+    BombpotCategoryOut {
+        id: "twoPair",
+        label: "2P",
+    },
+    BombpotCategoryOut {
+        id: "twoPairPlus",
+        label: "2P+",
+    },
+    BombpotCategoryOut {
+        id: "set",
+        label: "Set",
+    },
+    BombpotCategoryOut {
+        id: "fullHouse",
+        label: "FH",
+    },
+    BombpotCategoryOut {
+        id: "flush",
+        label: "Flush",
+    },
+    BombpotCategoryOut {
+        id: "nutFlush",
+        label: "Nut Flush",
+    },
+    BombpotCategoryOut {
+        id: "nutFlushDraw",
+        label: "Nut Flush Draw",
+    },
+    BombpotCategoryOut {
+        id: "sd12",
+        label: "SD12",
+    },
+];
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -344,6 +469,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/sim/preview/tag", post(sim_preview_tag))
         .route("/api/sim/preview/tags", post(sim_preview_tags))
         .route("/api/sim/preview/range", post(sim_preview_range))
+        .route(
+            "/api/sim/bombpot/progress/{token}",
+            get(sim_bombpot_progress),
+        )
+        .route("/api/sim/bombpot", post(sim_bombpot))
         .fallback_service(ServeDir::new(static_root.clone()))
         .layer(middleware::from_fn(static_cache_headers))
         .layer(CompressionLayer::new())
@@ -755,6 +885,1000 @@ async fn sim_preview_range(Json(req): Json<PreviewRangeRequest>) -> (StatusCode,
         "approx": approx
     });
     (StatusCode::OK, Json(json!({ "ok": true, "coverage": out })))
+}
+
+#[derive(Debug, Clone)]
+struct BombpotRunConfig {
+    variant: String,
+    hand_size: usize,
+    min_players: usize,
+    max_players: usize,
+    board: Vec<u8>,
+    dead: Vec<u8>,
+    board_text: String,
+    dead_text: String,
+    hero_range: String,
+    percentile_profile: Option<String>,
+    iteration_cap: usize,
+    min_iterations: usize,
+    target_half_width_pct: f64,
+    workers: usize,
+    progress_token: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum BombpotHeroSampler {
+    Any { weight_pct: u8 },
+    Predicate { expr: RangeExpr, weight_pct: u8 },
+    Pool { pool: Vec<Vec<u8>>, weight_pct: u8 },
+}
+
+#[derive(Debug, Clone)]
+struct BombpotProgressEntry {
+    token: String,
+    status: String,
+    iterations: usize,
+    iteration_cap: usize,
+    min_iterations: usize,
+    target_half_width_pct: f64,
+    max_half_width_pct: Option<f64>,
+    started_at: Instant,
+    updated_at: Instant,
+    workers: usize,
+    error: Option<String>,
+}
+
+fn bombpot_progress_registry() -> &'static Mutex<HashMap<String, BombpotProgressEntry>> {
+    static REG: OnceLock<Mutex<HashMap<String, BombpotProgressEntry>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn bombpot_progress_cleanup(map: &mut HashMap<String, BombpotProgressEntry>) {
+    let now = Instant::now();
+    map.retain(|_, entry| {
+        let age = now.saturating_duration_since(entry.updated_at).as_secs();
+        if entry.status == "running" {
+            age <= BOMBPOT_PROGRESS_KEEP_RUNNING_SECS
+        } else {
+            age <= BOMBPOT_PROGRESS_KEEP_DONE_SECS
+        }
+    });
+}
+
+fn bombpot_normalize_workers(requested: Option<usize>) -> usize {
+    let fallback = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1);
+    requested
+        .filter(|v| *v > 0)
+        .unwrap_or(fallback)
+        .max(1)
+        .min(BOMBPOT_DEFAULT_WORKERS_MAX)
+}
+
+fn bombpot_progress_start(token: &str, cfg: &BombpotRunConfig) {
+    if token.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let mut map = bombpot_progress_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    bombpot_progress_cleanup(&mut map);
+    map.insert(
+        token.to_string(),
+        BombpotProgressEntry {
+            token: token.to_string(),
+            status: "running".to_string(),
+            iterations: 0,
+            iteration_cap: cfg.iteration_cap,
+            min_iterations: cfg.min_iterations,
+            target_half_width_pct: cfg.target_half_width_pct,
+            max_half_width_pct: None,
+            started_at: now,
+            updated_at: now,
+            workers: cfg.workers,
+            error: None,
+        },
+    );
+}
+
+fn bombpot_progress_update(token: &str, iterations: usize, max_half_width_pct: Option<f64>) {
+    if token.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let mut map = bombpot_progress_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = map.get_mut(token) {
+        if entry.status == "running" {
+            entry.iterations = iterations;
+            entry.max_half_width_pct = max_half_width_pct;
+            entry.updated_at = now;
+        }
+    }
+}
+
+fn bombpot_progress_finish(
+    token: &str,
+    iterations: usize,
+    max_half_width_pct: Option<f64>,
+    error: Option<String>,
+) {
+    if token.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let mut map = bombpot_progress_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = map.get_mut(token) {
+        entry.iterations = iterations;
+        entry.max_half_width_pct = max_half_width_pct;
+        entry.error = error.clone();
+        entry.status = if error.is_some() {
+            "error".to_string()
+        } else {
+            "done".to_string()
+        };
+        entry.updated_at = now;
+        return;
+    }
+    map.insert(
+        token.to_string(),
+        BombpotProgressEntry {
+            token: token.to_string(),
+            status: if error.is_some() {
+                "error".to_string()
+            } else {
+                "done".to_string()
+            },
+            iterations,
+            iteration_cap: iterations.max(1),
+            min_iterations: 1,
+            target_half_width_pct: 0.0,
+            max_half_width_pct,
+            started_at: now,
+            updated_at: now,
+            workers: 1,
+            error,
+        },
+    );
+}
+
+fn bombpot_progress_snapshot(token: &str) -> Option<BombpotProgressOut> {
+    if token.is_empty() {
+        return None;
+    }
+    let now = Instant::now();
+    let mut map = bombpot_progress_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    bombpot_progress_cleanup(&mut map);
+    let entry = map.get(token)?.clone();
+    let elapsed_sec = now
+        .saturating_duration_since(entry.started_at)
+        .as_secs_f64();
+    let elapsed_ms = elapsed_sec * 1000.0;
+    let ips = if elapsed_sec > 0.0 {
+        entry.iterations as f64 / elapsed_sec
+    } else {
+        0.0
+    };
+    let remaining = entry.iteration_cap.saturating_sub(entry.iterations) as f64;
+    let eta_cap_seconds = if ips > 0.0 {
+        Some(remaining / ips)
+    } else if remaining <= 0.0 {
+        Some(0.0)
+    } else {
+        None
+    };
+    Some(BombpotProgressOut {
+        token: entry.token,
+        status: entry.status,
+        iterations: entry.iterations,
+        iteration_cap: entry.iteration_cap,
+        min_iterations: entry.min_iterations,
+        target_half_width_pct: entry.target_half_width_pct,
+        max_half_width_pct: entry.max_half_width_pct,
+        percent_of_cap: if entry.iteration_cap > 0 {
+            (entry.iterations as f64 * 100.0 / entry.iteration_cap as f64).clamp(0.0, 100.0)
+        } else {
+            0.0
+        },
+        percent_of_min: if entry.min_iterations > 0 {
+            (entry.iterations as f64 * 100.0 / entry.min_iterations as f64).clamp(0.0, 100.0)
+        } else {
+            0.0
+        },
+        elapsed_ms,
+        ips,
+        eta_cap_seconds,
+        workers: entry.workers,
+        error: entry.error,
+    })
+}
+
+fn bombpot_variant_limits(variant: &str) -> Option<(usize, usize, usize)> {
+    match variant {
+        "plo4" => Some((4, 4, 9)),
+        "plo5" => Some((5, 4, 7)),
+        _ => None,
+    }
+}
+
+fn bombpot_positive_usize(value: Option<usize>, fallback: usize) -> usize {
+    value.filter(|v| *v > 0).unwrap_or(fallback)
+}
+
+fn bombpot_positive_f64(value: Option<f64>, fallback: f64) -> f64 {
+    value
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(fallback)
+}
+
+async fn sim_bombpot_progress(Path(token): Path<String>) -> (StatusCode, Json<Value>) {
+    let t = token.trim();
+    if t.is_empty() {
+        return error_json(StatusCode::BAD_REQUEST, "missing bombpot progress token");
+    }
+    let Some(progress) = bombpot_progress_snapshot(t) else {
+        return error_json(StatusCode::NOT_FOUND, "bombpot progress token not found");
+    };
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "progress": progress })),
+    )
+}
+
+async fn sim_bombpot(Json(req): Json<BombpotRequest>) -> (StatusCode, Json<Value>) {
+    let variant = req.variant.trim().to_ascii_lowercase();
+    let (hand_size, min_players, max_players) = match bombpot_variant_limits(&variant) {
+        Some(v) => v,
+        None => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                "bombpot supports only plo4 and plo5",
+            )
+        }
+    };
+
+    let board = match parse_cards_text(&req.board) {
+        Ok(v) => v,
+        Err(msg) => return error_json(StatusCode::BAD_REQUEST, &msg),
+    };
+    if board.len() != 3 {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "bombpot requires exactly flop board (3 cards)",
+        );
+    }
+
+    let dead = match parse_cards_text(&req.dead) {
+        Ok(v) => v,
+        Err(msg) => return error_json(StatusCode::BAD_REQUEST, &msg),
+    };
+    if let Err(msg) = validate_disjoint(&board, &dead) {
+        return error_json(StatusCode::BAD_REQUEST, &msg);
+    }
+
+    let hero_range = {
+        let t = req.hero_range.trim();
+        if t.is_empty() {
+            "*".to_string()
+        } else {
+            t.to_string()
+        }
+    };
+
+    let mut iteration_cap = bombpot_positive_usize(req.iteration_cap, BOMBPOT_DEFAULT_ITER_CAP);
+    let mut min_iterations = bombpot_positive_usize(req.min_iterations, BOMBPOT_DEFAULT_MIN_ITER);
+    if min_iterations > iteration_cap {
+        min_iterations = iteration_cap;
+    }
+    if iteration_cap == 0 {
+        iteration_cap = 1;
+    }
+    if min_iterations == 0 {
+        min_iterations = 1;
+    }
+
+    let target_half_width_pct = bombpot_positive_f64(
+        req.target_half_width_pct,
+        BOMBPOT_DEFAULT_TARGET_HALF_WIDTH_PCT,
+    );
+    let workers = bombpot_normalize_workers(req.workers);
+    let progress_token = req
+        .progress_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+
+    let config = BombpotRunConfig {
+        variant: variant.clone(),
+        hand_size,
+        min_players,
+        max_players,
+        board: board.clone(),
+        dead: dead.clone(),
+        board_text: req.board.trim().to_string(),
+        dead_text: req.dead.trim().to_string(),
+        hero_range,
+        percentile_profile: req.percentile_profile.clone(),
+        iteration_cap,
+        min_iterations,
+        target_half_width_pct,
+        workers,
+        progress_token: progress_token.clone(),
+    };
+    if let Some(token) = progress_token.as_deref() {
+        bombpot_progress_start(token, &config);
+    }
+
+    let progress_for_finish = progress_token.clone();
+    let result = match tokio::task::spawn_blocking(move || run_bombpot_sim(config)).await {
+        Ok(Ok(v)) => {
+            if let Some(token) = progress_for_finish.as_deref() {
+                bombpot_progress_finish(token, v.iterations, Some(v.max_half_width_pct), None);
+            }
+            v
+        }
+        Ok(Err(msg)) => {
+            if let Some(token) = progress_for_finish.as_deref() {
+                bombpot_progress_finish(token, 0, None, Some(msg.clone()));
+            }
+            return error_json(StatusCode::BAD_REQUEST, &msg);
+        }
+        Err(e) => {
+            if let Some(token) = progress_for_finish.as_deref() {
+                bombpot_progress_finish(token, 0, None, Some(format!("bombpot task failed: {e}")));
+            }
+            return error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("bombpot task failed: {e}"),
+            );
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "result": result })),
+    )
+}
+
+fn bombpot_weight_pass(weight_pct: u8, rng: &mut SmallRng) -> bool {
+    if weight_pct >= 100 {
+        return true;
+    }
+    if weight_pct == 0 {
+        return false;
+    }
+    rng.gen_range(0.0..100.0) <= weight_pct as f64
+}
+
+fn bombpot_sample_distinct_cards(
+    source: &[u8],
+    n: usize,
+    rng: &mut SmallRng,
+    out: &mut Vec<u8>,
+) -> bool {
+    if source.len() < n {
+        return false;
+    }
+    out.clear();
+    let mut need = n;
+    for (i, card) in source.iter().enumerate() {
+        if need == 0 {
+            break;
+        }
+        let remaining = source.len() - i;
+        if rng.gen_range(0..remaining) < need {
+            out.push(*card);
+            need -= 1;
+        }
+    }
+    out.len() == n
+}
+
+fn bombpot_estimate_hero_acceptance(
+    base_deck: &[u8],
+    hand_size: usize,
+    board: &[u8],
+    expr: &RangeExpr,
+    weight_pct: u8,
+    rng: &mut SmallRng,
+) -> f64 {
+    let trials = 420usize;
+    let mut sampled = 0usize;
+    let mut matched = 0usize;
+    let mut hand = Vec::<u8>::with_capacity(hand_size);
+
+    for _ in 0..trials {
+        if !bombpot_sample_distinct_cards(base_deck, hand_size, rng, &mut hand) {
+            break;
+        }
+        sampled += 1;
+        if !range_expr_match(expr, &hand, board) {
+            continue;
+        }
+        if !bombpot_weight_pass(weight_pct, rng) {
+            continue;
+        }
+        matched += 1;
+    }
+
+    if sampled == 0 {
+        0.0
+    } else {
+        matched as f64 / sampled as f64
+    }
+}
+
+fn bombpot_collect_hero_pool(
+    base_deck: &[u8],
+    hand_size: usize,
+    board: &[u8],
+    expr: &RangeExpr,
+) -> Vec<Vec<u8>> {
+    let mut pool = Vec::<Vec<u8>>::new();
+    let mut hand = vec![0u8; hand_size];
+
+    fn rec(
+        start: usize,
+        depth: usize,
+        base_deck: &[u8],
+        hand: &mut [u8],
+        board: &[u8],
+        expr: &RangeExpr,
+        pool: &mut Vec<Vec<u8>>,
+    ) {
+        if depth == hand.len() {
+            if range_expr_match(expr, hand, board) {
+                pool.push(hand.to_vec());
+            }
+            return;
+        }
+        let need = hand.len() - depth;
+        if base_deck.len() < need || start > base_deck.len() - need {
+            return;
+        }
+        for i in start..=base_deck.len() - need {
+            hand[depth] = base_deck[i];
+            rec(i + 1, depth + 1, base_deck, hand, board, expr, pool);
+        }
+    }
+
+    rec(0, 0, base_deck, &mut hand, board, expr, &mut pool);
+    pool
+}
+
+fn bombpot_compile_hero_sampler(
+    range_text: &str,
+    variant: &str,
+    hand_size: usize,
+    board: &[u8],
+    base_deck: &[u8],
+    percentile_profile: Option<&str>,
+    rng: &mut SmallRng,
+) -> Result<BombpotHeroSampler, String> {
+    let compiled = compile_range_expr(range_text, variant, hand_size, percentile_profile)?;
+    let weight_pct = compiled.weight_pct.min(100);
+    if weight_pct == 0 {
+        return Err("p1 range is empty on this board".to_string());
+    }
+    if is_any_expr(&compiled.expr) {
+        return Ok(BombpotHeroSampler::Any { weight_pct });
+    }
+
+    let acceptance = bombpot_estimate_hero_acceptance(
+        base_deck,
+        hand_size,
+        board,
+        &compiled.expr,
+        weight_pct,
+        rng,
+    );
+    if acceptance >= BOMBPOT_HERO_ACCEPTANCE_POOL_THRESHOLD {
+        return Ok(BombpotHeroSampler::Predicate {
+            expr: compiled.expr,
+            weight_pct,
+        });
+    }
+
+    let pool = bombpot_collect_hero_pool(base_deck, hand_size, board, &compiled.expr);
+    if pool.is_empty() {
+        return Err("p1 range has no valid combos on this board/dead setup".to_string());
+    }
+    Ok(BombpotHeroSampler::Pool { pool, weight_pct })
+}
+
+fn bombpot_sample_hero_hand(
+    sampler: &BombpotHeroSampler,
+    base_deck: &[u8],
+    hand_size: usize,
+    board: &[u8],
+    rng: &mut SmallRng,
+    out: &mut Vec<u8>,
+) -> bool {
+    match sampler {
+        BombpotHeroSampler::Any { weight_pct } => {
+            for _ in 0..BOMBPOT_HERO_MAX_SAMPLE_ATTEMPTS {
+                if !bombpot_sample_distinct_cards(base_deck, hand_size, rng, out) {
+                    return false;
+                }
+                if bombpot_weight_pass(*weight_pct, rng) {
+                    return true;
+                }
+            }
+            false
+        }
+        BombpotHeroSampler::Predicate { expr, weight_pct } => {
+            for _ in 0..BOMBPOT_HERO_MAX_SAMPLE_ATTEMPTS {
+                if !bombpot_sample_distinct_cards(base_deck, hand_size, rng, out) {
+                    return false;
+                }
+                if !range_expr_match(expr, out, board) {
+                    continue;
+                }
+                if !bombpot_weight_pass(*weight_pct, rng) {
+                    continue;
+                }
+                return true;
+            }
+            false
+        }
+        BombpotHeroSampler::Pool { pool, weight_pct } => {
+            if pool.is_empty() {
+                return false;
+            }
+            for _ in 0..BOMBPOT_HERO_MAX_SAMPLE_ATTEMPTS {
+                let idx = rng.gen_range(0..pool.len());
+                out.clear();
+                out.extend_from_slice(&pool[idx]);
+                if bombpot_weight_pass(*weight_pct, rng) {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+fn bombpot_best_omaha_hand_class(hand: &[u8], board: &[u8]) -> u8 {
+    if hand.len() < 2 || board.len() < 3 {
+        return 0;
+    }
+    let mut best = 0u8;
+    for a in 0..hand.len().saturating_sub(1) {
+        for b in (a + 1)..hand.len() {
+            for i in 0..board.len().saturating_sub(2) {
+                for j in (i + 1)..board.len().saturating_sub(1) {
+                    for k in (j + 1)..board.len() {
+                        let cards = [hand[a], hand[b], board[i], board[j], board[k]];
+                        let (class_id, _) = eval_five_cards_class(cards);
+                        if class_id > best {
+                            best = class_id;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+fn bombpot_build_pair_class_lut(board: &[u8]) -> [[u8; 52]; 52] {
+    let mut lut = [[0u8; 52]; 52];
+    if board.len() != 3 {
+        return lut;
+    }
+    let b0 = board[0];
+    let b1 = board[1];
+    let b2 = board[2];
+    for a in 0u8..52u8 {
+        if a == b0 || a == b1 || a == b2 {
+            continue;
+        }
+        for b in (a + 1)..52u8 {
+            if b == b0 || b == b1 || b == b2 {
+                continue;
+            }
+            let cards = [a, b, b0, b1, b2];
+            let (class_id, _) = eval_five_cards_class(cards);
+            lut[a as usize][b as usize] = class_id;
+            lut[b as usize][a as usize] = class_id;
+        }
+    }
+    lut
+}
+
+fn bombpot_best_omaha_hand_class_lut(hand: &[u8], pair_class_lut: &[[u8; 52]; 52]) -> u8 {
+    if hand.len() < 2 {
+        return 0;
+    }
+    let mut best = 0u8;
+    for a in 0..hand.len().saturating_sub(1) {
+        let ca = hand[a] as usize;
+        for b in (a + 1)..hand.len() {
+            let class_id = pair_class_lut[ca][hand[b] as usize];
+            if class_id > best {
+                best = class_id;
+            }
+        }
+    }
+    best
+}
+
+fn bombpot_highest_available_suit_rank(blocked: &[bool; 52], suit: u8) -> Option<u8> {
+    for rank in (2..=14).rev() {
+        let card = ((rank - 2) * 4 + suit as usize) as usize;
+        if blocked[card] {
+            continue;
+        }
+        return Some(rank as u8);
+    }
+    None
+}
+
+fn bombpot_suit_targets(
+    board_suit_counts: &[u8; 4],
+    blocked: &[bool; 52],
+) -> ([Option<u8>; 4], [Option<u8>; 4]) {
+    let mut nut_flush_targets = [None; 4];
+    let mut nut_flush_draw_targets = [None; 4];
+    for s in 0..4 {
+        if board_suit_counts[s] >= 3 {
+            nut_flush_targets[s] = bombpot_highest_available_suit_rank(blocked, s as u8);
+        }
+        if board_suit_counts[s] == 2 {
+            nut_flush_draw_targets[s] = bombpot_highest_available_suit_rank(blocked, s as u8);
+        }
+    }
+    (nut_flush_targets, nut_flush_draw_targets)
+}
+
+fn bombpot_has_nut_suit_card_with_support(hand: &[u8], suit: u8, nut_rank: u8) -> bool {
+    let mut suit_count = 0u8;
+    let mut has_nut = false;
+    for &c in hand {
+        if card_suit(c) != suit {
+            continue;
+        }
+        suit_count = suit_count.saturating_add(1);
+        if card_rank_value(c) == nut_rank {
+            has_nut = true;
+        }
+    }
+    has_nut && suit_count >= 2
+}
+
+fn bombpot_is_nut_flush(
+    hand: &[u8],
+    board_suit_counts: &[u8; 4],
+    targets: &[Option<u8>; 4],
+) -> bool {
+    for s in 0..4 {
+        if board_suit_counts[s] < 3 {
+            continue;
+        }
+        let Some(target_rank) = targets[s] else {
+            continue;
+        };
+        if bombpot_has_nut_suit_card_with_support(hand, s as u8, target_rank) {
+            return true;
+        }
+    }
+    false
+}
+
+fn bombpot_is_nut_flush_draw(
+    hand: &[u8],
+    board_suit_counts: &[u8; 4],
+    targets: &[Option<u8>; 4],
+) -> bool {
+    for s in 0..4 {
+        if board_suit_counts[s] != 2 {
+            continue;
+        }
+        let Some(target_rank) = targets[s] else {
+            continue;
+        };
+        if bombpot_has_nut_suit_card_with_support(hand, s as u8, target_rank) {
+            return true;
+        }
+    }
+    false
+}
+
+fn bombpot_opponent_hits(
+    hand: &[u8],
+    board: &[u8],
+    board_suit_counts: &[u8; 4],
+    nut_flush_targets: &[Option<u8>; 4],
+    nut_flush_draw_targets: &[Option<u8>; 4],
+    pair_class_lut: &[[u8; 52]; 52],
+) -> [bool; 8] {
+    let mut hits = [false; 8];
+    let class_id = bombpot_best_omaha_hand_class_lut(hand, pair_class_lut);
+
+    hits[BOMBPOT_CAT_2P] = class_id == 2;
+    hits[BOMBPOT_CAT_2P_PLUS] = class_id >= 2;
+    hits[BOMBPOT_CAT_SET] = class_id == 3;
+    hits[BOMBPOT_CAT_FH] = class_id == 6;
+    hits[BOMBPOT_CAT_FLUSH] = class_id == 5;
+    hits[BOMBPOT_CAT_NUT_FLUSH] =
+        class_id == 5 && bombpot_is_nut_flush(hand, board_suit_counts, nut_flush_targets);
+    hits[BOMBPOT_CAT_NUT_FLUSH_DRAW] =
+        bombpot_is_nut_flush_draw(hand, board_suit_counts, nut_flush_draw_targets);
+    hits[BOMBPOT_CAT_SD12] = full_tag_match(TagAtom::StraightDraw { min_outs: 12 }, hand, board);
+    hits
+}
+
+fn bombpot_wilson_half_width_pct(successes: usize, samples: usize) -> f64 {
+    if samples == 0 {
+        return f64::INFINITY;
+    }
+    let p = successes as f64 / samples as f64;
+    let z2 = BOMBPOT_CI95_Z * BOMBPOT_CI95_Z;
+    let n = samples as f64;
+    let denom = 1.0 + z2 / n;
+    let root = ((p * (1.0 - p)) / n + z2 / (4.0 * n * n)).sqrt();
+    (BOMBPOT_CI95_Z * root / denom) * 100.0
+}
+
+fn bombpot_max_half_width_pct(hit_rows: &[Vec<usize>], iterations: usize) -> f64 {
+    let mut max_half = 0.0;
+    for row in hit_rows {
+        for successes in row {
+            let half = bombpot_wilson_half_width_pct(*successes, iterations);
+            if half > max_half {
+                max_half = half;
+            }
+        }
+    }
+    max_half
+}
+
+fn bombpot_merge_hit_rows(dst: &mut [Vec<usize>], src: &[Vec<usize>]) {
+    for (dst_row, src_row) in dst.iter_mut().zip(src.iter()) {
+        for (dst_cell, src_cell) in dst_row.iter_mut().zip(src_row.iter()) {
+            *dst_cell = dst_cell.saturating_add(*src_cell);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BombpotBatchShared<'a> {
+    cfg: &'a BombpotRunConfig,
+    hero_sampler: &'a BombpotHeroSampler,
+    base_deck: &'a [u8],
+    base_blocked: &'a [bool; 52],
+    board_suit_counts: &'a [u8; 4],
+    pair_class_lut: &'a [[u8; 52]; 52],
+    min_opp: usize,
+    max_opp: usize,
+    row_count: usize,
+}
+
+fn bombpot_worker_run(
+    shared: BombpotBatchShared<'_>,
+    worker_iters: usize,
+    seed: u64,
+) -> Result<Vec<Vec<usize>>, String> {
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let mut local_rows = vec![vec![0usize; BOMBPOT_CATEGORY_DEFS.len()]; shared.row_count];
+    let mut hero_hand = Vec::<u8>::with_capacity(shared.cfg.hand_size);
+    let mut available = Vec::<u8>::with_capacity(shared.base_deck.len());
+    let mut cumulative = [false; 8];
+
+    for _ in 0..worker_iters {
+        let mut blocked = *shared.base_blocked;
+        if !bombpot_sample_hero_hand(
+            shared.hero_sampler,
+            shared.base_deck,
+            shared.cfg.hand_size,
+            &shared.cfg.board,
+            &mut rng,
+            &mut hero_hand,
+        ) {
+            return Err("unable to sample p1 hand from range".to_string());
+        }
+        for c in &hero_hand {
+            blocked[*c as usize] = true;
+        }
+        let (nut_flush_targets, nut_flush_draw_targets) =
+            bombpot_suit_targets(shared.board_suit_counts, &blocked);
+
+        available.clear();
+        for c in shared.base_deck {
+            if !blocked[*c as usize] {
+                available.push(*c);
+            }
+        }
+        if available.len() < shared.max_opp * shared.cfg.hand_size {
+            return Err("not enough cards to deal bombpot table".to_string());
+        }
+        let need_cards = shared.max_opp * shared.cfg.hand_size;
+        let (dealt, _) = available.partial_shuffle(&mut rng, need_cards);
+
+        cumulative.fill(false);
+        let mut cursor = 0usize;
+        for opp in 0..shared.max_opp {
+            let end = cursor + shared.cfg.hand_size;
+            let hand = &dealt[cursor..end];
+            cursor = end;
+
+            let hits = bombpot_opponent_hits(
+                hand,
+                &shared.cfg.board,
+                shared.board_suit_counts,
+                &nut_flush_targets,
+                &nut_flush_draw_targets,
+                shared.pair_class_lut,
+            );
+            for cat in 0..hits.len() {
+                if hits[cat] {
+                    cumulative[cat] = true;
+                }
+            }
+
+            let opp_count = opp + 1;
+            if opp_count < shared.min_opp {
+                continue;
+            }
+            let row = &mut local_rows[opp_count - shared.min_opp];
+            for cat in 0..cumulative.len() {
+                if cumulative[cat] {
+                    row[cat] = row[cat].saturating_add(1);
+                }
+            }
+        }
+    }
+
+    Ok(local_rows)
+}
+
+fn bombpot_run_parallel_batch(
+    shared: BombpotBatchShared<'_>,
+    batch_iterations: usize,
+    seed_base: u64,
+) -> Result<Vec<Vec<usize>>, String> {
+    let worker_count = shared.cfg.workers.max(1).min(batch_iterations.max(1));
+    let base_each = batch_iterations / worker_count;
+    let extra = batch_iterations % worker_count;
+    let workloads = (0..worker_count)
+        .map(|idx| base_each + usize::from(idx < extra))
+        .collect::<Vec<_>>();
+
+    let local_rows = workloads
+        .into_par_iter()
+        .enumerate()
+        .filter_map(|(idx, worker_iters)| {
+            if worker_iters == 0 {
+                return None;
+            }
+            let seed = seed_base
+                .wrapping_add(((idx as u64).wrapping_add(1)).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            Some(bombpot_worker_run(shared, worker_iters, seed))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut merged = vec![vec![0usize; BOMBPOT_CATEGORY_DEFS.len()]; shared.row_count];
+    for rows in local_rows {
+        bombpot_merge_hit_rows(&mut merged, &rows);
+    }
+    Ok(merged)
+}
+
+fn run_bombpot_sim(cfg: BombpotRunConfig) -> Result<BombpotResultOut, String> {
+    let base_deck = base_deck(&cfg.board, &cfg.dead);
+    if base_deck.len() < cfg.max_players * cfg.hand_size {
+        return Err("not enough undealt cards for maximum bombpot table".to_string());
+    }
+
+    let mut rng = SmallRng::from_entropy();
+    let hero_sampler = bombpot_compile_hero_sampler(
+        &cfg.hero_range,
+        &cfg.variant,
+        cfg.hand_size,
+        &cfg.board,
+        &base_deck,
+        cfg.percentile_profile.as_deref(),
+        &mut rng,
+    )?;
+
+    let mut base_blocked = [false; 52];
+    for c in cfg.board.iter().chain(cfg.dead.iter()) {
+        base_blocked[*c as usize] = true;
+    }
+
+    let mut board_suit_counts = [0u8; 4];
+    for c in &cfg.board {
+        board_suit_counts[card_suit(*c) as usize] =
+            board_suit_counts[card_suit(*c) as usize].saturating_add(1);
+    }
+    let pair_class_lut = bombpot_build_pair_class_lut(&cfg.board);
+
+    let min_opp = cfg.min_players - 1;
+    let max_opp = cfg.max_players - 1;
+    let row_count = max_opp - min_opp + 1;
+    let mut hit_rows = vec![vec![0usize; BOMBPOT_CATEGORY_DEFS.len()]; row_count];
+    let mut iterations = 0usize;
+    let shared = BombpotBatchShared {
+        cfg: &cfg,
+        hero_sampler: &hero_sampler,
+        base_deck: &base_deck,
+        base_blocked: &base_blocked,
+        board_suit_counts: &board_suit_counts,
+        pair_class_lut: &pair_class_lut,
+        min_opp,
+        max_opp,
+        row_count,
+    };
+    let mut progress_half = None::<f64>;
+    let mut seed_rng = SmallRng::from_entropy();
+
+    while iterations < cfg.iteration_cap {
+        let remaining = cfg.iteration_cap.saturating_sub(iterations);
+        let batch_cap = cfg
+            .workers
+            .max(1)
+            .saturating_mul(BOMBPOT_PROGRESS_BATCH_BASE_ITERS)
+            .max(1);
+        let batch_iterations = remaining.min(batch_cap);
+        if batch_iterations == 0 {
+            break;
+        }
+
+        let seed_base = seed_rng.gen::<u64>();
+        let batch_rows = bombpot_run_parallel_batch(shared, batch_iterations, seed_base)?;
+        bombpot_merge_hit_rows(&mut hit_rows, &batch_rows);
+        iterations = iterations.saturating_add(batch_iterations);
+
+        let max_half_now = bombpot_max_half_width_pct(&hit_rows, iterations);
+        progress_half = Some(max_half_now);
+        if let Some(token) = cfg.progress_token.as_deref() {
+            bombpot_progress_update(token, iterations, progress_half);
+        }
+        if iterations >= cfg.min_iterations && max_half_now <= cfg.target_half_width_pct {
+            break;
+        }
+    }
+
+    if iterations == 0 {
+        return Err("bombpot simulation produced zero iterations".to_string());
+    }
+    let max_half =
+        progress_half.unwrap_or_else(|| bombpot_max_half_width_pct(&hit_rows, iterations));
+
+    let mut table_rows = Vec::<BombpotRowOut>::with_capacity(row_count);
+    for row_idx in 0..row_count {
+        let opponents = min_opp + row_idx;
+        let players = opponents + 1;
+        let mut values = Vec::<f64>::with_capacity(BOMBPOT_CATEGORY_DEFS.len());
+        for successes in &hit_rows[row_idx] {
+            values.push((*successes as f64 * 100.0) / iterations as f64);
+        }
+        table_rows.push(BombpotRowOut {
+            players,
+            opponents,
+            values,
+        });
+    }
+
+    Ok(BombpotResultOut {
+        variant: cfg.variant,
+        iterations,
+        max_half_width_pct: max_half,
+        categories: BOMBPOT_CATEGORY_DEFS.to_vec(),
+        hero_range: cfg.hero_range,
+        board_text: cfg.board_text,
+        dead_text: cfg.dead_text,
+        table_rows,
+    })
 }
 
 fn prepare_native_request(cfg: &RunConfig, workers: Option<usize>) -> Result<NativeSimReq, String> {
@@ -3173,12 +4297,7 @@ fn tag_shortcut_labels_for(
     preview_tag_core_combos_from_bundle(&bundle, board, tag, is_holdem)
 }
 
-fn tag_shortcut_expr(
-    variant: &str,
-    hand_size: usize,
-    board: &[u8],
-    tag: TagAtom,
-) -> RangeExpr {
+fn tag_shortcut_expr(variant: &str, hand_size: usize, board: &[u8], tag: TagAtom) -> RangeExpr {
     if board.len() < 3 || board.len() > 5 {
         return RangeExpr::Atom(RangeAtom::Never);
     }
@@ -3209,16 +4328,28 @@ fn rewrite_expr_tags_to_shortcuts(
 ) -> RangeExpr {
     match expr {
         RangeExpr::Or(left, right) => RangeExpr::Or(
-            Box::new(rewrite_expr_tags_to_shortcuts(left, variant, hand_size, board)),
-            Box::new(rewrite_expr_tags_to_shortcuts(right, variant, hand_size, board)),
+            Box::new(rewrite_expr_tags_to_shortcuts(
+                left, variant, hand_size, board,
+            )),
+            Box::new(rewrite_expr_tags_to_shortcuts(
+                right, variant, hand_size, board,
+            )),
         ),
         RangeExpr::And(left, right) => RangeExpr::And(
-            Box::new(rewrite_expr_tags_to_shortcuts(left, variant, hand_size, board)),
-            Box::new(rewrite_expr_tags_to_shortcuts(right, variant, hand_size, board)),
+            Box::new(rewrite_expr_tags_to_shortcuts(
+                left, variant, hand_size, board,
+            )),
+            Box::new(rewrite_expr_tags_to_shortcuts(
+                right, variant, hand_size, board,
+            )),
         ),
         RangeExpr::Not(left, right) => RangeExpr::Not(
-            Box::new(rewrite_expr_tags_to_shortcuts(left, variant, hand_size, board)),
-            Box::new(rewrite_expr_tags_to_shortcuts(right, variant, hand_size, board)),
+            Box::new(rewrite_expr_tags_to_shortcuts(
+                left, variant, hand_size, board,
+            )),
+            Box::new(rewrite_expr_tags_to_shortcuts(
+                right, variant, hand_size, board,
+            )),
         ),
         RangeExpr::Atom(RangeAtom::Tag(tag)) => tag_shortcut_expr(variant, hand_size, board, *tag),
         RangeExpr::Atom(atom) => RangeExpr::Atom(atom.clone()),
@@ -4425,4 +5556,254 @@ fn error_json(status: StatusCode, msg: &str) -> (StatusCode, Json<Value>) {
             "error": msg
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cards(text: &str) -> Vec<u8> {
+        parse_cards_text(text).expect("valid card text")
+    }
+
+    fn suit_counts(board: &[u8]) -> [u8; 4] {
+        let mut counts = [0u8; 4];
+        for &c in board {
+            counts[card_suit(c) as usize] = counts[card_suit(c) as usize].saturating_add(1);
+        }
+        counts
+    }
+
+    fn blocked_from(groups: &[&[u8]]) -> [bool; 52] {
+        let mut blocked = [false; 52];
+        for group in groups {
+            for &c in *group {
+                blocked[c as usize] = true;
+            }
+        }
+        blocked
+    }
+
+    #[test]
+    fn nut_flush_draw_uses_nut_card_with_support() {
+        let board = cards("7h2hKc");
+        let counts = suit_counts(&board);
+        let blocked = blocked_from(&[&board]);
+        let (_, draw_targets) = bombpot_suit_targets(&counts, &blocked);
+        let hearts = suit_char_to_idx('h').expect("hearts suit") as usize;
+
+        // Ah is available, so Ah + any other heart is the nut flush draw on this board.
+        assert_eq!(draw_targets[hearts], Some(14));
+        assert!(bombpot_is_nut_flush_draw(
+            &cards("Ah3hQsJd"),
+            &counts,
+            &draw_targets
+        ));
+        assert!(!bombpot_is_nut_flush_draw(
+            &cards("KhQhJsTd"),
+            &counts,
+            &draw_targets
+        ));
+    }
+
+    #[test]
+    fn nut_flush_draw_respects_blockers() {
+        let board = cards("7h2hKc");
+        let hero_blocker = cards("Ah");
+        let counts = suit_counts(&board);
+        let blocked = blocked_from(&[&board, &hero_blocker]);
+        let (_, draw_targets) = bombpot_suit_targets(&counts, &blocked);
+        let hearts = suit_char_to_idx('h').expect("hearts suit") as usize;
+
+        // Ah is blocked, so Kh + any other heart becomes the nut flush draw.
+        assert_eq!(draw_targets[hearts], Some(13));
+        assert!(bombpot_is_nut_flush_draw(
+            &cards("Kh3hQsJd"),
+            &counts,
+            &draw_targets
+        ));
+    }
+
+    #[test]
+    fn nut_flush_uses_nut_card_with_support_on_monotone_flop() {
+        let board = cards("Ah7h2h");
+        let counts = suit_counts(&board);
+        let blocked = blocked_from(&[&board]);
+        let (flush_targets, _) = bombpot_suit_targets(&counts, &blocked);
+        let hearts = suit_char_to_idx('h').expect("hearts suit") as usize;
+
+        // Ah on board, so Kh + any other heart is nut flush.
+        assert_eq!(flush_targets[hearts], Some(13));
+        assert!(bombpot_is_nut_flush(
+            &cards("Kh3hQsJd"),
+            &counts,
+            &flush_targets
+        ));
+        assert!(!bombpot_is_nut_flush(
+            &cards("QhJhAsKd"),
+            &counts,
+            &flush_targets
+        ));
+    }
+
+    #[test]
+    fn bombpot_category_hits_basic_sanity() {
+        let board = cards("AsKdQc");
+        let counts = suit_counts(&board);
+        let blocked = blocked_from(&[&board]);
+        let (flush_targets, draw_targets) = bombpot_suit_targets(&counts, &blocked);
+        let pair_class_lut = bombpot_build_pair_class_lut(&board);
+
+        let two_pair_hits = bombpot_opponent_hits(
+            &cards("AhKc7d6s"),
+            &board,
+            &counts,
+            &flush_targets,
+            &draw_targets,
+            &pair_class_lut,
+        );
+        assert!(two_pair_hits[BOMBPOT_CAT_2P]);
+        assert!(two_pair_hits[BOMBPOT_CAT_2P_PLUS]);
+        assert!(!two_pair_hits[BOMBPOT_CAT_SET]);
+        assert!(!two_pair_hits[BOMBPOT_CAT_FH]);
+        assert!(!two_pair_hits[BOMBPOT_CAT_FLUSH]);
+
+        let set_hits = bombpot_opponent_hits(
+            &cards("AcAd7d6s"),
+            &board,
+            &counts,
+            &flush_targets,
+            &draw_targets,
+            &pair_class_lut,
+        );
+        assert!(!set_hits[BOMBPOT_CAT_2P]);
+        assert!(set_hits[BOMBPOT_CAT_2P_PLUS]);
+        assert!(set_hits[BOMBPOT_CAT_SET]);
+    }
+
+    #[test]
+    fn bombpot_category_hits_full_house_and_flush_sanity() {
+        let board_fh = cards("AsAhKd");
+        let counts_fh = suit_counts(&board_fh);
+        let blocked_fh = blocked_from(&[&board_fh]);
+        let (flush_targets_fh, draw_targets_fh) = bombpot_suit_targets(&counts_fh, &blocked_fh);
+        let pair_class_lut_fh = bombpot_build_pair_class_lut(&board_fh);
+        let fh_hits = bombpot_opponent_hits(
+            &cards("KcKhQhJs"),
+            &board_fh,
+            &counts_fh,
+            &flush_targets_fh,
+            &draw_targets_fh,
+            &pair_class_lut_fh,
+        );
+        assert!(fh_hits[BOMBPOT_CAT_FH]);
+
+        let board_flush = cards("Ah7h2h");
+        let counts_flush = suit_counts(&board_flush);
+        let blocked_flush = blocked_from(&[&board_flush]);
+        let (flush_targets, draw_targets) = bombpot_suit_targets(&counts_flush, &blocked_flush);
+        let pair_class_lut_flush = bombpot_build_pair_class_lut(&board_flush);
+        let nut_flush_hits = bombpot_opponent_hits(
+            &cards("Kh3hQsJd"),
+            &board_flush,
+            &counts_flush,
+            &flush_targets,
+            &draw_targets,
+            &pair_class_lut_flush,
+        );
+        assert!(nut_flush_hits[BOMBPOT_CAT_FLUSH]);
+        assert!(nut_flush_hits[BOMBPOT_CAT_NUT_FLUSH]);
+
+        let non_nut_flush_hits = bombpot_opponent_hits(
+            &cards("QhJhAsKd"),
+            &board_flush,
+            &counts_flush,
+            &flush_targets,
+            &draw_targets,
+            &pair_class_lut_flush,
+        );
+        assert!(non_nut_flush_hits[BOMBPOT_CAT_FLUSH]);
+        assert!(!non_nut_flush_hits[BOMBPOT_CAT_NUT_FLUSH]);
+    }
+
+    #[test]
+    fn bombpot_pair_class_lut_matches_direct_eval() {
+        let board = cards("AsKdQc");
+        let lut = bombpot_build_pair_class_lut(&board);
+        let hands = [
+            cards("AhKc7d6s"),
+            cards("AcAd7d6s"),
+            cards("2c3d4h5s"),
+            cards("JhTh9s8d"),
+            cards("QhJh9s8d"),
+        ];
+        for hand in hands {
+            let direct = bombpot_best_omaha_hand_class(&hand, &board);
+            let via_lut = bombpot_best_omaha_hand_class_lut(&hand, &lut);
+            assert_eq!(via_lut, direct);
+        }
+    }
+
+    #[test]
+    fn bombpot_table_rows_cover_expected_player_ranges() {
+        let plo4 = run_bombpot_sim(BombpotRunConfig {
+            variant: "plo4".to_string(),
+            hand_size: 4,
+            min_players: 4,
+            max_players: 9,
+            board: cards("AsKdQc"),
+            dead: Vec::new(),
+            board_text: "AsKdQc".to_string(),
+            dead_text: "".to_string(),
+            hero_range: "*".to_string(),
+            percentile_profile: None,
+            iteration_cap: 512,
+            min_iterations: 512,
+            target_half_width_pct: 100.0,
+            workers: 2,
+            progress_token: None,
+        })
+        .expect("plo4 bombpot simulation");
+
+        assert_eq!(plo4.table_rows.len(), 6);
+        assert_eq!(plo4.table_rows.first().map(|r| r.players), Some(4));
+        assert_eq!(plo4.table_rows.last().map(|r| r.players), Some(9));
+        assert_eq!(plo4.categories.len(), 8);
+        assert!(plo4
+            .categories
+            .iter()
+            .any(|c| c.id == "nutFlushDraw" && c.label == "Nut Flush Draw"));
+
+        for cat in 0..plo4.categories.len() {
+            for i in 1..plo4.table_rows.len() {
+                assert!(
+                    plo4.table_rows[i].values[cat] >= plo4.table_rows[i - 1].values[cat],
+                    "category {} should be monotonic by opponent count",
+                    cat
+                );
+            }
+        }
+
+        let plo5 = run_bombpot_sim(BombpotRunConfig {
+            variant: "plo5".to_string(),
+            hand_size: 5,
+            min_players: 4,
+            max_players: 7,
+            board: cards("AsKdQc"),
+            dead: Vec::new(),
+            board_text: "AsKdQc".to_string(),
+            dead_text: "".to_string(),
+            hero_range: "*".to_string(),
+            percentile_profile: None,
+            iteration_cap: 384,
+            min_iterations: 384,
+            target_half_width_pct: 100.0,
+            workers: 2,
+            progress_token: None,
+        })
+        .expect("plo5 bombpot simulation");
+        assert_eq!(plo5.table_rows.len(), 4);
+        assert_eq!(plo5.table_rows.first().map(|r| r.players), Some(4));
+        assert_eq!(plo5.table_rows.last().map(|r| r.players), Some(7));
+    }
 }

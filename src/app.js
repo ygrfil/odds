@@ -29,6 +29,12 @@ const liveInfoState = {
   coverageByPlayer: new Map(),
   coverageReadyByPlayer: new Map()
 };
+const bombpotState = {
+  running: false,
+  requestId: 0,
+  progressToken: "",
+  progressTimer: null
+};
 const TAG_SHORTCUT_REMOTE_CACHE = new Map();
 const TAG_SHORTCUT_REMOTE_INFLIGHT = new Map();
 
@@ -49,11 +55,19 @@ const el = {
   helpOpen: document.querySelector("#helpOpen"),
   helpClose: document.querySelector("#helpClose"),
   helpModal: document.querySelector("#helpModal"),
+  bombpotModal: document.querySelector("#bombpotModal"),
+  bombpotClose: document.querySelector("#bombpotClose"),
   exportSetup: document.querySelector("#exportSetup"),
   importSetup: document.querySelector("#importSetup"),
   clearAll: document.querySelector("#clearAll"),
   importFile: document.querySelector("#importFile"),
-  rangePicks: document.querySelector("#rangePicks")
+  rangePicks: document.querySelector("#rangePicks"),
+  bombpotRun: document.querySelector("#bombpotRun"),
+  bombpotStatus: document.querySelector("#bombpotStatus"),
+  bombpotMeta: document.querySelector("#bombpotMeta"),
+  bombpotProgressWrap: document.querySelector("#bombpotProgressWrap"),
+  bombpotProgressBar: document.querySelector("#bombpotProgressBar"),
+  bombpotResult: document.querySelector("#bombpotResult")
 };
 const uiState = {
   rangeInputsByPlayer: new Map(),
@@ -346,8 +360,16 @@ function handSizeForVariant(variant) {
   return 6;
 }
 
+function normalizeSuitSymbols(text) {
+  return String(text || "")
+    .replace(/♣/g, "c")
+    .replace(/♦/g, "d")
+    .replace(/♥/g, "h")
+    .replace(/♠/g, "s");
+}
+
 function parseCardsText(rawText) {
-  const compact = String(rawText || "").replace(/\s+/g, "");
+  const compact = normalizeSuitSymbols(rawText).replace(/\s+/g, "");
   if (!compact) return { cards: [], invalid: false };
   const m = compact.match(/[2-9TJQKA][cdhs]/gi);
   if (!m || m.join("").toLowerCase() !== compact.toLowerCase()) {
@@ -356,8 +378,25 @@ function parseCardsText(rawText) {
   return { cards: m.map((x) => `${x[0].toUpperCase()}${x[1].toLowerCase()}`), invalid: false };
 }
 
+function explicitCardsFromRange(rangeText) {
+  const tokens = tokenizeRangeExpressionLoose(normalizeSuitSymbols(rangeText).replace(/\s+/g, ""));
+  const out = [];
+  for (const token of tokens) {
+    if (token.type !== "atom") continue;
+    const atom = normalizeSuitSymbols(String(token.value || ""));
+    const runs = atom.match(/[2-9TJQKAcdhs]+/gi) || [];
+    for (const run of runs) {
+      if (!isExplicitCardRun(run)) continue;
+      for (let i = 0; i + 1 < run.length; i += 2) {
+        out.push(`${run[i].toUpperCase()}${run[i + 1].toLowerCase()}`);
+      }
+    }
+  }
+  return out;
+}
+
 function exactCardsFromRange(rangeText, variant) {
-  const compact = String(rangeText || "").replace(/\s+/g, "");
+  const compact = normalizeSuitSymbols(rangeText).replace(/\s+/g, "");
   if (!compact || compact === "*") return null;
   if (/[,:!()@%$\[\]{}+\-]/.test(compact)) return null;
   const parsed = parseCardsText(compact);
@@ -417,11 +456,11 @@ function prettyRangeDisplayText(rangeText) {
 }
 
 function rangeConflictMessage(playerIndex, rangeText, variant, boardText, deadText) {
-  const selfExact = exactCardsFromRange(rangeText, variant);
-  if (!selfExact || !selfExact.length) return "";
+  const selfFixed = explicitCardsFromRange(rangeText);
+  if (!selfFixed.length) return "";
 
   const selfSet = new Set();
-  for (const card of selfExact) {
+  for (const card of selfFixed) {
     if (selfSet.has(card)) return `Duplicate exact card ${prettyCard(card)} in this range.`;
     selfSet.add(card);
   }
@@ -429,7 +468,7 @@ function rangeConflictMessage(playerIndex, rangeText, variant, boardText, deadTe
   const board = parseCardsText(boardText);
   if (!board.invalid) {
     const boardSet = new Set(board.cards);
-    for (const card of selfExact) {
+    for (const card of selfSet) {
       if (boardSet.has(card)) return `Exact card ${prettyCard(card)} conflicts with board.`;
     }
   }
@@ -437,17 +476,17 @@ function rangeConflictMessage(playerIndex, rangeText, variant, boardText, deadTe
   const dead = parseCardsText(deadText);
   if (!dead.invalid) {
     const deadSet = new Set(dead.cards);
-    for (const card of selfExact) {
+    for (const card of selfSet) {
       if (deadSet.has(card)) return `Exact card ${prettyCard(card)} conflicts with dead cards.`;
     }
   }
 
   for (let i = 0; i < state.players.length; i++) {
     if (i === playerIndex) continue;
-    const otherExact = exactCardsFromRange(state.players[i]?.range || "", variant);
-    if (!otherExact || !otherExact.length) continue;
-    const otherSet = new Set(otherExact);
-    for (const card of selfExact) {
+    const otherFixed = explicitCardsFromRange(state.players[i]?.range || "");
+    if (!otherFixed.length) continue;
+    const otherSet = new Set(otherFixed);
+    for (const card of selfSet) {
       if (otherSet.has(card)) {
         return `Exact card ${prettyCard(card)} overlaps with P${i + 1} range.`;
       }
@@ -891,6 +930,185 @@ function initLiveInfoWorker() {
   }
 }
 
+function initBombpotUi() {
+  setBombpotStatus("Idle.");
+  setBombpotProgress(0, false);
+  setBombpotRunning(false);
+}
+
+function bombpotCreateProgressToken() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `bombpot_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function formatEtaSeconds(seconds) {
+  const s = Number(seconds);
+  if (!Number.isFinite(s) || s < 0) return "";
+  if (s < 60) return `${Math.ceil(s)}s`;
+  const mins = Math.floor(s / 60);
+  const secs = Math.ceil(s - mins * 60);
+  if (mins < 60) return `${mins}m ${secs}s`;
+  const hours = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  return `${hours}h ${remMins}m`;
+}
+
+function setBombpotProgress(percent, visible = true) {
+  const pct = Math.max(0, Math.min(100, Number(percent) || 0));
+  if (el.bombpotProgressBar) el.bombpotProgressBar.style.width = `${pct.toFixed(1)}%`;
+  if (el.bombpotProgressWrap) {
+    el.bombpotProgressWrap.classList.toggle("hidden", !visible);
+    el.bombpotProgressWrap.setAttribute("aria-hidden", visible ? "false" : "true");
+  }
+}
+
+function stopBombpotProgressPolling() {
+  if (bombpotState.progressTimer) {
+    clearInterval(bombpotState.progressTimer);
+    bombpotState.progressTimer = null;
+  }
+  bombpotState.progressToken = "";
+}
+
+function updateBombpotProgressUi(progress) {
+  const status = String(progress?.status || "running");
+  const it = Number(progress?.iterations || 0);
+  const cap = Number(progress?.iterationCap || 0);
+  const minIt = Number(progress?.minIterations || 0);
+  const pctCap = Number(progress?.percentOfCap || 0);
+  const ips = Number(progress?.ips || 0);
+  const etaCap = Number(progress?.etaCapSeconds);
+  const ciNow = Number(progress?.maxHalfWidthPct);
+  const ciTarget = Number(progress?.targetHalfWidthPct);
+
+  let visualPct = 0;
+  if (status === "done") {
+    visualPct = 100;
+  } else if (status === "error") {
+    visualPct = 0;
+  } else if (minIt > 0 && it < minIt) {
+    visualPct = Math.min(55, (it * 55) / minIt);
+  } else if (Number.isFinite(ciNow) && ciNow > 0 && Number.isFinite(ciTarget) && ciTarget > 0) {
+    visualPct = 55 + Math.min(45, Math.max(0, (ciTarget / ciNow) * 45));
+  } else if (cap > 0) {
+    visualPct = Math.min(95, (it * 95) / cap);
+  }
+  setBombpotProgress(visualPct, true);
+
+  if (!bombpotState.running) return;
+  if (status === "error") {
+    setBombpotStatus(`Error: ${progress?.error || "bombpot failed"}`);
+    return;
+  }
+
+  const parts = [];
+  parts.push(`${it.toLocaleString()} deals`);
+  if (cap > 0) parts.push(`${pctCap.toFixed(1)}% of cap`);
+  if (Number.isFinite(ips) && ips > 0) parts.push(`${Math.round(ips).toLocaleString()} deals/s`);
+  if (Number.isFinite(etaCap) && etaCap >= 0) {
+    const etaText = formatEtaSeconds(etaCap);
+    if (etaText) parts.push(`up to ${etaText} left`);
+  }
+  if (minIt > 0 && it < minIt) {
+    parts.push(`baseline ${Math.min(100, (it * 100) / minIt).toFixed(0)}%`);
+  }
+  if (Number.isFinite(ciNow) && ciNow > 0 && Number.isFinite(ciTarget) && ciTarget > 0) {
+    parts.push(`CI95 +/-${ciNow.toFixed(2)}% (target +/-${ciTarget.toFixed(2)}%)`);
+  }
+  setBombpotStatus(parts.join(" | "));
+}
+
+function startBombpotProgressPolling(requestId, token) {
+  stopBombpotProgressPolling();
+  bombpotState.progressToken = token;
+  let inFlight = false;
+  const poll = async () => {
+    if (inFlight) return;
+    if (!bombpotState.running || requestId !== bombpotState.requestId) return;
+    inFlight = true;
+    try {
+      const res = await fetch(`/api/sim/bombpot/progress/${encodeURIComponent(token)}`, {
+        cache: "no-store",
+        headers: { Accept: "application/json" }
+      });
+      if (!res.ok) return;
+      const payload = await res.json();
+      if (!payload?.ok || !payload?.progress) return;
+      if (!bombpotState.running || requestId !== bombpotState.requestId) return;
+      updateBombpotProgressUi(payload.progress);
+    } catch {
+      // keep running; next poll may recover
+    } finally {
+      inFlight = false;
+    }
+  };
+  poll();
+  bombpotState.progressTimer = setInterval(poll, 320);
+}
+
+async function runBombpot() {
+  openBombpot();
+  if (bombpotState.running) return;
+
+  const variant = String(el.variant?.value || "").toLowerCase();
+  if (!supportsBombpotVariant(variant)) {
+    setBombpotProgress(0, false);
+    setBombpotStatus("Bombpot supports only PLO4 and PLO5.");
+    return;
+  }
+
+  const requestId = bombpotState.requestId + 1;
+  bombpotState.requestId = requestId;
+  const progressToken = bombpotCreateProgressToken();
+  setBombpotRunning(true);
+  setBombpotProgress(0, true);
+  setBombpotStatus("Starting bombpot...");
+  startBombpotProgressPolling(requestId, progressToken);
+
+  try {
+    const res = await fetch("/api/sim/bombpot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        variant,
+        percentileProfile: currentOrderingProfile(variant),
+        board: String(el.board?.value || "").trim(),
+        dead: String(el.dead?.value || "").trim(),
+        heroRange: String(state.players?.[0]?.range || "*").trim() || "*",
+        progressToken
+      })
+    });
+
+    let payload = null;
+    try {
+      payload = await res.json();
+    } catch {
+      payload = null;
+    }
+
+    if (requestId !== bombpotState.requestId) return;
+    if (!res.ok || !payload?.ok || !payload?.result) {
+      throw new Error(payload?.error || `Backend error (${res.status})`);
+    }
+
+    const result = payload.result;
+    renderBombpotResultTable(result);
+    const it = Number(result.iterations || 0);
+    const half = Number(result.maxHalfWidthPct || 0);
+    setBombpotProgress(100, true);
+    setBombpotStatus(`${it.toLocaleString()} deals, max CI95 +/-${half.toFixed(2)}%`);
+  } catch (err) {
+    if (requestId !== bombpotState.requestId) return;
+    setBombpotProgress(0, false);
+    setBombpotStatus(`Error: ${err?.message || String(err)}`);
+  } finally {
+    stopBombpotProgressPolling();
+    if (requestId === bombpotState.requestId) setBombpotRunning(false);
+  }
+}
+
 function pruneLiveInfoState() {
   const maxPlayers = state.players.length;
   for (const [idx, timer] of liveInfoState.timers.entries()) {
@@ -1060,6 +1278,7 @@ function applyQuickPick(token) {
 }
 
 function openHelp() {
+  closeBombpot();
   el.helpModal.classList.remove("hidden");
 }
 
@@ -1067,8 +1286,100 @@ function closeHelp() {
   el.helpModal.classList.add("hidden");
 }
 
+function openBombpot() {
+  closeHelp();
+  if (el.bombpotModal) el.bombpotModal.classList.remove("hidden");
+}
+
+function closeBombpot() {
+  if (el.bombpotModal) el.bombpotModal.classList.add("hidden");
+}
+
 function setStatus(msg) {
   el.status.textContent = msg;
+}
+
+function supportsBombpotVariant(variant) {
+  const v = String(variant || "").toLowerCase();
+  return v === "plo4" || v === "plo5";
+}
+
+function setBombpotStatus(text) {
+  if (!el.bombpotStatus) return;
+  el.bombpotStatus.textContent = String(text || "");
+}
+
+function setBombpotMeta(text) {
+  if (!el.bombpotMeta) return;
+  setSuitStyledText(el.bombpotMeta, String(text || ""));
+}
+
+function clearBombpotResultTable() {
+  if (!el.bombpotResult) return;
+  el.bombpotResult.innerHTML = "";
+}
+
+function formatBombpotPercent(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "-";
+  return `${n.toFixed(2)}%`;
+}
+
+function setBombpotRunning(running) {
+  bombpotState.running = !!running;
+  if (el.bombpotRun) el.bombpotRun.disabled = bombpotState.running;
+}
+
+function renderBombpotResultTable(payload) {
+  if (!el.bombpotResult) return;
+  clearBombpotResultTable();
+
+  const categories = Array.isArray(payload?.categories) ? payload.categories : [];
+  const rows = Array.isArray(payload?.tableRows) ? payload.tableRows : [];
+  if (!categories.length || !rows.length) {
+    setBombpotStatus("Bombpot returned no data.");
+    return;
+  }
+
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  const playersHead = document.createElement("th");
+  playersHead.textContent = "Players";
+  headRow.appendChild(playersHead);
+  for (const cat of categories) {
+    const th = document.createElement("th");
+    th.textContent = cat?.label || cat?.id || "?";
+    headRow.appendChild(th);
+  }
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  for (const row of rows) {
+    const tr = document.createElement("tr");
+    const tdPlayers = document.createElement("td");
+    tdPlayers.textContent = `${Number(row?.players) || 0}p`;
+    tr.appendChild(tdPlayers);
+
+    const values = Array.isArray(row?.values) ? row.values : [];
+    for (let i = 0; i < categories.length; i++) {
+      const td = document.createElement("td");
+      td.textContent = formatBombpotPercent(values[i]);
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+
+  el.bombpotResult.appendChild(table);
+
+  const boardText = String(payload?.boardText || "").trim();
+  const deadText = String(payload?.deadText || "").trim();
+  const heroRange = String(payload?.heroRange || "*").trim() || "*";
+  const boardShown = boardText ? withSuitSymbols(boardText) : "-";
+  const deadShown = deadText ? withSuitSymbols(deadText) : "-";
+  setBombpotMeta(`P1 range: ${heroRange} | Board: ${boardShown} | Dead: ${deadShown}`);
 }
 
 function renderSummary(result) {
@@ -1518,6 +1829,10 @@ function clearAllFields() {
   renderSummary(state.lastResult);
   renderPlayers();
   updateBoardPrettyPreview();
+  clearBombpotResultTable();
+  setBombpotMeta("");
+  setBombpotProgress(0, false);
+  if (!bombpotState.running) setBombpotStatus("Idle.");
   saveLocal();
   setStatus("Cleared board, dead cards, ranges, and results.");
 }
@@ -1608,14 +1923,26 @@ function wire() {
 
   el.run.addEventListener("click", run);
   el.stop.addEventListener("click", stopRun);
+  if (el.bombpotRun) el.bombpotRun.addEventListener("click", runBombpot);
   if (el.clearAll) el.clearAll.addEventListener("click", clearAllFields);
   el.helpOpen.addEventListener("click", openHelp);
   el.helpClose.addEventListener("click", closeHelp);
+  if (el.bombpotClose) el.bombpotClose.addEventListener("click", closeBombpot);
   el.helpModal.addEventListener("click", (event) => {
     if (event.target === el.helpModal) closeHelp();
   });
+  if (el.bombpotModal) {
+    el.bombpotModal.addEventListener("click", (event) => {
+      if (event.target === el.bombpotModal) closeBombpot();
+    });
+  }
   window.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !el.helpModal.classList.contains("hidden")) closeHelp();
+    if (event.key !== "Escape") return;
+    if (el.helpModal && !el.helpModal.classList.contains("hidden")) {
+      closeHelp();
+      return;
+    }
+    if (el.bombpotModal && !el.bombpotModal.classList.contains("hidden")) closeBombpot();
   });
 
   el.exportSetup.addEventListener("click", exportSetup);
@@ -1635,6 +1962,14 @@ function wire() {
     syncOrderingProfileControl();
     saveLocal();
     renderPlayers();
+    setBombpotRunning(bombpotState.running);
+    if (!supportsBombpotVariant(el.variant.value) && !bombpotState.running) {
+      setBombpotProgress(0, false);
+      setBombpotStatus("Bombpot supports only PLO4 and PLO5.");
+    } else if (!bombpotState.running) {
+      setBombpotProgress(0, false);
+      setBombpotStatus("Idle.");
+    }
   });
   if (el.orderingProfile) {
     el.orderingProfile.addEventListener("change", () => {
@@ -1651,6 +1986,7 @@ loadLocal();
 syncOrderingProfileControl();
 updateBoardPrettyPreview();
 initLiveInfoWorker();
+initBombpotUi();
 renderQuickPicks();
 renderSummary(state.lastResult);
 renderPlayers();
@@ -1659,4 +1995,7 @@ window.addEventListener("beforeunload", () => {
   if (liveInfoState.worker) liveInfoState.worker.terminate();
 });
 el.stop.disabled = true;
+setBombpotMeta("Uses P1 range as hero filter. Opponents are always 100% random.");
+if (!supportsBombpotVariant(el.variant.value)) setBombpotStatus("Bombpot supports only PLO4 and PLO5.");
+setBombpotRunning(false);
 setStatus("Idle.");

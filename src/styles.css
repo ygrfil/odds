@@ -184,6 +184,7 @@ button.primary {
   gap: 5px;
   overflow: auto;
   min-height: 0;
+  flex: 1 1 auto;
   -webkit-overflow-scrolling: touch;
 }
 
@@ -561,6 +562,66 @@ th { color: var(--muted); font-weight: 700; }
 #playersPanel {
   display: flex;
   flex-direction: column;
+}
+
+.bombpot-card {
+  width: min(980px, 100%);
+}
+
+.bombpot-meta-wrap {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.bombpot-progress {
+  position: relative;
+  width: 100%;
+  height: 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: #0a1320;
+  overflow: hidden;
+}
+
+.bombpot-progress.hidden {
+  display: none;
+}
+
+.bombpot-progress-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #36c7ff 0%, #7cf57b 100%);
+  transition: width 0.22s ease;
+}
+
+.bombpot-result-wrap {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #0d1726;
+  max-height: min(64vh, 560px);
+  overflow: auto;
+}
+
+.bombpot-result-wrap table {
+  min-width: 620px;
+}
+
+.bombpot-result-wrap th,
+.bombpot-result-wrap td {
+  font-size: 11px;
+}
+
+.bombpot-result-wrap th:first-child,
+.bombpot-result-wrap td:first-child {
+  position: sticky;
+  left: 0;
+  background: #0d1726;
+  z-index: 1;
+}
+
+.bombpot-result-wrap th:first-child {
+  z-index: 2;
 }
 
 .help-modal {
