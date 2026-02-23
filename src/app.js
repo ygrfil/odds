@@ -35,6 +35,9 @@ const bombpotState = {
   progressToken: "",
   progressTimer: null
 };
+const BOMBPOT_RUNTIME_MULTIPLIER = 1.6;
+const BOMBPOT_RUNTIME_MIN_MS = 20_000;
+const BOMBPOT_RUNTIME_MAX_MS = 900_000;
 const TAG_SHORTCUT_REMOTE_CACHE = new Map();
 const TAG_SHORTCUT_REMOTE_INFLIGHT = new Map();
 
@@ -964,6 +967,12 @@ function setBombpotProgress(percent, visible = true) {
   }
 }
 
+function bombpotRuntimeCapMs(precisionConfig) {
+  const baseCap = Number(precisionConfig?.iterationCap || 0);
+  const scaled = Math.round(baseCap * BOMBPOT_RUNTIME_MULTIPLIER);
+  return Math.max(BOMBPOT_RUNTIME_MIN_MS, Math.min(BOMBPOT_RUNTIME_MAX_MS, scaled));
+}
+
 function stopBombpotProgressPolling() {
   if (bombpotState.progressTimer) {
     clearInterval(bombpotState.progressTimer);
@@ -1065,6 +1074,7 @@ async function runBombpot() {
   const requestId = bombpotState.requestId + 1;
   bombpotState.requestId = requestId;
   const progressToken = bombpotCreateProgressToken();
+  const maxRuntimeMs = bombpotRuntimeCapMs(precisionConfig);
   setBombpotRunning(true);
   setBombpotProgress(0, true);
   setBombpotStatus("Starting bombpot...");
@@ -1083,6 +1093,7 @@ async function runBombpot() {
         iterationCap: precisionConfig.iterationCap,
         minIterations: precisionConfig.min,
         targetHalfWidthPct: precisionConfig.target,
+        maxRuntimeMs,
         progressToken
       })
     });
@@ -1103,8 +1114,19 @@ async function runBombpot() {
     renderBombpotResultTable(result);
     const it = Number(result.iterations || 0);
     const half = Number(result.maxHalfWidthPct || 0);
+    const stoppedByRuntime = !!result.stoppedByRuntime;
+    const elapsedMs = Number(result.elapsedMs || 0);
+    const elapsedSec = Number.isFinite(elapsedMs) ? (elapsedMs / 1000).toFixed(1) : "?";
+    const runtimeCapMs = Number(result.runtimeCapMs || maxRuntimeMs || 0);
+    const runtimeCapSec = Number.isFinite(runtimeCapMs) ? (runtimeCapMs / 1000).toFixed(0) : "?";
     setBombpotProgress(100, true);
-    setBombpotStatus(`${it.toLocaleString()} deals, max CI95 +/-${half.toFixed(2)}%`);
+    if (stoppedByRuntime) {
+      setBombpotStatus(
+        `${it.toLocaleString()} deals, max CI95 +/-${half.toFixed(2)}% | Runtime safeguard hit at ${elapsedSec}s (cap ${runtimeCapSec}s)`
+      );
+    } else {
+      setBombpotStatus(`${it.toLocaleString()} deals, max CI95 +/-${half.toFixed(2)}%`);
+    }
   } catch (err) {
     if (requestId !== bombpotState.requestId) return;
     setBombpotProgress(0, false);

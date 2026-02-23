@@ -112,6 +112,8 @@ struct BombpotRequest {
     workers: Option<usize>,
     #[serde(default)]
     progress_token: Option<String>,
+    #[serde(default)]
+    max_runtime_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Clone, Copy)]
@@ -135,6 +137,9 @@ struct BombpotResultOut {
     variant: String,
     iterations: usize,
     max_half_width_pct: f64,
+    elapsed_ms: f64,
+    stopped_by_runtime: bool,
+    runtime_cap_ms: u64,
     categories: Vec<BombpotCategoryOut>,
     hero_range: String,
     board_text: String,
@@ -376,6 +381,7 @@ const BOMBPOT_DEFAULT_MIN_ITER: usize = 25_000;
 const BOMBPOT_DEFAULT_TARGET_HALF_WIDTH_PCT: f64 = 0.10;
 const BOMBPOT_DEFAULT_WORKERS_MAX: usize = 16;
 const BOMBPOT_PROGRESS_BATCH_BASE_ITERS: usize = 2048;
+const BOMBPOT_DEFAULT_MAX_RUNTIME_MS: u64 = 600_000;
 const BOMBPOT_HERO_ACCEPTANCE_POOL_THRESHOLD: f64 = 0.04;
 const BOMBPOT_HERO_MAX_SAMPLE_ATTEMPTS: usize = 20_000;
 const BOMBPOT_CI95_Z: f64 = 1.959_963_984_540_054;
@@ -513,6 +519,11 @@ fn env_u64(name: &str) -> Option<u64> {
 fn sim_max_runtime_ms_env() -> Option<u64> {
     static VALUE: OnceLock<Option<u64>> = OnceLock::new();
     *VALUE.get_or_init(|| env_u64("SIM_MAX_RUNTIME_MS"))
+}
+
+fn bombpot_max_runtime_ms_env() -> Option<u64> {
+    static VALUE: OnceLock<Option<u64>> = OnceLock::new();
+    *VALUE.get_or_init(|| env_u64("BOMBPOT_MAX_RUNTIME_MS"))
 }
 
 fn resolve_static_root() -> Result<PathBuf, std::io::Error> {
@@ -904,6 +915,7 @@ struct BombpotRunConfig {
     target_half_width_pct: f64,
     workers: usize,
     progress_token: Option<String>,
+    max_runtime_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1189,6 +1201,11 @@ async fn sim_bombpot(Json(req): Json<BombpotRequest>) -> (StatusCode, Json<Value
         BOMBPOT_DEFAULT_TARGET_HALF_WIDTH_PCT,
     );
     let workers = bombpot_normalize_workers(req.workers);
+    let max_runtime_ms = req
+        .max_runtime_ms
+        .filter(|v| *v > 0)
+        .or_else(bombpot_max_runtime_ms_env)
+        .unwrap_or(BOMBPOT_DEFAULT_MAX_RUNTIME_MS);
     let progress_token = req
         .progress_token
         .as_deref()
@@ -1212,6 +1229,7 @@ async fn sim_bombpot(Json(req): Json<BombpotRequest>) -> (StatusCode, Json<Value
         target_half_width_pct,
         workers,
         progress_token: progress_token.clone(),
+        max_runtime_ms,
     };
     if let Some(token) = progress_token.as_deref() {
         bombpot_progress_start(token, &config);
@@ -1774,6 +1792,7 @@ fn bombpot_run_parallel_batch(
 }
 
 fn run_bombpot_sim(cfg: BombpotRunConfig) -> Result<BombpotResultOut, String> {
+    let started = Instant::now();
     let base_deck = base_deck(&cfg.board, &cfg.dead);
     if base_deck.len() < cfg.max_players * cfg.hand_size {
         return Err("not enough undealt cards for maximum bombpot table".to_string());
@@ -1820,8 +1839,21 @@ fn run_bombpot_sim(cfg: BombpotRunConfig) -> Result<BombpotResultOut, String> {
     };
     let mut progress_half = None::<f64>;
     let mut seed_rng = SmallRng::from_entropy();
+    let mut stopped_by_runtime = false;
 
     while iterations < cfg.iteration_cap {
+        let elapsed_ms_now = started.elapsed().as_millis() as u64;
+        if elapsed_ms_now >= cfg.max_runtime_ms {
+            if iterations < cfg.min_iterations {
+                return Err(format!(
+                    "bombpot runtime guard hit at {:.1}s before minimum iterations; choose faster precision or increase limits",
+                    cfg.max_runtime_ms as f64 / 1000.0
+                ));
+            }
+            stopped_by_runtime = true;
+            break;
+        }
+
         let remaining = cfg.iteration_cap.saturating_sub(iterations);
         let batch_cap = cfg
             .workers
@@ -1853,6 +1885,7 @@ fn run_bombpot_sim(cfg: BombpotRunConfig) -> Result<BombpotResultOut, String> {
     }
     let max_half =
         progress_half.unwrap_or_else(|| bombpot_max_half_width_pct(&hit_rows, iterations));
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     let mut table_rows = Vec::<BombpotRowOut>::with_capacity(row_count);
     for row_idx in 0..row_count {
@@ -1873,6 +1906,9 @@ fn run_bombpot_sim(cfg: BombpotRunConfig) -> Result<BombpotResultOut, String> {
         variant: cfg.variant,
         iterations,
         max_half_width_pct: max_half,
+        elapsed_ms,
+        stopped_by_runtime,
+        runtime_cap_ms: cfg.max_runtime_ms,
         categories: BOMBPOT_CATEGORY_DEFS.to_vec(),
         hero_range: cfg.hero_range,
         board_text: cfg.board_text,
@@ -5762,6 +5798,7 @@ mod tests {
             target_half_width_pct: 100.0,
             workers: 2,
             progress_token: None,
+            max_runtime_ms: 60_000,
         })
         .expect("plo4 bombpot simulation");
 
@@ -5800,6 +5837,7 @@ mod tests {
             target_half_width_pct: 100.0,
             workers: 2,
             progress_token: None,
+            max_runtime_ms: 60_000,
         })
         .expect("plo5 bombpot simulation");
         assert_eq!(plo5.table_rows.len(), 4);
