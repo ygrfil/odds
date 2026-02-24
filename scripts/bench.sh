@@ -7,6 +7,7 @@ RUNS="${RUNS:-7}"
 PORT_BASE="${PORT_BASE:-8920}"
 ITER_CAP="${ITER_CAP:-200000}"
 BUILD_RELEASE="${BUILD_RELEASE:-1}"
+PRECOMPRESS_STATIC="${PRECOMPRESS_STATIC:-0}"
 OUT_DIR="${OUT_DIR:-${ROOT_DIR}/.bench/$(date +%Y%m%d-%H%M%S)}"
 
 mkdir -p "${OUT_DIR}"
@@ -30,7 +31,7 @@ Usage:
   scripts/bench.sh compare <before_summary.json> <after_summary.json>
 
 Run mode env vars:
-  RUNS=7 ITER_CAP=200000 PORT_BASE=8920 BUILD_RELEASE=1 OUT_DIR=...
+  RUNS=7 ITER_CAP=200000 PORT_BASE=8920 BUILD_RELEASE=1 PRECOMPRESS_STATIC=0 OUT_DIR=...
 EOF
 }
 
@@ -289,6 +290,10 @@ log "output directory: ${OUT_DIR}"
 if [[ "${BUILD_RELEASE}" == "1" ]]; then
   log "building release binary"
   (cd "${ROOT_DIR}" && cargo build -p odds --release >/dev/null)
+fi
+if [[ "${PRECOMPRESS_STATIC}" == "1" ]]; then
+  log "precompressing static assets"
+  "${ROOT_DIR}/scripts/precompress-static.sh" "${ROOT_DIR}" >/dev/null
 fi
 if [[ ! -x "${BIN_PATH}" ]]; then
   echo "missing binary: ${BIN_PATH}" >&2
