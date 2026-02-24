@@ -117,6 +117,7 @@ apt_packages=(
   ca-certificates
   curl
   git
+  gzip
 )
 if [[ "${ENABLE_NGINX}" == "true" ]]; then
   apt_packages+=(nginx)
@@ -180,6 +181,7 @@ $SUDO tee "${APP_DIR}/build-info.json" >/dev/null <<EOF
   "deployedAtUtc": "${DEPLOY_TIME_UTC}"
 }
 EOF
+$SUDO "${REPO_DIR}/scripts/precompress-static.sh" "${APP_DIR}"
 $SUDO chown -R "${APP_USER}:${APP_GROUP}" "${APP_DIR}"
 
 log "Writing environment file"

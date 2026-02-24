@@ -469,6 +469,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.trim().parse::<u16>().ok())
         .unwrap_or(8789);
 
+    let static_service = ServeDir::new(static_root.clone())
+        .precompressed_br()
+        .precompressed_gzip();
+
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/sim/run", post(sim_run))
@@ -480,7 +484,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(sim_bombpot_progress),
         )
         .route("/api/sim/bombpot", post(sim_bombpot))
-        .fallback_service(ServeDir::new(static_root.clone()))
+        .fallback_service(static_service)
         .layer(middleware::from_fn(static_cache_headers))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http());
@@ -536,6 +540,7 @@ fn resolve_static_root() -> Result<PathBuf, std::io::Error> {
 async fn static_cache_headers(req: Request, next: Next) -> Response {
     let is_get_or_head = *req.method() == Method::GET || *req.method() == Method::HEAD;
     let path = req.uri().path().to_string();
+    let query = req.uri().query().unwrap_or("").to_string();
     let is_api = path.starts_with("/api/");
 
     let mut res = next.run(req).await;
@@ -545,9 +550,31 @@ async fn static_cache_headers(req: Request, next: Next) -> Response {
     }
 
     let headers = res.headers_mut();
-    if path == "/"
-        || path.ends_with(".html")
-        || path.ends_with(".js")
+    if path == "/" || path.ends_with(".html") {
+        headers.insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("no-cache, must-revalidate, max-age=0"),
+        );
+        return res;
+    }
+
+    if is_percentile_table_asset(&path) {
+        if has_version_query(&query) {
+            // Versioned URLs can be cached aggressively and invalidated by changing `v=`.
+            headers.insert(
+                CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
+            );
+        } else {
+            headers.insert(
+                CACHE_CONTROL,
+                HeaderValue::from_static("no-cache, must-revalidate, max-age=0"),
+            );
+        }
+        return res;
+    }
+
+    if path.ends_with(".js")
         || path.ends_with(".json")
         || path.ends_with(".mjs")
         || path.ends_with(".css")
@@ -563,7 +590,7 @@ async fn static_cache_headers(req: Request, next: Next) -> Response {
         || path.ends_with(".woff2")
         || path.ends_with(".ttf")
     {
-        // Non-fingerprinted assets should never be cached at intermediaries.
+        // Non-versioned assets should never be cached at intermediaries.
         headers.insert(
             CACHE_CONTROL,
             HeaderValue::from_static("no-cache, must-revalidate, max-age=0"),
@@ -571,6 +598,20 @@ async fn static_cache_headers(req: Request, next: Next) -> Response {
         return res;
     }
     res
+}
+
+fn is_percentile_table_asset(path: &str) -> bool {
+    (path.ends_with("/src/percentile-tables.js")
+        || path.ends_with("/src/percentile-tables-ppt6max.js"))
+        || path == "/src/percentile-tables.js"
+        || path == "/src/percentile-tables-ppt6max.js"
+}
+
+fn has_version_query(query: &str) -> bool {
+    query.split('&').any(|part| {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        key == "v" && !value.is_empty()
+    })
 }
 
 async fn shutdown_signal() {

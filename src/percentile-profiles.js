@@ -34,6 +34,7 @@ const PROFILE_TABLE_MODULES = {
 
 const PROFILE_TABLE_CACHE = new Map();
 const PROFILE_TABLE_LOADS = new Map();
+let BUILD_VERSION_LOAD = null;
 
 function loadedProfileTables(profile) {
   return PROFILE_TABLE_CACHE.get(profile) || null;
@@ -51,7 +52,9 @@ async function loadProfileTables(profile) {
 
   const load = (async () => {
     try {
-      const mod = await import(spec.modulePath);
+      const version = await loadBuildVersion();
+      const modulePath = withVersionQuery(spec.modulePath, version);
+      const mod = await import(modulePath);
       const tables = mod?.[spec.exportName] || null;
       PROFILE_TABLE_CACHE.set(profile, tables);
       return tables;
@@ -65,6 +68,28 @@ async function loadProfileTables(profile) {
 
   PROFILE_TABLE_LOADS.set(profile, load);
   return load;
+}
+
+async function loadBuildVersion() {
+  if (BUILD_VERSION_LOAD) return BUILD_VERSION_LOAD;
+  BUILD_VERSION_LOAD = (async () => {
+    try {
+      const res = await fetch("/build-info.json", { cache: "no-store" });
+      if (!res.ok) return "";
+      const data = await res.json();
+      return String(data?.gitSha || data?.deployedAtUtc || "").trim();
+    } catch {
+      return "";
+    }
+  })();
+  return BUILD_VERSION_LOAD;
+}
+
+function withVersionQuery(path, version) {
+  const v = String(version || "").trim();
+  if (!v) return path;
+  const sep = path.includes("?") ? "&" : "?";
+  return `${path}${sep}v=${encodeURIComponent(v)}`;
 }
 
 export function percentileProfileOptionsForVariant(variant) {

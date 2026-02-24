@@ -158,6 +158,12 @@ Optional overrides:
 RUNS=10 ITER_CAP=300000 PORT_BASE=9100 ./scripts/bench.sh
 ```
 
+Optionally benchmark with precompressed static assets (`.gz` and optional `.br`) enabled:
+
+```bash
+PRECOMPRESS_STATIC=1 ./scripts/bench.sh
+```
+
 Compare two benchmark summaries:
 
 ```bash
