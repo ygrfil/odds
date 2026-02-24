@@ -1464,14 +1464,6 @@ async fn sim_bombpot(Json(req): Json<BombpotRequest>) -> (StatusCode, Json<Value
     );
     let workers = bombpot_normalize_workers(req.workers);
     let runtime_cap_ms = bombpot_runtime_cap_ms();
-    if let Some(ms) = req.max_runtime_ms.filter(|v| *v > 0) {
-        if ms > runtime_cap_ms {
-            return error_json(
-                StatusCode::BAD_REQUEST,
-                &format!("maxRuntimeMs exceeds maximum of {runtime_cap_ms}"),
-            );
-        }
-    }
     let max_runtime_ms = req
         .max_runtime_ms
         .filter(|v| *v > 0)
@@ -2220,11 +2212,6 @@ fn prepare_native_request(cfg: &RunConfig, workers: Option<usize>) -> Result<Nat
     validate_disjoint(&board, &dead)?;
 
     let runtime_cap_ms = sim_runtime_cap_ms();
-    if let Some(ms) = cfg.max_runtime_ms.filter(|v| *v > 0) {
-        if ms > runtime_cap_ms {
-            return Err(format!("maxRuntimeMs exceeds maximum of {runtime_cap_ms}"));
-        }
-    }
     let max_runtime_ms = cfg
         .max_runtime_ms
         .filter(|v| *v > 0)
