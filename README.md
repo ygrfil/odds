@@ -135,6 +135,11 @@ sudo systemctl restart nginx
 
 Then open `http://<LXC_IP>/index.html`.
 
+### Cloudflare bridge notes
+- Keep API request runtime under Cloudflare edge timeout; installer defaults set simulation/bombpot runtime to `55s` and preview runtime to `45s`.
+- Nginx config trusts `CF-Connecting-IP` only from localhost (`cloudflared` on the same node), so per-IP rate limiting works correctly.
+- Nginx `/api/` location has explicit request/connection limits and tighter upstream timeouts to fail fast under overload.
+
 ### Runtime env vars
 - `PORT` (default `8789`)
 - `HOST` (default `0.0.0.0`)
@@ -142,7 +147,12 @@ Then open `http://<LXC_IP>/index.html`.
 - `RUST_LOG` (default `odds=info,tower_http=info`)
 - `PREWARM_PERCENTILES` (default `true`)
 - `PREWARM_PERCENTILES_BLOCKING` (default `false`, when `true` warms tables before accepting traffic)
-- `SIM_MAX_RUNTIME_MS` (default unset; LXC installer sets `55000` to stop long-running sims before proxy timeouts)
+- `SIM_MAX_RUNTIME_MS` (default unset; LXC installer sets `55000`)
+- `PREVIEW_MAX_RUNTIME_MS` (default `45000`)
+- `BOMBPOT_MAX_RUNTIME_MS` (default unset; LXC installer sets `55000`)
+- `SIM_MAX_RUNTIME_MS_CAP` (default `3600000`; installer sets `90000`)
+- `BOMBPOT_MAX_RUNTIME_MS_CAP` (default `3600000`; installer sets `90000`)
+- `REQUEST_BODY_LIMIT_BYTES` (default `262144`)
 
 ## Benchmark
 Run repeatable local benchmarks (startup, percentile cold/warm latency, sim API, static transfer):
@@ -179,3 +189,4 @@ Compare two benchmark summaries:
 - Player count: 2 to 6.
 - Monte Carlo + exact mode (exact when all players are exact suited hands).
 - Range syntax includes combinators, macros, weighted atoms, and percentile forms.
+- Random hand selection from candidate pools uses bounded partial-shuffle sampling (uniform without replacement), removing probabilistic unbounded loops without changing result accuracy.

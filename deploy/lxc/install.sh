@@ -191,6 +191,11 @@ RUST_LOG=odds=info,tower_http=warn
 PREWARM_PERCENTILES=true
 PREWARM_PERCENTILES_BLOCKING=false
 SIM_MAX_RUNTIME_MS=55000
+PREVIEW_MAX_RUNTIME_MS=45000
+BOMBPOT_MAX_RUNTIME_MS=55000
+SIM_MAX_RUNTIME_MS_CAP=90000
+BOMBPOT_MAX_RUNTIME_MS_CAP=90000
+REQUEST_BODY_LIMIT_BYTES=262144
 EOF
 $SUDO chmod 640 "${ENV_DIR}/${APP_NAME}.env"
 
@@ -233,13 +238,24 @@ Environment=HOST=127.0.0.1
 Environment=APP_STATIC_ROOT=${APP_DIR}
 EnvironmentFile=-${ENV_DIR}/${APP_NAME}.env
 ExecStart=${APP_DIR}/odds
-Restart=on-failure
-RestartSec=3
+Restart=always
+RestartSec=2
+TimeoutStopSec=20
+KillSignal=SIGINT
 NoNewPrivileges=true
 ${CAP_NET_BIND_LINES}
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=full
 ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+TasksMax=512
 LimitNOFILE=65535
 
 [Install]
@@ -249,17 +265,45 @@ EOF
 if [[ "${ENABLE_NGINX}" == "true" ]]; then
   log "Installing nginx reverse proxy config"
   $SUDO tee "${NGINX_SITE}" >/dev/null <<EOF
+# This file is included from nginx.conf inside \`http { ... }\`.
+limit_req_zone \$binary_remote_addr zone=odds_api_per_ip:10m rate=20r/s;
+limit_conn_zone \$binary_remote_addr zone=odds_api_conn_per_ip:10m;
+
 server {
     listen 80;
     server_name ${DOMAIN};
 
+    client_max_body_size 256k;
+    real_ip_header CF-Connecting-IP;
+    set_real_ip_from 127.0.0.1;
+    set_real_ip_from ::1;
+    real_ip_recursive on;
+
+    location /api/ {
+        limit_req zone=odds_api_per_ip burst=60 nodelay;
+        limit_conn odds_api_conn_per_ip 24;
+
+        proxy_pass http://127.0.0.1:${PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 3s;
+        proxy_send_timeout 70s;
+        proxy_read_timeout 70s;
+        send_timeout 70s;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:${PORT};
         proxy_http_version 1.1;
-        proxy_connect_timeout 5s;
-        proxy_send_timeout 180s;
-        proxy_read_timeout 180s;
-        send_timeout 180s;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 3s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 30s;
+        send_timeout 30s;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;

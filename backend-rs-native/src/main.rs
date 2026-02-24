@@ -1,4 +1,4 @@
-use axum::extract::{Path, Request};
+use axum::extract::{DefaultBodyLimit, Path, Request};
 use axum::http::{header::CACHE_CONTROL, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -15,7 +15,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
@@ -332,6 +332,18 @@ const MACRO_REPLACEMENTS: [(&str, &str); 21] = [
 ];
 const PERCENTILE_SAMPLE_SIZE: usize = 30_000;
 const PREVIEW_PARALLEL_THRESHOLD: usize = 400_000;
+const PREVIEW_DEADLINE_CHECK_MASK: usize = 0x3ff;
+const REQUEST_BODY_LIMIT_BYTES_DEFAULT: usize = 256 * 1024;
+const RANGE_TEXT_MAX_LEN_DEFAULT: usize = 4096;
+const RANGE_EXPR_MAX_TOKENS_DEFAULT: usize = 2048;
+const RANGE_EXPR_MAX_NESTING_DEFAULT: usize = 64;
+const SIM_ITERATION_CAP_MAX_DEFAULT: usize = 20_000_000;
+const SIM_DEFAULT_MAX_RUNTIME_MS: u64 = 300_000;
+const SIM_MAX_RUNTIME_CAP_MS: u64 = 3_600_000;
+const BOMBPOT_ITERATION_CAP_MAX_DEFAULT: usize = 2_000_000;
+const BOMBPOT_MAX_RUNTIME_CAP_MS: u64 = 3_600_000;
+const BOMBPOT_PROGRESS_TOKEN_MAX_LEN_DEFAULT: usize = 128;
+const PREVIEW_MAX_RUNTIME_MS_DEFAULT: u64 = 45_000;
 const EXACT_PLAN_POOL_LIMIT_HOLDEM: usize = 40_000;
 const EXACT_PLAN_POOL_LIMIT_PLO4: usize = 180_000;
 const EXACT_PLAN_POOL_LIMIT_PLO5: usize = 260_000;
@@ -430,6 +442,9 @@ const BOMBPOT_CATEGORY_DEFS: [BombpotCategoryOut; 8] = [
     },
 ];
 
+#[derive(Debug, Clone, Copy)]
+struct PreviewDeadlineExceeded;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -485,6 +500,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/sim/bombpot", post(sim_bombpot))
         .fallback_service(static_service)
+        .layer(DefaultBodyLimit::max(request_body_limit_bytes()))
         .layer(middleware::from_fn(static_cache_headers))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http());
@@ -520,14 +536,149 @@ fn env_u64(name: &str) -> Option<u64> {
         .filter(|v| *v > 0)
 }
 
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+}
+
+fn request_body_limit_bytes() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env_usize("REQUEST_BODY_LIMIT_BYTES")
+            .unwrap_or(REQUEST_BODY_LIMIT_BYTES_DEFAULT)
+            .clamp(4 * 1024, 8 * 1024 * 1024)
+    })
+}
+
+fn range_text_max_len() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env_usize("RANGE_TEXT_MAX_LEN")
+            .unwrap_or(RANGE_TEXT_MAX_LEN_DEFAULT)
+            .clamp(256, 64 * 1024)
+    })
+}
+
+fn range_expr_max_tokens() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env_usize("RANGE_EXPR_MAX_TOKENS")
+            .unwrap_or(RANGE_EXPR_MAX_TOKENS_DEFAULT)
+            .clamp(64, 32 * 1024)
+    })
+}
+
+fn range_expr_max_nesting() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env_usize("RANGE_EXPR_MAX_NESTING")
+            .unwrap_or(RANGE_EXPR_MAX_NESTING_DEFAULT)
+            .clamp(8, 512)
+    })
+}
+
+fn sim_iteration_cap_max() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env_usize("SIM_ITERATION_CAP_MAX")
+            .unwrap_or(SIM_ITERATION_CAP_MAX_DEFAULT)
+            .max(1)
+    })
+}
+
+fn sim_runtime_default_ms() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE
+        .get_or_init(|| env_u64("SIM_DEFAULT_MAX_RUNTIME_MS").unwrap_or(SIM_DEFAULT_MAX_RUNTIME_MS))
+}
+
+fn sim_runtime_cap_ms() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| env_u64("SIM_MAX_RUNTIME_MS_CAP").unwrap_or(SIM_MAX_RUNTIME_CAP_MS))
+}
+
 fn sim_max_runtime_ms_env() -> Option<u64> {
     static VALUE: OnceLock<Option<u64>> = OnceLock::new();
-    *VALUE.get_or_init(|| env_u64("SIM_MAX_RUNTIME_MS"))
+    *VALUE.get_or_init(|| {
+        env_u64("SIM_MAX_RUNTIME_MS")
+            .map(|v| v.min(sim_runtime_cap_ms()))
+            .filter(|v| *v > 0)
+    })
+}
+
+fn bombpot_iteration_cap_max() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env_usize("BOMBPOT_ITERATION_CAP_MAX")
+            .unwrap_or(BOMBPOT_ITERATION_CAP_MAX_DEFAULT)
+            .max(1)
+    })
+}
+
+fn bombpot_runtime_cap_ms() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE
+        .get_or_init(|| env_u64("BOMBPOT_MAX_RUNTIME_MS_CAP").unwrap_or(BOMBPOT_MAX_RUNTIME_CAP_MS))
+}
+
+fn bombpot_progress_token_max_len() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env_usize("BOMBPOT_PROGRESS_TOKEN_MAX_LEN")
+            .unwrap_or(BOMBPOT_PROGRESS_TOKEN_MAX_LEN_DEFAULT)
+            .clamp(16, 512)
+    })
+}
+
+fn preview_max_runtime_ms() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE
+        .get_or_init(|| env_u64("PREVIEW_MAX_RUNTIME_MS").unwrap_or(PREVIEW_MAX_RUNTIME_MS_DEFAULT))
 }
 
 fn bombpot_max_runtime_ms_env() -> Option<u64> {
     static VALUE: OnceLock<Option<u64>> = OnceLock::new();
-    *VALUE.get_or_init(|| env_u64("BOMBPOT_MAX_RUNTIME_MS"))
+    *VALUE.get_or_init(|| {
+        env_u64("BOMBPOT_MAX_RUNTIME_MS")
+            .map(|v| v.min(bombpot_runtime_cap_ms()))
+            .filter(|v| *v > 0)
+    })
+}
+
+fn max_concurrent_heavy_requests() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env_usize("MAX_CONCURRENT_HEAVY_REQUESTS").unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|v| v.get())
+                .unwrap_or(1)
+        })
+    })
+}
+
+fn heavy_request_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(max_concurrent_heavy_requests().max(1)))
+}
+
+fn try_acquire_heavy_request_permit() -> Result<tokio::sync::SemaphorePermit<'static>, &'static str>
+{
+    heavy_request_semaphore()
+        .try_acquire()
+        .map_err(|_| "server is busy; retry shortly")
+}
+
+fn preview_deadline() -> Option<Instant> {
+    Instant::now().checked_add(Duration::from_millis(preview_max_runtime_ms()))
+}
+
+fn preview_timeout_json() -> (StatusCode, Json<Value>) {
+    error_json(
+        StatusCode::REQUEST_TIMEOUT,
+        "preview computation exceeded runtime limit; narrow the range and retry",
+    )
 }
 
 fn resolve_static_root() -> Result<PathBuf, std::io::Error> {
@@ -650,6 +801,11 @@ async fn health() -> Json<Value> {
 }
 
 async fn sim_run(Json(req): Json<RunRequest>) -> (StatusCode, Json<Value>) {
+    let _heavy_permit = match try_acquire_heavy_request_permit() {
+        Ok(v) => v,
+        Err(msg) => return error_json(StatusCode::TOO_MANY_REQUESTS, msg),
+    };
+
     let total_start = Instant::now();
     let prepare_start = Instant::now();
     let prep = match prepare_native_request(&req.config, req.workers) {
@@ -692,6 +848,11 @@ async fn sim_run(Json(req): Json<RunRequest>) -> (StatusCode, Json<Value>) {
 }
 
 async fn sim_preview_tag(Json(req): Json<PreviewTagRequest>) -> (StatusCode, Json<Value>) {
+    let _heavy_permit = match try_acquire_heavy_request_permit() {
+        Ok(v) => v,
+        Err(msg) => return error_json(StatusCode::TOO_MANY_REQUESTS, msg),
+    };
+
     let variant = req.variant.trim().to_lowercase();
     let hand_size = match variant_hand_size(&variant) {
         Some(v) => v,
@@ -709,6 +870,7 @@ async fn sim_preview_tag(Json(req): Json<PreviewTagRequest>) -> (StatusCode, Jso
         );
     }
     let total_cov = n_choose_k(base_deck(&board, &[]).len(), hand_size);
+    let deadline = preview_deadline();
 
     let tag = match normalize_tag_token(&req.tag) {
         Some(t) => t,
@@ -725,12 +887,19 @@ async fn sim_preview_tag(Json(req): Json<PreviewTagRequest>) -> (StatusCode, Jso
     let cov_board = board.clone();
     let (combos, matched) = match tokio::task::spawn_blocking(move || {
         let combos = tag_shortcut_labels_for(&cov_variant, hand_size, &cov_board, tag);
-        let matched = tag_alias_coverage_for(&cov_variant, hand_size, &cov_board, tag);
-        (combos, matched)
+        let matched = tag_alias_coverage_for_with_deadline(
+            &cov_variant,
+            hand_size,
+            &cov_board,
+            tag,
+            deadline,
+        )?;
+        Ok::<(Vec<String>, usize), PreviewDeadlineExceeded>((combos, matched))
     })
     .await
     {
-        Ok(v) => v,
+        Ok(Ok(v)) => v,
+        Ok(Err(_)) => return preview_timeout_json(),
         Err(e) => {
             return error_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -746,6 +915,11 @@ async fn sim_preview_tag(Json(req): Json<PreviewTagRequest>) -> (StatusCode, Jso
 }
 
 async fn sim_preview_tags(Json(req): Json<PreviewTagsRequest>) -> (StatusCode, Json<Value>) {
+    let _heavy_permit = match try_acquire_heavy_request_permit() {
+        Ok(v) => v,
+        Err(msg) => return error_json(StatusCode::TOO_MANY_REQUESTS, msg),
+    };
+
     let variant = req.variant.trim().to_lowercase();
     let hand_size = match variant_hand_size(&variant) {
         Some(v) => v,
@@ -771,6 +945,7 @@ async fn sim_preview_tags(Json(req): Json<PreviewTagsRequest>) -> (StatusCode, J
         );
     }
     let total_cov = n_choose_k(base_deck(&board, &[]).len(), hand_size);
+    let deadline = preview_deadline();
 
     let cov_variant = variant.clone();
     let cov_board = board.clone();
@@ -778,15 +953,25 @@ async fn sim_preview_tags(Json(req): Json<PreviewTagsRequest>) -> (StatusCode, J
         let mut matched = Vec::<usize>::with_capacity(TAG_COVERAGE_TOKEN_ORDER.len());
         for raw_tag in TAG_COVERAGE_TOKEN_ORDER {
             let v = normalize_tag_token(raw_tag)
-                .map(|tag| tag_alias_coverage_for(&cov_variant, hand_size, &cov_board, tag))
+                .map(|tag| {
+                    tag_alias_coverage_for_with_deadline(
+                        &cov_variant,
+                        hand_size,
+                        &cov_board,
+                        tag,
+                        deadline,
+                    )
+                })
+                .transpose()?
                 .unwrap_or(0);
             matched.push(v);
         }
-        matched
+        Ok::<Vec<usize>, PreviewDeadlineExceeded>(matched)
     })
     .await
     {
-        Ok(v) => v,
+        Ok(Ok(v)) => v,
+        Ok(Err(_)) => return preview_timeout_json(),
         Err(e) => {
             return error_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -810,6 +995,11 @@ async fn sim_preview_tags(Json(req): Json<PreviewTagsRequest>) -> (StatusCode, J
 }
 
 async fn sim_preview_range(Json(req): Json<PreviewRangeRequest>) -> (StatusCode, Json<Value>) {
+    let _heavy_permit = match try_acquire_heavy_request_permit() {
+        Ok(v) => v,
+        Err(msg) => return error_json(StatusCode::TOO_MANY_REQUESTS, msg),
+    };
+
     let variant = req.variant.trim().to_lowercase();
     let hand_size = match variant_hand_size(&variant) {
         Some(v) => v,
@@ -826,6 +1016,7 @@ async fn sim_preview_range(Json(req): Json<PreviewRangeRequest>) -> (StatusCode,
     let dead = Vec::<u8>::new();
     let base = base_deck(&board, &dead);
     let total = n_choose_k(base.len(), hand_size);
+    let deadline = preview_deadline();
 
     let range_text = req.range_text.trim();
     let range_compact = range_text
@@ -889,12 +1080,19 @@ async fn sim_preview_range(Json(req): Json<PreviewRangeRequest>) -> (StatusCode,
         let cov_board = board.clone();
         let cov_expr = compiled.expr.clone();
         let matched = match tokio::task::spawn_blocking(move || {
-            estimate_tag_expr_coverage(&cov_variant, hand_size, &cov_board, &cov_expr)
+            estimate_tag_expr_coverage_with_deadline(
+                &cov_variant,
+                hand_size,
+                &cov_board,
+                &cov_expr,
+                deadline,
+            )
         })
         .await
         {
-            Ok(Some(v)) => v,
-            Ok(None) => 0,
+            Ok(Ok(Some(v))) => v,
+            Ok(Ok(None)) => 0,
+            Ok(Err(_)) => return preview_timeout_json(),
             Err(e) => {
                 return error_json(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -916,13 +1114,18 @@ async fn sim_preview_range(Json(req): Json<PreviewRangeRequest>) -> (StatusCode,
     let cov_base = base.clone();
     let cov_expr = compiled.expr.clone();
     let (matched, approx) = match tokio::task::spawn_blocking(move || {
-        estimate_coverage(&cov_base, hand_size, total, |hand| {
-            range_expr_match(&cov_expr, hand, &cov_board)
-        })
+        estimate_coverage_with_deadline(
+            &cov_base,
+            hand_size,
+            total,
+            |hand| range_expr_match(&cov_expr, hand, &cov_board),
+            deadline,
+        )
     })
     .await
     {
-        Ok(v) => v,
+        Ok(Ok(v)) => v,
+        Ok(Err(_)) => return preview_timeout_json(),
         Err(e) => {
             return error_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1176,6 +1379,12 @@ async fn sim_bombpot_progress(Path(token): Path<String>) -> (StatusCode, Json<Va
     if t.is_empty() {
         return error_json(StatusCode::BAD_REQUEST, "missing bombpot progress token");
     }
+    if t.len() > bombpot_progress_token_max_len() {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "bombpot progress token is too long",
+        );
+    }
     let Some(progress) = bombpot_progress_snapshot(t) else {
         return error_json(StatusCode::NOT_FOUND, "bombpot progress token not found");
     };
@@ -1186,6 +1395,11 @@ async fn sim_bombpot_progress(Path(token): Path<String>) -> (StatusCode, Json<Va
 }
 
 async fn sim_bombpot(Json(req): Json<BombpotRequest>) -> (StatusCode, Json<Value>) {
+    let _heavy_permit = match try_acquire_heavy_request_permit() {
+        Ok(v) => v,
+        Err(msg) => return error_json(StatusCode::TOO_MANY_REQUESTS, msg),
+    };
+
     let variant = req.variant.trim().to_ascii_lowercase();
     let (hand_size, min_players, max_players) = match bombpot_variant_limits(&variant) {
         Some(v) => v,
@@ -1227,6 +1441,13 @@ async fn sim_bombpot(Json(req): Json<BombpotRequest>) -> (StatusCode, Json<Value
 
     let mut iteration_cap = bombpot_positive_usize(req.iteration_cap, BOMBPOT_DEFAULT_ITER_CAP);
     let mut min_iterations = bombpot_positive_usize(req.min_iterations, BOMBPOT_DEFAULT_MIN_ITER);
+    let iteration_cap_max = bombpot_iteration_cap_max();
+    if iteration_cap > iteration_cap_max {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            &format!("iterationCap exceeds maximum of {iteration_cap_max}"),
+        );
+    }
     if min_iterations > iteration_cap {
         min_iterations = iteration_cap;
     }
@@ -1242,17 +1463,32 @@ async fn sim_bombpot(Json(req): Json<BombpotRequest>) -> (StatusCode, Json<Value
         BOMBPOT_DEFAULT_TARGET_HALF_WIDTH_PCT,
     );
     let workers = bombpot_normalize_workers(req.workers);
+    let runtime_cap_ms = bombpot_runtime_cap_ms();
+    if let Some(ms) = req.max_runtime_ms.filter(|v| *v > 0) {
+        if ms > runtime_cap_ms {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                &format!("maxRuntimeMs exceeds maximum of {runtime_cap_ms}"),
+            );
+        }
+    }
     let max_runtime_ms = req
         .max_runtime_ms
         .filter(|v| *v > 0)
         .or_else(bombpot_max_runtime_ms_env)
-        .unwrap_or(BOMBPOT_DEFAULT_MAX_RUNTIME_MS);
+        .unwrap_or(BOMBPOT_DEFAULT_MAX_RUNTIME_MS)
+        .min(runtime_cap_ms);
     let progress_token = req
         .progress_token
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(|v| v.to_string());
+    if let Some(token) = progress_token.as_ref() {
+        if token.len() > bombpot_progress_token_max_len() {
+            return error_json(StatusCode::BAD_REQUEST, "progressToken is too long");
+        }
+    }
 
     let config = BombpotRunConfig {
         variant: variant.clone(),
@@ -1964,6 +2200,17 @@ fn prepare_native_request(cfg: &RunConfig, workers: Option<usize>) -> Result<Nat
     if cfg.players.len() < 2 || cfg.players.len() > 6 {
         return Err("players must be between 2 and 6".to_string());
     }
+    if cfg.iteration_cap <= 0 {
+        return Err("iterationCap must be > 0".to_string());
+    }
+    let iteration_cap = usize::try_from(cfg.iteration_cap)
+        .map_err(|_| "iterationCap is out of supported range".to_string())?;
+    let iteration_cap_max = sim_iteration_cap_max();
+    if iteration_cap > iteration_cap_max {
+        return Err(format!(
+            "iterationCap exceeds maximum of {iteration_cap_max}"
+        ));
+    }
 
     let board = parse_cards_text(&cfg.board)?;
     if board.len() > 5 {
@@ -1971,6 +2218,32 @@ fn prepare_native_request(cfg: &RunConfig, workers: Option<usize>) -> Result<Nat
     }
     let dead = parse_cards_text(&cfg.dead)?;
     validate_disjoint(&board, &dead)?;
+
+    let runtime_cap_ms = sim_runtime_cap_ms();
+    if let Some(ms) = cfg.max_runtime_ms.filter(|v| *v > 0) {
+        if ms > runtime_cap_ms {
+            return Err(format!("maxRuntimeMs exceeds maximum of {runtime_cap_ms}"));
+        }
+    }
+    let max_runtime_ms = cfg
+        .max_runtime_ms
+        .filter(|v| *v > 0)
+        .or_else(sim_max_runtime_ms_env)
+        .unwrap_or(sim_runtime_default_ms())
+        .min(runtime_cap_ms);
+
+    let confidence_min_iters = match cfg.confidence_min_iterations {
+        Some(v) if v <= 0 => return Err("confidenceMinIterations must be > 0".to_string()),
+        Some(v) => {
+            let parsed = usize::try_from(v)
+                .map_err(|_| "confidenceMinIterations is out of supported range".to_string())?;
+            if parsed > iteration_cap {
+                return Err("confidenceMinIterations cannot exceed iterationCap".to_string());
+            }
+            Some(parsed)
+        }
+        None => None,
+    };
 
     let profile = cfg.percentile_profile.as_deref();
     let players = cfg
@@ -1995,24 +2268,15 @@ fn prepare_native_request(cfg: &RunConfig, workers: Option<usize>) -> Result<Nat
 
     Ok(NativeSimReq {
         variant,
-        iteration_cap: cfg.iteration_cap.max(1) as usize,
+        iteration_cap,
         board,
         dead,
         players,
         workers: workers.and_then(|w| if w > 0 { Some(w) } else { None }),
         confidence_target_pct: cfg.confidence_target_pct.filter(|v| *v > 0.0),
-        confidence_min_iters: cfg.confidence_min_iterations.and_then(|v| {
-            if v > 0 {
-                Some(v as usize)
-            } else {
-                None
-            }
-        }),
+        confidence_min_iters,
         confidence_level: cfg.confidence_level.filter(|v| *v > 0.0),
-        max_runtime_ms: cfg
-            .max_runtime_ms
-            .filter(|v| *v > 0)
-            .or_else(sim_max_runtime_ms_env),
+        max_runtime_ms: Some(max_runtime_ms),
         seed: Some(rand::random::<u64>()),
     })
 }
@@ -3025,22 +3289,84 @@ fn coverage_json(matched: usize, total: usize) -> Value {
     })
 }
 
-fn estimate_coverage<F>(base: &[u8], hand_size: usize, total: usize, predicate: F) -> (usize, bool)
+fn estimate_coverage_with_deadline<F>(
+    base: &[u8],
+    hand_size: usize,
+    total: usize,
+    predicate: F,
+    deadline: Option<Instant>,
+) -> Result<(usize, bool), PreviewDeadlineExceeded>
 where
     F: Fn(&[u8]) -> bool + Sync,
 {
     if total >= PREVIEW_PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
-        let matched = count_matching_hands_parallel(base, hand_size, &predicate);
-        return (matched, false);
+        let matched =
+            count_matching_hands_parallel_with_deadline(base, hand_size, &predicate, deadline)?;
+        return Ok((matched, false));
     }
 
     let mut matched = 0usize;
-    enumerate_hands(base, hand_size, |hand| {
+    enumerate_hands_with_deadline(base, hand_size, deadline, |hand| {
         if predicate(hand) {
-            matched += 1;
+            matched = matched.saturating_add(1);
         }
-    });
-    (matched, false)
+    })?;
+    Ok((matched, false))
+}
+
+fn count_matching_hands_parallel_with_deadline<F>(
+    base: &[u8],
+    hand_size: usize,
+    predicate: &F,
+    deadline: Option<Instant>,
+) -> Result<usize, PreviewDeadlineExceeded>
+where
+    F: Fn(&[u8]) -> bool + Sync,
+{
+    if deadline.is_none() {
+        return Ok(count_matching_hands_parallel(base, hand_size, predicate));
+    }
+    if hand_size == 0 {
+        return Ok(if predicate(&[]) { 1 } else { 0 });
+    }
+    if base.len() < hand_size {
+        return Ok(0);
+    }
+
+    let deadline = deadline.expect("checked above");
+    let timed_out = AtomicBool::new(false);
+    let max_start = base.len() - hand_size;
+    let matched: usize = (0..=max_start)
+        .into_par_iter()
+        .map(|first_idx| {
+            if timed_out.load(Ordering::Relaxed) {
+                return 0usize;
+            }
+            if Instant::now() >= deadline {
+                timed_out.store(true, Ordering::Relaxed);
+                return 0usize;
+            }
+            let mut hand = vec![0u8; hand_size];
+            hand[0] = base[first_idx];
+            let mut tick = 0usize;
+            count_matching_hands_rec_parallel_with_deadline(
+                base,
+                first_idx + 1,
+                1,
+                &mut hand,
+                predicate,
+                deadline,
+                &timed_out,
+                &mut tick,
+            )
+        })
+        .sum();
+
+    if timed_out.load(Ordering::Relaxed) {
+        Err(PreviewDeadlineExceeded)
+    } else {
+        Ok(matched)
+    }
 }
 
 fn count_matching_hands_parallel<F>(base: &[u8], hand_size: usize, predicate: &F) -> usize
@@ -3091,6 +3417,57 @@ where
     matched
 }
 
+#[allow(clippy::too_many_arguments)]
+fn count_matching_hands_rec_parallel_with_deadline<F>(
+    base: &[u8],
+    start: usize,
+    depth: usize,
+    hand: &mut [u8],
+    predicate: &F,
+    deadline: Instant,
+    timed_out: &AtomicBool,
+    tick: &mut usize,
+) -> usize
+where
+    F: Fn(&[u8]) -> bool,
+{
+    if timed_out.load(Ordering::Relaxed) {
+        return 0;
+    }
+    if depth == hand.len() {
+        return usize::from(predicate(hand));
+    }
+
+    let need = hand.len() - depth;
+    if base.len() < need || start > base.len() - need {
+        return 0;
+    }
+
+    let mut matched = 0usize;
+    for i in start..=base.len() - need {
+        if timed_out.load(Ordering::Relaxed) {
+            break;
+        }
+        *tick = tick.wrapping_add(1);
+        if (*tick & PREVIEW_DEADLINE_CHECK_MASK) == 0 && Instant::now() >= deadline {
+            timed_out.store(true, Ordering::Relaxed);
+            break;
+        }
+        hand[depth] = base[i];
+        matched = matched.saturating_add(count_matching_hands_rec_parallel_with_deadline(
+            base,
+            i + 1,
+            depth + 1,
+            hand,
+            predicate,
+            deadline,
+            timed_out,
+            tick,
+        ));
+    }
+    matched
+}
+
 fn enumerate_hands<F>(base: &[u8], hand_size: usize, mut f: F)
 where
     F: FnMut(&[u8]),
@@ -3116,6 +3493,73 @@ where
     }
 
     rec(0, 0, base, &mut hand, &mut f);
+}
+
+fn enumerate_hands_with_deadline<F>(
+    base: &[u8],
+    hand_size: usize,
+    deadline: Option<Instant>,
+    mut f: F,
+) -> Result<(), PreviewDeadlineExceeded>
+where
+    F: FnMut(&[u8]),
+{
+    let mut hand = vec![0u8; hand_size];
+    let mut tick = 0usize;
+
+    fn rec<F>(
+        start: usize,
+        depth: usize,
+        base: &[u8],
+        hand: &mut [u8],
+        deadline: Option<Instant>,
+        tick: &mut usize,
+        f: &mut F,
+    ) -> Result<(), PreviewDeadlineExceeded>
+    where
+        F: FnMut(&[u8]),
+    {
+        if depth == hand.len() {
+            f(hand);
+            return Ok(());
+        }
+        let need = hand.len() - depth;
+        if base.len() < need || start > base.len() - need {
+            return Ok(());
+        }
+        for i in start..=base.len() - need {
+            check_preview_deadline(deadline, tick)?;
+            hand[depth] = base[i];
+            rec(i + 1, depth + 1, base, hand, deadline, tick, f)?;
+        }
+        Ok(())
+    }
+
+    check_preview_deadline(deadline, &mut tick)?;
+    rec(0, 0, base, &mut hand, deadline, &mut tick, &mut f)
+}
+
+#[inline(always)]
+fn check_preview_deadline_instant(
+    deadline: Instant,
+    tick: &mut usize,
+) -> Result<(), PreviewDeadlineExceeded> {
+    *tick = tick.wrapping_add(1);
+    if (*tick & PREVIEW_DEADLINE_CHECK_MASK) == 0 && Instant::now() >= deadline {
+        return Err(PreviewDeadlineExceeded);
+    }
+    Ok(())
+}
+
+fn check_preview_deadline(
+    deadline: Option<Instant>,
+    tick: &mut usize,
+) -> Result<(), PreviewDeadlineExceeded> {
+    if let Some(limit) = deadline {
+        return check_preview_deadline_instant(limit, tick);
+    }
+    *tick = tick.wrapping_add(1);
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -3576,6 +4020,12 @@ fn compile_range_expr(
     hand_size: usize,
     percentile_profile: Option<&str>,
 ) -> Result<CompiledRangeExpr, String> {
+    if text.chars().count() > range_text_max_len() {
+        return Err(format!(
+            "range expression exceeds max length of {} characters",
+            range_text_max_len()
+        ));
+    }
     let t = text.trim();
     let raw = if t.is_empty() { "*" } else { t };
     let expanded = expand_expr_macros(&strip_spaces(raw));
@@ -3584,13 +4034,27 @@ fn compile_range_expr(
     } else {
         expanded
     };
+    if source.chars().count() > range_text_max_len() {
+        return Err(format!(
+            "range expression exceeds max length of {} characters",
+            range_text_max_len()
+        ));
+    }
     let toks = tokenize_expr(&source)?;
+    if toks.len() > range_expr_max_tokens() {
+        return Err(format!(
+            "range expression exceeds max token count of {}",
+            range_expr_max_tokens()
+        ));
+    }
     let mut p = ExprParser {
         tokens: toks,
         pos: 0,
         variant: variant.to_string(),
         percentile_profile: percentile_profile.unwrap_or_default().to_lowercase(),
         hand_size,
+        max_nesting: range_expr_max_nesting(),
+        nesting: 0,
     };
     let expr = p.parse_union()?;
     if p.pos != p.tokens.len() {
@@ -3671,6 +4135,8 @@ struct ExprParser {
     variant: String,
     percentile_profile: String,
     hand_size: usize,
+    max_nesting: usize,
+    nesting: usize,
 }
 
 impl ExprParser {
@@ -3708,7 +4174,16 @@ impl ExprParser {
 
     fn parse_primary(&mut self) -> Result<CompiledRangeExpr, String> {
         if self.match_tok(|t| matches!(t, LexToken::LParen)) {
-            let expr = self.parse_union()?;
+            if self.nesting >= self.max_nesting {
+                return Err(format!(
+                    "range expression nesting exceeds max depth of {}",
+                    self.max_nesting
+                ));
+            }
+            self.nesting += 1;
+            let expr = self.parse_union();
+            self.nesting = self.nesting.saturating_sub(1);
+            let expr = expr?;
             if !self.match_tok(|t| matches!(t, LexToken::RParen)) {
                 return Err("missing ')' in range expression".to_string());
             }
@@ -4440,24 +4915,34 @@ fn tag_alias_cache_expr_token(tag: TagAtom) -> String {
     format!("alias:{tag:?}")
 }
 
-fn tag_alias_coverage_for(variant: &str, hand_size: usize, board: &[u8], tag: TagAtom) -> usize {
+fn tag_alias_coverage_for_with_deadline(
+    variant: &str,
+    hand_size: usize,
+    board: &[u8],
+    tag: TagAtom,
+    deadline: Option<Instant>,
+) -> Result<usize, PreviewDeadlineExceeded> {
     if board.len() < 3 || board.len() > 5 {
-        return 0;
+        return Ok(0);
     }
     let expr_token = tag_alias_cache_expr_token(tag);
     let cache_key = tag_expr_coverage_cache_key(variant, hand_size, board, &expr_token);
     if let Some(matched) = tag_expr_coverage_cache_get(&cache_key) {
-        return matched;
+        return Ok(matched);
     }
 
     let expr = tag_shortcut_expr(variant, hand_size, board, tag);
     let base = base_deck(board, &[]);
     let total = n_choose_k(base.len(), hand_size);
-    let (matched, _) = estimate_coverage(&base, hand_size, total, |hand| {
-        range_expr_match(&expr, hand, board)
-    });
+    let (matched, _) = estimate_coverage_with_deadline(
+        &base,
+        hand_size,
+        total,
+        |hand| range_expr_match(&expr, hand, board),
+        deadline,
+    )?;
     tag_expr_coverage_cache_put(cache_key, matched);
-    matched
+    Ok(matched)
 }
 
 fn is_any_expr(expr: &RangeExpr) -> bool {
@@ -4504,24 +4989,27 @@ fn range_expr_match_tag_mask(expr: &RangeExpr, hand_mask: u32) -> bool {
     }
 }
 
-fn estimate_tag_expr_coverage(
+fn estimate_tag_expr_coverage_with_deadline(
     variant: &str,
     hand_size: usize,
     board: &[u8],
     expr: &RangeExpr,
-) -> Option<usize> {
+    deadline: Option<Instant>,
+) -> Result<Option<usize>, PreviewDeadlineExceeded> {
     if !is_tag_only_expr(expr) {
-        return None;
+        return Ok(None);
     }
 
     let is_holdem = variant == "holdem";
     let bundle = tag_coverage_bundle_for(variant, hand_size, board);
     let mut matched = 0usize;
+    let mut tick = 0usize;
 
     if hand_size == 2 {
         for i in 0..bundle.base.len() {
             let c1 = bundle.base[i];
             for j in (i + 1)..bundle.base.len() {
+                check_preview_deadline(deadline, &mut tick)?;
                 let c2 = bundle.base[j];
                 let hand = [c1, c2];
                 let mask = hand_tag_mask_from_pair_masks(
@@ -4536,10 +5024,10 @@ fn estimate_tag_expr_coverage(
                 }
             }
         }
-        return Some(matched);
+        return Ok(Some(matched));
     }
 
-    enumerate_hands(&bundle.base, hand_size, |hand| {
+    enumerate_hands_with_deadline(&bundle.base, hand_size, deadline, |hand| {
         let mask = hand_tag_mask_from_pair_masks(
             &bundle.pair_tag_masks,
             &bundle.pair_straight_rank_masks,
@@ -4550,8 +5038,8 @@ fn estimate_tag_expr_coverage(
         if range_expr_match_tag_mask(expr, mask) {
             matched = matched.saturating_add(1);
         }
-    });
-    Some(matched)
+    })?;
+    Ok(Some(matched))
 }
 
 fn range_expr_match(expr: &RangeExpr, hand: &[u8], board: &[u8]) -> bool {

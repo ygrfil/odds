@@ -2037,17 +2037,14 @@ fn sample_random_hand_from_avail(
     if avail.len() < hand_size {
         return false;
     }
-    let mut picked = [0usize; 6];
+    let mut shuffled = [0u8; 52];
+    let n = avail.len();
+    shuffled[..n].copy_from_slice(avail);
     out.clear();
     for i in 0..hand_size {
-        loop {
-            let idx = rng.gen_range(0..avail.len());
-            if !picked[..i].contains(&idx) {
-                picked[i] = idx;
-                out.push(avail[idx]);
-                break;
-            }
-        }
+        let j = i + rng.gen_range(0..(n - i));
+        shuffled.swap(i, j);
+        out.push(shuffled[i]);
     }
     out.sort_unstable();
     true
