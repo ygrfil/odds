@@ -406,8 +406,10 @@ const BOMBPOT_CAT_FH: usize = 3;
 const BOMBPOT_CAT_FLUSH: usize = 4;
 const BOMBPOT_CAT_NUT_FLUSH: usize = 5;
 const BOMBPOT_CAT_NUT_FLUSH_DRAW: usize = 6;
-const BOMBPOT_CAT_SD12: usize = 7;
-const BOMBPOT_CATEGORY_DEFS: [BombpotCategoryOut; 8] = [
+const BOMBPOT_CAT_STRAIGHT: usize = 7;
+const BOMBPOT_CAT_SD8: usize = 8;
+const BOMBPOT_CAT_SD12: usize = 9;
+const BOMBPOT_CATEGORY_DEFS: [BombpotCategoryOut; 10] = [
     BombpotCategoryOut {
         id: "twoPair",
         label: "2P",
@@ -435,6 +437,14 @@ const BOMBPOT_CATEGORY_DEFS: [BombpotCategoryOut; 8] = [
     BombpotCategoryOut {
         id: "nutFlushDraw",
         label: "Nut Flush Draw",
+    },
+    BombpotCategoryOut {
+        id: "straight",
+        label: "Straight",
+    },
+    BombpotCategoryOut {
+        id: "sd8",
+        label: "SD8",
     },
     BombpotCategoryOut {
         id: "sd12",
@@ -1887,8 +1897,8 @@ fn bombpot_opponent_hits(
     nut_flush_targets: &[Option<u8>; 4],
     nut_flush_draw_targets: &[Option<u8>; 4],
     pair_class_lut: &[[u8; 52]; 52],
-) -> [bool; 8] {
-    let mut hits = [false; 8];
+) -> [bool; 10] {
+    let mut hits = [false; 10];
     let class_id = bombpot_best_omaha_hand_class_lut(hand, pair_class_lut);
 
     hits[BOMBPOT_CAT_2P] = class_id == 2;
@@ -1900,6 +1910,8 @@ fn bombpot_opponent_hits(
         class_id == 5 && bombpot_is_nut_flush(hand, board_suit_counts, nut_flush_targets);
     hits[BOMBPOT_CAT_NUT_FLUSH_DRAW] =
         bombpot_is_nut_flush_draw(hand, board_suit_counts, nut_flush_draw_targets);
+    hits[BOMBPOT_CAT_STRAIGHT] = class_id == 4;
+    hits[BOMBPOT_CAT_SD8] = full_tag_match(TagAtom::StraightDraw { min_outs: 8 }, hand, board);
     hits[BOMBPOT_CAT_SD12] = full_tag_match(TagAtom::StraightDraw { min_outs: 12 }, hand, board);
     hits
 }
@@ -1959,7 +1971,7 @@ fn bombpot_worker_run(
     let mut local_rows = vec![vec![0usize; BOMBPOT_CATEGORY_DEFS.len()]; shared.row_count];
     let mut hero_hand = Vec::<u8>::with_capacity(shared.cfg.hand_size);
     let mut available = Vec::<u8>::with_capacity(shared.base_deck.len());
-    let mut cumulative = [false; 8];
+    let mut cumulative = [false; 10];
 
     for _ in 0..worker_iters {
         let mut blocked = *shared.base_blocked;
@@ -6321,11 +6333,19 @@ mod tests {
         assert_eq!(plo4.table_rows.len(), 6);
         assert_eq!(plo4.table_rows.first().map(|r| r.players), Some(4));
         assert_eq!(plo4.table_rows.last().map(|r| r.players), Some(9));
-        assert_eq!(plo4.categories.len(), 8);
+        assert_eq!(plo4.categories.len(), 10);
         assert!(plo4
             .categories
             .iter()
             .any(|c| c.id == "nutFlushDraw" && c.label == "Nut Flush Draw"));
+        assert!(plo4
+            .categories
+            .iter()
+            .any(|c| c.id == "straight" && c.label == "Straight"));
+        assert!(plo4
+            .categories
+            .iter()
+            .any(|c| c.id == "sd8" && c.label == "SD8"));
 
         for cat in 0..plo4.categories.len() {
             for i in 1..plo4.table_rows.len() {
