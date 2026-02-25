@@ -407,9 +407,10 @@ const BOMBPOT_CAT_FLUSH: usize = 4;
 const BOMBPOT_CAT_NUT_FLUSH: usize = 5;
 const BOMBPOT_CAT_NUT_FLUSH_DRAW: usize = 6;
 const BOMBPOT_CAT_STRAIGHT: usize = 7;
-const BOMBPOT_CAT_SD8: usize = 8;
-const BOMBPOT_CAT_SD12: usize = 9;
-const BOMBPOT_CATEGORY_DEFS: [BombpotCategoryOut; 10] = [
+const BOMBPOT_CAT_NUT_STRAIGHT: usize = 8;
+const BOMBPOT_CAT_SD8: usize = 9;
+const BOMBPOT_CAT_SD12: usize = 10;
+const BOMBPOT_CATEGORY_DEFS: [BombpotCategoryOut; 11] = [
     BombpotCategoryOut {
         id: "twoPair",
         label: "2P",
@@ -441,6 +442,10 @@ const BOMBPOT_CATEGORY_DEFS: [BombpotCategoryOut; 10] = [
     BombpotCategoryOut {
         id: "straight",
         label: "Straight",
+    },
+    BombpotCategoryOut {
+        id: "nutStraight",
+        label: "Nut Straight",
     },
     BombpotCategoryOut {
         id: "sd8",
@@ -1890,15 +1895,98 @@ fn bombpot_is_nut_flush_draw(
     false
 }
 
+fn bombpot_straight_seq_ranks(high: u8) -> Option<[u8; 5]> {
+    if !(5..=14).contains(&high) {
+        return None;
+    }
+    if high == 5 {
+        return Some([14, 5, 4, 3, 2]);
+    }
+    Some([high, high - 1, high - 2, high - 3, high - 4])
+}
+
+fn bombpot_nut_straight_target(board: &[u8]) -> Option<u8> {
+    if board.len() != 3 {
+        return None;
+    }
+    let b0 = card_rank_value(board[0]);
+    let b1 = card_rank_value(board[1]);
+    let b2 = card_rank_value(board[2]);
+    if b0 == b1 || b0 == b2 || b1 == b2 {
+        return None;
+    }
+    let board_ranks = [b0, b1, b2];
+
+    for high in (5u8..=14u8).rev() {
+        let Some(seq) = bombpot_straight_seq_ranks(high) else {
+            continue;
+        };
+        let mut board_ok = true;
+        for &br in &board_ranks {
+            if !seq.contains(&br) {
+                board_ok = false;
+                break;
+            }
+        }
+        if !board_ok {
+            continue;
+        }
+        let mut m = 0usize;
+        for &r in &seq {
+            if r != b0 && r != b1 && r != b2 {
+                if m >= 2 {
+                    board_ok = false;
+                    break;
+                }
+                m += 1;
+            }
+        }
+        if !board_ok || m != 2 {
+            continue;
+        }
+        return Some(high);
+    }
+    None
+}
+
+fn bombpot_best_omaha_straight_high(hand: &[u8], board: &[u8]) -> u8 {
+    if hand.len() < 2 || board.len() < 3 {
+        return 0;
+    }
+    let mut best = 0u8;
+    for a in 0..hand.len().saturating_sub(1) {
+        for b in (a + 1)..hand.len() {
+            for i in 0..board.len().saturating_sub(2) {
+                for j in (i + 1)..board.len().saturating_sub(1) {
+                    for k in (j + 1)..board.len() {
+                        let cards = [hand[a], hand[b], board[i], board[j], board[k]];
+                        let mut rank_counts = [0u8; 15];
+                        for c in cards {
+                            rank_counts[card_rank_value(c) as usize] =
+                                rank_counts[card_rank_value(c) as usize].saturating_add(1);
+                        }
+                        let hi = straight_high_from_counts(&rank_counts);
+                        if hi > best {
+                            best = hi;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
 fn bombpot_opponent_hits(
     hand: &[u8],
     board: &[u8],
     board_suit_counts: &[u8; 4],
     nut_flush_targets: &[Option<u8>; 4],
     nut_flush_draw_targets: &[Option<u8>; 4],
+    nut_straight_target: Option<u8>,
     pair_class_lut: &[[u8; 52]; 52],
-) -> [bool; 10] {
-    let mut hits = [false; 10];
+) -> [bool; 11] {
+    let mut hits = [false; 11];
     let class_id = bombpot_best_omaha_hand_class_lut(hand, pair_class_lut);
 
     hits[BOMBPOT_CAT_2P] = class_id == 2;
@@ -1911,6 +1999,13 @@ fn bombpot_opponent_hits(
     hits[BOMBPOT_CAT_NUT_FLUSH_DRAW] =
         bombpot_is_nut_flush_draw(hand, board_suit_counts, nut_flush_draw_targets);
     hits[BOMBPOT_CAT_STRAIGHT] = class_id == 4;
+    let straight_high = if class_id == 4 {
+        bombpot_best_omaha_straight_high(hand, board)
+    } else {
+        0
+    };
+    hits[BOMBPOT_CAT_NUT_STRAIGHT] =
+        class_id == 4 && nut_straight_target.is_some_and(|v| straight_high == v);
     hits[BOMBPOT_CAT_SD8] = full_tag_match(TagAtom::StraightDraw { min_outs: 8 }, hand, board);
     hits[BOMBPOT_CAT_SD12] = full_tag_match(TagAtom::StraightDraw { min_outs: 12 }, hand, board);
     hits
@@ -1956,6 +2051,7 @@ struct BombpotBatchShared<'a> {
     base_deck: &'a [u8],
     base_blocked: &'a [bool; 52],
     board_suit_counts: &'a [u8; 4],
+    nut_straight_target: Option<u8>,
     pair_class_lut: &'a [[u8; 52]; 52],
     min_opp: usize,
     max_opp: usize,
@@ -1971,7 +2067,7 @@ fn bombpot_worker_run(
     let mut local_rows = vec![vec![0usize; BOMBPOT_CATEGORY_DEFS.len()]; shared.row_count];
     let mut hero_hand = Vec::<u8>::with_capacity(shared.cfg.hand_size);
     let mut available = Vec::<u8>::with_capacity(shared.base_deck.len());
-    let mut cumulative = [false; 10];
+    let mut cumulative = [false; 11];
 
     for _ in 0..worker_iters {
         let mut blocked = *shared.base_blocked;
@@ -2016,6 +2112,7 @@ fn bombpot_worker_run(
                 shared.board_suit_counts,
                 &nut_flush_targets,
                 &nut_flush_draw_targets,
+                shared.nut_straight_target,
                 shared.pair_class_lut,
             );
             for cat in 0..hits.len() {
@@ -2113,6 +2210,7 @@ fn run_bombpot_sim(cfg: BombpotRunConfig) -> Result<BombpotResultOut, String> {
         base_deck: &base_deck,
         base_blocked: &base_blocked,
         board_suit_counts: &board_suit_counts,
+        nut_straight_target: bombpot_nut_straight_target(&cfg.board),
         pair_class_lut: &pair_class_lut,
         min_opp,
         max_opp,
@@ -6216,6 +6314,7 @@ mod tests {
         let counts = suit_counts(&board);
         let blocked = blocked_from(&[&board]);
         let (flush_targets, draw_targets) = bombpot_suit_targets(&counts, &blocked);
+        let nut_straight_target = bombpot_nut_straight_target(&board);
         let pair_class_lut = bombpot_build_pair_class_lut(&board);
 
         let two_pair_hits = bombpot_opponent_hits(
@@ -6224,6 +6323,7 @@ mod tests {
             &counts,
             &flush_targets,
             &draw_targets,
+            nut_straight_target,
             &pair_class_lut,
         );
         assert!(two_pair_hits[BOMBPOT_CAT_2P]);
@@ -6238,6 +6338,7 @@ mod tests {
             &counts,
             &flush_targets,
             &draw_targets,
+            nut_straight_target,
             &pair_class_lut,
         );
         assert!(!set_hits[BOMBPOT_CAT_2P]);
@@ -6251,6 +6352,7 @@ mod tests {
         let counts_fh = suit_counts(&board_fh);
         let blocked_fh = blocked_from(&[&board_fh]);
         let (flush_targets_fh, draw_targets_fh) = bombpot_suit_targets(&counts_fh, &blocked_fh);
+        let nut_straight_target_fh = bombpot_nut_straight_target(&board_fh);
         let pair_class_lut_fh = bombpot_build_pair_class_lut(&board_fh);
         let fh_hits = bombpot_opponent_hits(
             &cards("KcKhQhJs"),
@@ -6258,6 +6360,7 @@ mod tests {
             &counts_fh,
             &flush_targets_fh,
             &draw_targets_fh,
+            nut_straight_target_fh,
             &pair_class_lut_fh,
         );
         assert!(fh_hits[BOMBPOT_CAT_FH]);
@@ -6266,6 +6369,7 @@ mod tests {
         let counts_flush = suit_counts(&board_flush);
         let blocked_flush = blocked_from(&[&board_flush]);
         let (flush_targets, draw_targets) = bombpot_suit_targets(&counts_flush, &blocked_flush);
+        let nut_straight_target_flush = bombpot_nut_straight_target(&board_flush);
         let pair_class_lut_flush = bombpot_build_pair_class_lut(&board_flush);
         let nut_flush_hits = bombpot_opponent_hits(
             &cards("Kh3hQsJd"),
@@ -6273,6 +6377,7 @@ mod tests {
             &counts_flush,
             &flush_targets,
             &draw_targets,
+            nut_straight_target_flush,
             &pair_class_lut_flush,
         );
         assert!(nut_flush_hits[BOMBPOT_CAT_FLUSH]);
@@ -6284,10 +6389,42 @@ mod tests {
             &counts_flush,
             &flush_targets,
             &draw_targets,
+            nut_straight_target_flush,
             &pair_class_lut_flush,
         );
         assert!(non_nut_flush_hits[BOMBPOT_CAT_FLUSH]);
         assert!(!non_nut_flush_hits[BOMBPOT_CAT_NUT_FLUSH]);
+    }
+
+    #[test]
+    fn bombpot_nut_straight_zero_when_board_nuts_are_fully_blocked() {
+        let out = run_bombpot_sim(BombpotRunConfig {
+            variant: "plo4".to_string(),
+            hand_size: 4,
+            min_players: 4,
+            max_players: 4,
+            board: cards("5s6d7c"),
+            dead: Vec::new(),
+            board_text: "5s6d7c".to_string(),
+            dead_text: "".to_string(),
+            hero_range: "8c8d8h8s".to_string(),
+            percentile_profile: None,
+            iteration_cap: 512,
+            min_iterations: 512,
+            target_half_width_pct: 100.0,
+            workers: 2,
+            progress_token: None,
+            max_runtime_ms: 60_000,
+        })
+        .expect("bombpot simulation");
+
+        let nut_straight_idx = out
+            .categories
+            .iter()
+            .position(|c| c.id == "nutStraight")
+            .expect("nutStraight category");
+        assert_eq!(out.table_rows.len(), 1);
+        assert_eq!(out.table_rows[0].values[nut_straight_idx], 0.0);
     }
 
     #[test]
@@ -6333,7 +6470,7 @@ mod tests {
         assert_eq!(plo4.table_rows.len(), 6);
         assert_eq!(plo4.table_rows.first().map(|r| r.players), Some(4));
         assert_eq!(plo4.table_rows.last().map(|r| r.players), Some(9));
-        assert_eq!(plo4.categories.len(), 10);
+        assert_eq!(plo4.categories.len(), 11);
         assert!(plo4
             .categories
             .iter()
@@ -6342,6 +6479,10 @@ mod tests {
             .categories
             .iter()
             .any(|c| c.id == "straight" && c.label == "Straight"));
+        assert!(plo4
+            .categories
+            .iter()
+            .any(|c| c.id == "nutStraight" && c.label == "Nut Straight"));
         assert!(plo4
             .categories
             .iter()
