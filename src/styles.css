@@ -16,6 +16,7 @@ html {
   height: 100%;
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
+  overflow-x: hidden;
 }
 
 * { box-sizing: border-box; }
@@ -27,6 +28,7 @@ body {
   font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
   color: var(--text);
   background: radial-gradient(circle at 0% 0%, #14243a, #090d14 42%);
+  max-width: 100%;
 }
 
 .app-shell {
@@ -203,9 +205,11 @@ button.primary {
   display: grid;
   gap: 5px;
   overflow: auto;
+  overflow-x: hidden;
   min-height: 0;
   flex: 1 1 auto;
   -webkit-overflow-scrolling: touch;
+  max-width: 100%;
 }
 
 .player-row {
@@ -214,6 +218,8 @@ button.primary {
   padding: 5px 6px;
   background: #0d1726;
   position: relative;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .player-main {
@@ -221,17 +227,21 @@ button.primary {
   margin-bottom: 3px;
   gap: 6px;
   align-items: center;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .player-tag {
-  min-width: 24px;
+  flex: 0 0 24px;
   color: var(--muted);
   font-size: 11px;
   font-weight: 700;
 }
 
 .player-range-input {
-  width: 100%;
+  flex: 1 1 0;
+  width: auto;
+  min-width: 0;
   font-family: "IBM Plex Mono", "Consolas", monospace;
   font-size: 12px;
   padding: 4px 6px;
@@ -241,10 +251,13 @@ button.primary {
   display: flex;
   gap: 6px;
   align-items: center;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .card-input-row input {
   flex: 1 1 auto;
+  min-width: 0;
 }
 
 .card-keyboard-trigger {
@@ -268,7 +281,7 @@ button.primary {
 
 .tag-hint {
   width: 20px;
-  min-width: 20px;
+  flex: 0 0 20px;
   height: 20px;
   padding: 0;
   border-radius: 999px;
@@ -970,6 +983,28 @@ th { color: var(--muted); font-weight: 700; }
   }
   .player-validation {
     margin-left: 0;
+  }
+  .player-row,
+  .player-main,
+  .card-input-row {
+    width: 100%;
+  }
+  .player-main {
+    gap: 4px;
+  }
+  .player-tag {
+    flex-basis: 20px;
+  }
+  .player-main .card-keyboard-trigger {
+    flex: 0 0 38px;
+    width: 38px;
+    min-width: 38px;
+  }
+  .player-main .tag-hint {
+    flex: 0 0 34px;
+    width: 34px;
+    min-width: 34px;
+    height: 44px;
   }
   .cards-short { width: 100%; min-width: 0; }
   .cards-pretty-row {

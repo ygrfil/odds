@@ -424,6 +424,7 @@ function normalizePercentileScopedRange(rangeText, allowTransient = false) {
   const compact = String(rangeText || "").replace(/\s+/g, "");
   if (!compact) return allowTransient ? "" : DEFAULT_PLAYER_RANGE;
   const parsed = parsePercentileWindowRange(compact);
+  if (allowTransient && !parsed.hasWindow) return compact;
   const windowToken = percentileWindowToken(parsed.from, parsed.to);
   let suffix = String(parsed.suffix || "");
   if (!suffix) return windowToken;
@@ -1667,6 +1668,10 @@ function positionCardKeyboard(trigger) {
   el.cardKeyboardPanel.style.top = `${Math.max(8, top)}px`;
 }
 
+function isMobileViewport() {
+  return window.matchMedia?.("(max-width: 960px)")?.matches || window.innerWidth <= 960;
+}
+
 function openCardKeyboard(target, trigger) {
   if (!el.cardKeyboard || !target?.input) return;
   cardKeyboardState.target = { ...target, trigger };
@@ -1694,14 +1699,22 @@ function insertCardFromKeyboard(card) {
     const inserted = appendCardToCardText(target.input, card, 5);
     if (!inserted) return;
     target.input.value = inserted.value;
-    target.input.focus();
-    target.input.setSelectionRange(inserted.cursor, inserted.cursor);
+    if (!isMobileViewport()) {
+      target.input.focus();
+      target.input.setSelectionRange(inserted.cursor, inserted.cursor);
+    } else {
+      target.input.blur();
+    }
     target.onChange?.();
   } else if (target.kind === "range") {
     const next = appendCardToScopedRange(target.input.value || target.player?.range || DEFAULT_PLAYER_RANGE, card, el.variant.value);
     target.input.value = next;
-    target.input.focus();
-    target.input.setSelectionRange(next.length, next.length);
+    if (!isMobileViewport()) {
+      target.input.focus();
+      target.input.setSelectionRange(next.length, next.length);
+    } else {
+      target.input.blur();
+    }
     if (target.player) target.player.range = next;
     target.rangeWindow?.syncFromRangeText();
     saveLocal();
@@ -2190,6 +2203,7 @@ function renderPlayers() {
       let nextValue = range.value;
       const inserted = typeof event?.data === "string" ? event.data : "";
       const isDelimiterTyped = inserted.includes(",") || inserted.includes(" ");
+      const shouldNormalizeScope = isDelimiterTyped || inserted.length > 1 || event?.inputType === "insertFromPaste";
       if (isDelimiterTyped) {
         const cursorAtEnd = Number.isFinite(range.selectionStart)
           && Number.isFinite(range.selectionEnd)
@@ -2210,8 +2224,8 @@ function renderPlayers() {
           }
         }
       }
-      const scopedValue = normalizePercentileScopedRange(nextValue, true);
-      if (scopedValue !== nextValue && validateRangeSyntax(scopedValue, el.variant.value).ok) {
+      const scopedValue = shouldNormalizeScope ? normalizePercentileScopedRange(nextValue, true) : nextValue;
+      if (shouldNormalizeScope && scopedValue !== nextValue && validateRangeSyntax(scopedValue, el.variant.value).ok) {
         nextValue = scopedValue;
         range.value = nextValue;
         range.setSelectionRange(nextValue.length, nextValue.length);
