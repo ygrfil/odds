@@ -56,15 +56,6 @@ body {
 .topbar h1 { margin: 0; font-size: 24px; line-height: 1.1; }
 .topbar p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
 
-.mode-chip {
-  background: linear-gradient(120deg, var(--accent), #0d7ea8);
-  color: #fff;
-  padding: 6px 10px;
-  border-radius: 999px;
-  font-weight: 600;
-  font-size: 12px;
-}
-
 .panel {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -789,6 +780,19 @@ th { color: var(--muted); font-weight: 700; }
   margin-top: 8px;
 }
 
+.help-intro {
+  padding: 10px;
+  border: 1px solid rgba(110, 151, 198, 0.35);
+  border-radius: 8px;
+  background: rgba(37, 65, 99, 0.22);
+}
+
+.help-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 22px;
+}
+
 .help-body h3 {
   margin: 14px 0 6px;
   font-size: 14px;
@@ -805,6 +809,13 @@ th { color: var(--muted); font-weight: 700; }
 
 .help-body li + li {
   margin-top: 5px;
+}
+
+@media (max-width: 760px) {
+  .help-grid {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
 }
 
 .card-keyboard {
@@ -921,7 +932,6 @@ th { color: var(--muted); font-weight: 700; }
 @media (max-width: 960px) {
   .topbar { flex-direction: column; gap: 10px; }
   .topbar h1 { font-size: 22px; }
-  .mode-chip { align-self: flex-start; }
   .content-grid { grid-template-columns: 1fr; }
   .control-row {
     width: 100%;
