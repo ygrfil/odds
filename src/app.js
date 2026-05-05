@@ -8,10 +8,11 @@ import {
   PERCENTILE_PROFILE_OURS
 } from "./percentile-profiles.js";
 
+const DEFAULT_PLAYER_RANGE = "30%";
 const state = {
   players: [
-    { name: "P1", range: "*" },
-    { name: "P2", range: "*" }
+    { name: "P1", range: DEFAULT_PLAYER_RANGE },
+    { name: "P2", range: DEFAULT_PLAYER_RANGE }
   ],
   focusedPlayer: 0,
   lastResult: null,
@@ -56,7 +57,6 @@ const el = {
   run: document.querySelector("#run"),
   stop: document.querySelector("#stop"),
   status: document.querySelector("#status"),
-  runSummary: document.querySelector("#runSummary"),
   helpOpen: document.querySelector("#helpOpen"),
   helpClose: document.querySelector("#helpClose"),
   helpModal: document.querySelector("#helpModal"),
@@ -76,8 +76,17 @@ const el = {
 };
 const uiState = {
   rangeInputsByPlayer: new Map(),
+  rangeWindowsByPlayer: new Map(),
   refreshByPlayer: new Map(),
   deadVisible: false
+};
+const runActivityState = {
+  timer: null,
+  startedAt: 0,
+  phase: "",
+  iterations: 0,
+  rate: NaN,
+  detail: ""
 };
 const validationPreviewState = {
   timers: new Map(),
@@ -293,6 +302,126 @@ function normalizeRangeTextForTyping(rangeText) {
   const normalizedCore = coreRaw ? normalizeRangeText(coreRaw) : "";
   const base = normalizedCore === "*" ? "" : normalizedCore;
   return `${base}${tail}`;
+}
+
+function clampPercent(value, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return min;
+  return Math.max(min, Math.min(max, Math.round(n)));
+}
+
+function percentileWindowToken(fromPct, toPct) {
+  const from = clampPercent(fromPct, 0, 99);
+  const to = clampPercent(toPct, 1, 100);
+  const hi = Math.max(from + 1, to);
+  if (from <= 0) return `${hi}%`;
+  return `${from}%-${hi}%`;
+}
+
+function unwrapWholeParens(text) {
+  const src = String(text || "").trim();
+  if (!src.startsWith("(") || !src.endsWith(")")) return src;
+  let depth = 0;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === "(") depth++;
+    else if (ch === ")") depth--;
+    if (depth === 0 && i < src.length - 1) return src;
+  }
+  return src.slice(1, -1);
+}
+
+function splitTopLevel(text, delimiter) {
+  const src = String(text || "");
+  const parts = [];
+  let depth = 0;
+  let bracketDepth = 0;
+  let start = 0;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === "(") depth++;
+    else if (ch === ")") depth = Math.max(0, depth - 1);
+    else if (ch === "[") bracketDepth++;
+    else if (ch === "]") bracketDepth = Math.max(0, bracketDepth - 1);
+    else if (ch === delimiter && depth === 0 && bracketDepth === 0) {
+      parts.push(src.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(src.slice(start));
+  return parts;
+}
+
+function parsePercentileWindowRange(rangeText) {
+  const compact = String(rangeText || "").replace(/\s+/g, "");
+  const pct = "(?:100(?:\\.0+)?|[0-9]{1,2}(?:\\.[0-9]+)?)";
+  const topRe = new RegExp(`^(${pct})%(.*)$`);
+  const sliceRe = new RegExp(`^(${pct})%-(${pct})%(.*)$`);
+  const slice = compact.match(sliceRe);
+  if (slice) {
+    return {
+      from: clampPercent(slice[1], 0, 99),
+      to: clampPercent(slice[2], 1, 100),
+      suffix: slice[3] || "",
+      hasWindow: true
+    };
+  }
+  const top = compact.match(topRe);
+  if (top) {
+    return {
+      from: 0,
+      to: clampPercent(top[1], 1, 100),
+      suffix: top[2] || "",
+      hasWindow: true
+    };
+  }
+  const manual = normalizeRangeText(compact);
+  return {
+    from: 0,
+    to: 30,
+    suffix: manual && manual !== "*" ? `:(${manual})` : "",
+    hasWindow: false
+  };
+}
+
+function buildPercentileWindowRange(fromPct, toPct, suffixText) {
+  const from = clampPercent(fromPct, 0, 99);
+  const to = Math.max(from + 1, clampPercent(toPct, 1, 100));
+  const windowToken = percentileWindowToken(from, to);
+  const suffix = String(suffixText || "").trim();
+  return `${windowToken}${suffix}`;
+}
+
+function normalizeScopedInnerExpression(text) {
+  const normalized = normalizeRangeText(text);
+  if (!normalized || normalized === "*") return "";
+  return splitTopLevel(normalized, ",")
+    .map((part) => unwrapWholeParens(part))
+    .filter(Boolean)
+    .join(",");
+}
+
+function normalizePercentileScopedRange(rangeText, allowTransient = false) {
+  const compact = String(rangeText || "").replace(/\s+/g, "");
+  if (!compact) return allowTransient ? "" : DEFAULT_PLAYER_RANGE;
+  const parsed = parsePercentileWindowRange(compact);
+  const windowToken = percentileWindowToken(parsed.from, parsed.to);
+  let suffix = String(parsed.suffix || "");
+  if (!suffix) return windowToken;
+
+  const transientTail = /[,:!(]$/.test(suffix);
+  if (allowTransient && transientTail) return compact;
+
+  if (suffix.startsWith("!") && splitTopLevel(suffix, ",").length === 1) {
+    return normalizeRangeText(`${windowToken}${suffix}`);
+  }
+
+  if (suffix[0] === ":" || suffix[0] === ",") suffix = suffix.slice(1);
+  if (suffix.startsWith("!") || suffix.startsWith(",")) suffix = `*${suffix}`;
+
+  const inner = normalizeScopedInnerExpression(suffix);
+  if (!inner) return windowToken;
+  return normalizeRangeText(`${windowToken}:(${inner})`);
 }
 
 function withSuitSymbols(rawText) {
@@ -1246,7 +1375,7 @@ function loadLocal() {
     if (Array.isArray(s.players) && s.players.length >= 2) {
       state.players = s.players.slice(0, 6).map((p, i) => ({
         name: p.name || `P${i + 1}`,
-        range: p.range || "*"
+        range: normalizePercentileScopedRange(p.range || DEFAULT_PLAYER_RANGE)
       }));
     }
   } catch {
@@ -1297,21 +1426,23 @@ function applyQuickPick(token) {
     nextCursor = Math.max(0, Math.min(String(nextRange || "").length, prevCursor));
   } else if (input && document.activeElement === input) {
     const insertion = insertTokenAtCursor(current, tokenText, input.selectionStart, input.selectionEnd);
-    nextRange = normalizeRangeText(insertion.value);
+    nextRange = normalizePercentileScopedRange(insertion.value);
     nextCursor = Math.max(0, Math.min(nextRange.length, insertion.cursor));
   } else {
-    const base = normalizeRangeText(current);
-    nextRange = normalizeRangeText(base === "*" ? tokenText : `${base},${tokenText}`);
+    const base = normalizePercentileScopedRange(current || DEFAULT_PLAYER_RANGE);
+    nextRange = normalizePercentileScopedRange(base === "*" ? tokenText : `${base},${tokenText}`);
     nextCursor = nextRange.length;
   }
 
-  player.range = nextRange || "*";
+  nextRange = normalizePercentileScopedRange(nextRange || DEFAULT_PLAYER_RANGE);
+  player.range = nextRange || DEFAULT_PLAYER_RANGE;
   if (input) {
     input.value = player.range;
     input.focus();
     const pos = Number.isFinite(nextCursor) ? nextCursor : player.range.length;
     input.setSelectionRange(pos, pos);
   }
+  uiState.rangeWindowsByPlayer.get(idx)?.syncFromRangeText();
   if (refresh) refresh(true);
   else renderPlayers();
   saveLocal();
@@ -1337,6 +1468,66 @@ function closeBombpot() {
 
 function setStatus(msg) {
   el.status.textContent = msg;
+}
+
+function clearRunActivityTimer() {
+  if (!runActivityState.timer) return;
+  clearInterval(runActivityState.timer);
+  runActivityState.timer = null;
+}
+
+function formatDuration(ms, precise = false) {
+  const sec = Math.max(0, Number(ms) || 0) / 1000;
+  if (sec >= 60) {
+    const minutes = Math.floor(sec / 60);
+    const seconds = Math.floor(sec % 60).toString().padStart(2, "0");
+    return `${minutes}:${seconds}`;
+  }
+  return `${sec.toFixed(precise ? 2 : 1)}s`;
+}
+
+function formatRunRate(rate) {
+  const n = Number(rate);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  return `${Math.round(n).toLocaleString()} it/s overall`;
+}
+
+function renderRunActivity() {
+  if (!runActivityState.startedAt) return;
+  const elapsedMs = performance.now() - runActivityState.startedAt;
+  const parts = [runActivityState.phase || "Working"];
+  const iterations = Number(runActivityState.iterations);
+  if (Number.isFinite(iterations) && iterations > 0) {
+    parts.push(`${Math.round(iterations).toLocaleString()} iterations`);
+  }
+  parts.push(`${formatDuration(elapsedMs)} total`);
+  const rateText = formatRunRate(runActivityState.rate);
+  if (rateText) parts.push(rateText);
+  if (runActivityState.detail) parts.push(runActivityState.detail);
+  setStatus(parts.join(" • "));
+}
+
+function setRunActivity({ phase, startedAt, iterations, rate, detail, live = true }) {
+  if (startedAt) runActivityState.startedAt = startedAt;
+  if (!runActivityState.startedAt) runActivityState.startedAt = performance.now();
+  if (phase !== undefined) runActivityState.phase = String(phase || "Working");
+  if (iterations !== undefined) runActivityState.iterations = Number(iterations) || 0;
+  if (rate !== undefined) runActivityState.rate = Number(rate);
+  if (detail !== undefined) runActivityState.detail = String(detail || "");
+  renderRunActivity();
+  if (live && !runActivityState.timer) {
+    runActivityState.timer = setInterval(renderRunActivity, 250);
+  }
+}
+
+function setFinalRunStatus(text) {
+  clearRunActivityTimer();
+  runActivityState.startedAt = 0;
+  runActivityState.phase = "";
+  runActivityState.iterations = 0;
+  runActivityState.rate = NaN;
+  runActivityState.detail = "";
+  setStatus(text);
 }
 
 function supportsBombpotVariant(variant) {
@@ -1422,18 +1613,6 @@ function renderBombpotResultTable(payload) {
   setBombpotMeta(`P1 range: ${heroRange} | Board: ${boardShown} | Dead: ${deadShown}`);
 }
 
-function renderSummary(result) {
-  if (!result || !result.players?.length) {
-    el.runSummary.textContent = "";
-    return;
-  }
-  const totalMs = result.backend && result.timings && Number(result.timings.endToEndMs) > 0
-    ? Number(result.timings.endToEndMs)
-    : Number(result.elapsedMs || 0);
-  const total = (Math.max(0, totalMs) / 1000).toFixed(2);
-  el.runSummary.textContent = `${result.iterations.toLocaleString()} iterations in ${total}s`;
-}
-
 function numericPercent(value) {
   const n = Number(String(value || "").replace("%", ""));
   return Number.isFinite(n) ? n : 0;
@@ -1483,6 +1662,119 @@ function playerOutputRow(row, rowIndex, allRows) {
   return wrap;
 }
 
+function createRangeWindowSlider(player, playerIndex, rangeInput, refreshDerived, closeAutocomplete) {
+  const wrap = document.createElement("div");
+  wrap.className = "range-window-slider";
+
+  const track = document.createElement("div");
+  track.className = "range-window-track";
+  const fill = document.createElement("div");
+  fill.className = "range-window-fill";
+  const startThumb = document.createElement("button");
+  const endThumb = document.createElement("button");
+  const thumbs = [
+    { node: startThumb, key: "start", label: "Range start" },
+    { node: endThumb, key: "end", label: "Range end" }
+  ];
+
+  let start = 0;
+  let end = 30;
+  let dragging = "";
+
+  for (const thumb of thumbs) {
+    thumb.node.type = "button";
+    thumb.node.className = `range-window-thumb range-window-${thumb.key}`;
+    thumb.node.dataset.thumb = thumb.key;
+    thumb.node.setAttribute("role", "slider");
+    thumb.node.setAttribute("aria-label", thumb.label);
+    thumb.node.setAttribute("aria-valuemin", thumb.key === "start" ? "0" : "1");
+    thumb.node.setAttribute("aria-valuemax", thumb.key === "start" ? "99" : "100");
+  }
+
+  function syncFromRangeText() {
+    const parsed = parsePercentileWindowRange(rangeInput.value || player.range);
+    start = clampPercent(parsed.from, 0, 99);
+    end = Math.max(start + 1, clampPercent(parsed.to, 1, 100));
+    paint();
+  }
+
+  function paint() {
+    start = clampPercent(start, 0, 99);
+    end = Math.max(start + 1, clampPercent(end, 1, 100));
+    const left = `${start}%`;
+    const right = `${100 - end}%`;
+    fill.style.left = left;
+    fill.style.right = right;
+    startThumb.style.left = left;
+    endThumb.style.left = `${end}%`;
+    startThumb.setAttribute("aria-valuenow", String(start));
+    endThumb.setAttribute("aria-valuenow", String(end));
+    startThumb.setAttribute("aria-valuetext", `Skip top ${start}%`);
+    endThumb.setAttribute("aria-valuetext", `Play to ${end}%`);
+    wrap.title = start > 0 ? `${start}%-${end}%` : `${end}%`;
+  }
+
+  function commit() {
+    const parsed = parsePercentileWindowRange(rangeInput.value || player.range);
+    const nextRange = normalizePercentileScopedRange(buildPercentileWindowRange(start, end, parsed.suffix));
+    player.range = nextRange;
+    rangeInput.value = nextRange;
+    closeAutocomplete();
+    saveLocal();
+    refreshDerived(false);
+    paint();
+  }
+
+  function pctFromEvent(event) {
+    const rect = track.getBoundingClientRect();
+    if (!rect.width) return start;
+    const pct = ((event.clientX - rect.left) / rect.width) * 100;
+    return clampPercent(pct, 0, 100);
+  }
+
+  function moveThumb(which, pct) {
+    if (which === "start") start = Math.min(clampPercent(pct, 0, 99), end - 1);
+    else end = Math.max(clampPercent(pct, 1, 100), start + 1);
+    commit();
+  }
+
+  wrap.addEventListener("pointerdown", (event) => {
+    setFocusedPlayer(playerIndex);
+    const pct = pctFromEvent(event);
+    dragging = event.target?.dataset?.thumb || (Math.abs(pct - start) <= Math.abs(pct - end) ? "start" : "end");
+    wrap.setPointerCapture?.(event.pointerId);
+    moveThumb(dragging, pct);
+  });
+  wrap.addEventListener("pointermove", (event) => {
+    if (!dragging) return;
+    moveThumb(dragging, pctFromEvent(event));
+  });
+  wrap.addEventListener("pointerup", () => {
+    dragging = "";
+  });
+  wrap.addEventListener("pointercancel", () => {
+    dragging = "";
+  });
+
+  for (const thumb of thumbs) {
+    thumb.node.addEventListener("focus", () => setFocusedPlayer(playerIndex));
+    thumb.node.addEventListener("keydown", (event) => {
+      const step = event.shiftKey ? 5 : 1;
+      if (!["ArrowLeft", "ArrowDown", "ArrowRight", "ArrowUp"].includes(event.key)) return;
+      event.preventDefault();
+      const delta = event.key === "ArrowLeft" || event.key === "ArrowDown" ? -step : step;
+      moveThumb(thumb.key, (thumb.key === "start" ? start : end) + delta);
+    });
+  }
+
+  track.appendChild(fill);
+  track.appendChild(startThumb);
+  track.appendChild(endThumb);
+  wrap.appendChild(track);
+  syncFromRangeText();
+  return { node: wrap, syncFromRangeText };
+}
+
 function coverageForConfigPlayer(config, playerIndex) {
   const boardText = String(config.board || "").trim();
   const variant = String(config.variant || "");
@@ -1525,6 +1817,7 @@ function renderPlayers() {
   el.players.innerHTML = "";
   liveInfoState.nodeByPlayer.clear();
   uiState.rangeInputsByPlayer.clear();
+  uiState.rangeWindowsByPlayer.clear();
   uiState.refreshByPlayer.clear();
   for (const timer of validationPreviewState.timers.values()) clearTimeout(timer);
   validationPreviewState.timers.clear();
@@ -1547,7 +1840,7 @@ function renderPlayers() {
     range.className = "player-range-input";
     range.type = "text";
     range.value = p.range;
-    range.placeholder = "Range syntax, e.g. AA,AK$s,15%";
+    range.placeholder = "Range syntax, e.g. 5%-30%:(AA,$ds,@fd)";
     range.addEventListener("focus", () => {
       setFocusedPlayer(i);
     });
@@ -1643,13 +1936,14 @@ function renderPlayers() {
           const before = range.value.slice(0, activeFragment.start);
           const after = range.value.slice(activeFragment.end);
           const next = `${before}${entry.token}${after}`;
-          p.range = normalizeRangeText(next);
+          p.range = normalizePercentileScopedRange(next);
           range.value = p.range;
           const cursorPos = Math.max(0, Math.min(p.range.length, before.length + entry.token.length));
           range.focus();
           range.setSelectionRange(cursorPos, cursorPos);
           closeAutocomplete();
           saveLocal();
+          rangeWindow.syncFromRangeText();
           refreshDerived(false);
         });
         auto.appendChild(button);
@@ -1676,6 +1970,10 @@ function renderPlayers() {
     };
     uiState.refreshByPlayer.set(i, refreshDerived);
 
+    const rangeWindow = createRangeWindowSlider(p, i, range, refreshDerived, closeAutocomplete);
+    uiState.rangeWindowsByPlayer.set(i, rangeWindow);
+    row.insertBefore(rangeWindow.node, validation);
+
     range.addEventListener("input", (event) => {
       let nextValue = range.value;
       const inserted = typeof event?.data === "string" ? event.data : "";
@@ -1700,9 +1998,16 @@ function renderPlayers() {
           }
         }
       }
+      const scopedValue = normalizePercentileScopedRange(nextValue, true);
+      if (scopedValue !== nextValue && validateRangeSyntax(scopedValue, el.variant.value).ok) {
+        nextValue = scopedValue;
+        range.value = nextValue;
+        range.setSelectionRange(nextValue.length, nextValue.length);
+      }
       p.range = nextValue;
       saveLocal();
       refreshDerived(false);
+      rangeWindow.syncFromRangeText();
       refreshAutocomplete();
     });
     range.addEventListener("click", refreshAutocomplete);
@@ -1731,12 +2036,13 @@ function renderPlayers() {
         const after = range.value.slice(activeFragment.end);
         const chosen = autoItems[autoActive];
         const next = `${before}${chosen.token}${after}`;
-        p.range = normalizeRangeText(next);
+        p.range = normalizePercentileScopedRange(next);
         range.value = p.range;
         const cursorPos = Math.max(0, Math.min(p.range.length, before.length + chosen.token.length));
         range.setSelectionRange(cursorPos, cursorPos);
         closeAutocomplete();
         saveLocal();
+        rangeWindow.syncFromRangeText();
         refreshDerived(false);
         return;
       }
@@ -1747,11 +2053,12 @@ function renderPlayers() {
     });
     range.addEventListener("blur", () => {
       setTimeout(() => closeAutocomplete(), 120);
-      const normalizedFinal = normalizeRangeText(range.value);
+      const normalizedFinal = normalizePercentileScopedRange(range.value);
       if (normalizedFinal === range.value) return;
       p.range = normalizedFinal;
       range.value = normalizedFinal;
       saveLocal();
+      rangeWindow.syncFromRangeText();
       refreshDerived(true);
     });
     refreshDerived(false);
@@ -1782,7 +2089,7 @@ function currentConfig() {
     dead: el.dead.value.trim(),
     players: state.players.map((p, i) => ({
       name: p.name?.trim() || `P${i + 1}`,
-      range: p.range?.trim() || "*"
+      range: normalizePercentileScopedRange(p.range?.trim() || DEFAULT_PLAYER_RANGE)
     }))
   };
 }
@@ -1798,23 +2105,30 @@ async function run() {
   try {
     const config = currentConfig();
     const controller = runAbortController;
-    setStatus("Preparing cached range coverage...");
+    setRunActivity({ phase: "Preparing coverage", startedAt: endToEndStarted });
     const coverageStarted = performance.now();
     config.rangeCoverage = await collectRangeCoverageSnapshot(config, controller?.signal);
     const coverageMs = performance.now() - coverageStarted;
     if (!controller || controller.signal.aborted) throw new DOMException("Aborted", "AbortError");
-    setStatus("Running simulation...");
+    setRunActivity({ phase: "Running simulation", detail: "waiting for iterations" });
     const result = await runSimulation(config, (p) => {
-      const ips = Number(p.ips);
-      if (Number.isFinite(ips) && ips > 0 && Number(p.iterations) > 0) {
-        setStatus(`Iterations: ${p.iterations.toLocaleString()} | ${Math.round(ips).toLocaleString()} it/s | ${p.elapsed.toFixed(2)}s`);
+      const iterations = Number(p.iterations);
+      if (Number.isFinite(iterations) && iterations > 0) {
+        const totalElapsedSec = Math.max(0.001, (performance.now() - endToEndStarted) / 1000);
+        setRunActivity({
+          phase: "Running simulation",
+          iterations,
+          rate: iterations / totalElapsedSec,
+          detail: ""
+        });
       } else {
-        setStatus(`Running... preparing/evaluating ranges | ${p.elapsed.toFixed(2)}s`);
+        setRunActivity({ phase: "Running simulation", detail: "preparing/evaluating ranges" });
       }
     }, controller.signal);
     result.timings = result.timings || {};
     result.timings.coverageMs = coverageMs;
-    result.timings.endToEndMs = performance.now() - endToEndStarted;
+    const endToEndMs = performance.now() - endToEndStarted;
+    result.timings.endToEndMs = endToEndMs;
     if (result.backend && typeof console !== "undefined" && typeof console.info === "function") {
       const t = result.timings;
       console.info("[native timing]", {
@@ -1827,22 +2141,18 @@ async function run() {
       });
     }
     state.lastResult = result;
-    renderSummary(result);
     renderPlayers();
-    const simMs = result.backend
-      ? Number(result.timings.nativeMs || result.backendComputeMs || result.elapsedMs || 0)
-      : Number(result.elapsedMs || 0);
-    const avgIps = result.iterations / Math.max(0.001, simMs / 1000);
-    const simSeconds = (simMs / 1000).toFixed(2);
-    const ipsText = `${Math.round(avgIps).toLocaleString()} it/s`;
+    const avgIps = result.iterations / Math.max(0.001, endToEndMs / 1000);
+    const totalText = formatDuration(endToEndMs, true);
+    const ipsText = formatRunRate(avgIps);
     if (result.aborted || controller.signal.aborted) {
-      setStatus(`Stopped at ${result.iterations.toLocaleString()} iterations in ${simSeconds}s • ${ipsText}`);
+      setFinalRunStatus(`Stopped • ${result.iterations.toLocaleString()} iterations • ${totalText} total • ${ipsText}`);
     } else {
-      setStatus(`${result.iterations.toLocaleString()} iterations in ${simSeconds}s • ${ipsText}`);
+      setFinalRunStatus(`Done • ${result.iterations.toLocaleString()} iterations • ${totalText} total • ${ipsText}`);
     }
   } catch (err) {
-    if (runAbortController?.signal?.aborted || err?.name === "AbortError") setStatus("Stopped.");
-    else setStatus(`Error: ${err.message || String(err)}`);
+    if (runAbortController?.signal?.aborted || err?.name === "AbortError") setFinalRunStatus("Stopped.");
+    else setFinalRunStatus(`Error: ${err.message || String(err)}`);
   } finally {
     state.isRunning = false;
     runAbortController = null;
@@ -1854,7 +2164,7 @@ async function run() {
 function stopRun() {
   if (!state.isRunning || !runAbortController) return;
   runAbortController.abort();
-  setStatus("Stopping...");
+  setRunActivity({ phase: "Stopping", detail: "" });
 }
 
 function clearAllFields() {
@@ -1866,9 +2176,8 @@ function clearAllFields() {
   state.lastResult = null;
   state.players = state.players.map((p, i) => ({
     name: p.name || `P${i + 1}`,
-    range: "*"
+    range: DEFAULT_PLAYER_RANGE
   }));
-  renderSummary(state.lastResult);
   renderPlayers();
   updateBoardPrettyPreview();
   clearBombpotResultTable();
@@ -1918,11 +2227,10 @@ function importSetup(file) {
       updateBoardPrettyPreview();
       state.players = setup.players.slice(0, 6).map((p, i) => ({
         name: p.name || `P${i + 1}`,
-        range: p.range || "*"
+        range: normalizePercentileScopedRange(p.range || DEFAULT_PLAYER_RANGE)
       }));
 
       state.lastResult = payload.result || null;
-      renderSummary(state.lastResult);
       renderPlayers();
       saveLocal();
       setStatus("Setup imported.");
@@ -1949,7 +2257,7 @@ function wire() {
       setStatus("Max 6 players.");
       return;
     }
-    state.players.push({ name: `P${state.players.length + 1}`, range: "*" });
+    state.players.push({ name: `P${state.players.length + 1}`, range: DEFAULT_PLAYER_RANGE });
     renderPlayers();
     saveLocal();
   });
@@ -2046,7 +2354,6 @@ updateBoardPrettyPreview();
 initLiveInfoWorker();
 initBombpotUi();
 renderQuickPicks();
-renderSummary(state.lastResult);
 renderPlayers();
 wire();
 window.addEventListener("beforeunload", () => {
