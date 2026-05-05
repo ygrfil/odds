@@ -118,6 +118,7 @@ apt_packages=(
   curl
   git
   gzip
+  brotli
 )
 if [[ "${ENABLE_NGINX}" == "true" ]]; then
   apt_packages+=(nginx)

@@ -52,16 +52,17 @@
             Board (0-5 cards, e.g. AsKdJh)
             <input id="board" class="cards-short" type="text" maxlength="10" placeholder="AsKdJh" />
           </label>
-          <label>
+          <button id="deadToggle" type="button" class="compact-btn">Dead Cards</button>
+          <label id="deadWrap" class="hidden">
             Dead cards (optional)
             <input id="dead" class="cards-short" type="text" maxlength="10" />
           </label>
+          <div class="spacer"></div>
+          <div class="range-picks" id="rangePicks"></div>
         </div>
         <div class="cards-pretty-row">
           <div id="boardPretty" class="cards-pretty"></div>
         </div>
-
-        <div class="range-picks" id="rangePicks"></div>
 
         <div class="action-row">
           <button id="addPlayer" type="button">+ Player</button>
@@ -69,7 +70,6 @@
           <button id="clearAll" type="button">Clear All</button>
           <button id="bombpotRun" type="button">Bombpot</button>
           <button id="run" type="button" class="primary">Run Simulation</button>
-          <button id="stop" type="button">Stop</button>
           <button id="exportSetup" type="button">Export Setup</button>
           <button id="importSetup" type="button">Import Setup</button>
           <input id="importFile" type="file" accept=".json,application/json" hidden />

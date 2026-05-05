@@ -69,6 +69,7 @@ After you push new changes to GitHub, run this on the LXC:
 It will:
 - `git pull --ff-only` from your current branch
 - auto-detect your deployed port and nginx mode
+- precompress static assets for faster delivery
 - rerun install/redeploy with those settings
 
 Optional:
@@ -96,7 +97,7 @@ Run inside your LXC:
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential pkg-config libssl-dev ca-certificates curl git nginx
+sudo apt install -y build-essential pkg-config libssl-dev ca-certificates curl git gzip brotli nginx
 curl https://sh.rustup.rs -sSf | sh -s -- -y
 source "$HOME/.cargo/env"
 
@@ -109,6 +110,7 @@ sudo mkdir -p /opt/odds
 sudo install -m 755 target/release/odds /opt/odds/odds
 sudo cp index.html /opt/odds/index.html
 sudo cp -R src /opt/odds/src
+sudo ./scripts/precompress-static.sh /opt/odds
 sudo chown -R odds:odds /opt/odds
 ```
 

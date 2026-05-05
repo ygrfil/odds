@@ -771,6 +771,14 @@ fn is_percentile_table_asset(path: &str) -> bool {
         || path.ends_with("/src/percentile-tables-ppt6max.js"))
         || path == "/src/percentile-tables.js"
         || path == "/src/percentile-tables-ppt6max.js"
+        || path.ends_with("/src/percentile-tables-ours-plo4.js")
+        || path.ends_with("/src/percentile-tables-ours-plo5.js")
+        || path.ends_with("/src/percentile-tables-ppt6max-plo4.js")
+        || path.ends_with("/src/percentile-tables-ppt6max-plo5.js")
+        || path == "/src/percentile-tables-ours-plo4.js"
+        || path == "/src/percentile-tables-ours-plo5.js"
+        || path == "/src/percentile-tables-ppt6max-plo4.js"
+        || path == "/src/percentile-tables-ppt6max-plo5.js"
 }
 
 fn has_version_query(query: &str) -> bool {
@@ -3720,9 +3728,8 @@ static SAMPLER_CACHE: OnceLock<Mutex<SamplerCacheStore>> = OnceLock::new();
 static TAG_COVERAGE_CACHE: OnceLock<Mutex<TagCoverageCacheStore>> = OnceLock::new();
 static TAG_EXPR_COVERAGE_CACHE: OnceLock<Mutex<TagExprCoverageCacheStore>> = OnceLock::new();
 static PLAN_POOL_TOO_LARGE_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-static EXACT_PERCENTILE_TABLES: OnceLock<
-    Mutex<HashMap<String, HashMap<String, Arc<PercentileTable>>>>,
-> = OnceLock::new();
+static EXACT_PERCENTILE_TABLES: OnceLock<Mutex<HashMap<String, Option<Arc<PercentileTable>>>>> =
+    OnceLock::new();
 static CHOOSE_52_TABLE: OnceLock<[[usize; 7]; 53]> = OnceLock::new();
 const SAMPLER_CACHE_MAX: usize = 96;
 
@@ -3943,38 +3950,52 @@ fn normalize_percentile_profile(variant: &str, raw_profile: &str) -> String {
 }
 
 fn exact_percentile_table(variant: &str, profile: &str) -> Option<Arc<PercentileTable>> {
+    let variant_norm = variant.to_lowercase();
     let profile_norm = normalize_percentile_profile(variant, profile);
+    let key = format!("{profile_norm}|{variant_norm}");
     let cache = EXACT_PERCENTILE_TABLES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = cache.lock().ok()?;
-    if !guard.contains_key(&profile_norm) {
-        let loaded = load_percentile_tables_for_profile(&profile_norm).ok()?;
-        guard.insert(profile_norm.clone(), loaded);
+    if !guard.contains_key(&key) {
+        let loaded = load_percentile_table(&profile_norm, &variant_norm).ok();
+        guard.insert(key.clone(), loaded);
     }
-    let profile_tables = guard.get(&profile_norm)?;
-    profile_tables.get(&variant.to_lowercase()).cloned()
+    guard.get(&key).cloned().flatten()
 }
 
-fn load_percentile_tables_for_profile(
-    profile: &str,
-) -> Result<HashMap<String, Arc<PercentileTable>>, String> {
-    let (path, export_name) = if profile == "ppt6max" {
-        (
-            "src/percentile-tables-ppt6max.js",
-            "PPT_6MAX_PERCENTILE_TABLES",
-        )
-    } else {
-        ("src/percentile-tables.js", "PRECOMPUTED_PERCENTILE_TABLES")
-    };
+fn load_percentile_table(profile: &str, variant: &str) -> Result<Arc<PercentileTable>, String> {
+    let (path, export_name) = percentile_table_module_spec(profile, variant)
+        .ok_or_else(|| format!("no exact percentile table for {profile}/{variant}"))?;
     let text = fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
     let object_text = extract_exported_object_literal(&text, export_name)
         .ok_or_else(|| format!("failed to parse {export_name} in {path}"))?;
-    let parsed: HashMap<String, PercentileTable> =
+    let parsed: PercentileTable =
         json5::from_str(&object_text).map_err(|e| format!("parse {path}: {e}"))?;
-    let mut out = HashMap::<String, Arc<PercentileTable>>::new();
-    for (variant, table) in parsed {
-        out.insert(variant.to_lowercase(), Arc::new(table));
+    Ok(Arc::new(parsed))
+}
+
+fn percentile_table_module_spec(
+    profile: &str,
+    variant: &str,
+) -> Option<(&'static str, &'static str)> {
+    match (profile, variant) {
+        ("ppt6max", "plo4") => Some((
+            "src/percentile-tables-ppt6max-plo4.js",
+            "PPT_6MAX_PERCENTILE_TABLE_PLO4",
+        )),
+        ("ppt6max", "plo5") => Some((
+            "src/percentile-tables-ppt6max-plo5.js",
+            "PPT_6MAX_PERCENTILE_TABLE_PLO5",
+        )),
+        (_, "plo4") => Some((
+            "src/percentile-tables-ours-plo4.js",
+            "PRECOMPUTED_PERCENTILE_TABLE_PLO4",
+        )),
+        (_, "plo5") => Some((
+            "src/percentile-tables-ours-plo5.js",
+            "PRECOMPUTED_PERCENTILE_TABLE_PLO5",
+        )),
+        _ => None,
     }
-    Ok(out)
 }
 
 fn extract_exported_object_literal(text: &str, export_name: &str) -> Option<String> {

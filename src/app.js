@@ -46,6 +46,8 @@ const el = {
   precision: document.querySelector("#precision"),
   orderingProfile: document.querySelector("#orderingProfile"),
   board: document.querySelector("#board"),
+  deadToggle: document.querySelector("#deadToggle"),
+  deadWrap: document.querySelector("#deadWrap"),
   dead: document.querySelector("#dead"),
   boardPretty: document.querySelector("#boardPretty"),
   addPlayer: document.querySelector("#addPlayer"),
@@ -74,7 +76,8 @@ const el = {
 };
 const uiState = {
   rangeInputsByPlayer: new Map(),
-  refreshByPlayer: new Map()
+  refreshByPlayer: new Map(),
+  deadVisible: false
 };
 const validationPreviewState = {
   timers: new Map(),
@@ -101,12 +104,8 @@ const quickPicks = [
   { label: "Straight", token: "@s", group: "ready" },
   { label: "Flush", token: "@f", group: "ready" },
   { label: "Flush Draw", token: "@fd", group: "draw" },
-  { label: "Straight Draw", token: "@sd", group: "draw" },
   { label: "SD 8+ Outs", token: "@sd8", group: "draw" },
-  { label: "SD 12+ Outs", token: "@sd12", group: "draw" },
-  { label: "Double Suited", token: "$ds", group: "macro" },
-  { label: "Single Suited", token: "$ss", group: "macro" },
-  { label: "No Pair", token: "$np", group: "macro" }
+  { label: "SD 12+ Outs", token: "@sd12", group: "draw" }
 ];
 const autocompleteEntries = [
   { token: "@2p", description: "Two-pair board-core structures." },
@@ -353,6 +352,16 @@ function cardsPrettyLine(rawText, label) {
 
 function updateBoardPrettyPreview() {
   if (el.boardPretty) setSuitStyledText(el.boardPretty, cardsPrettyLine(el.board.value, "Board"));
+}
+
+function syncDeadVisibility() {
+  const hasDead = String(el.dead?.value || "").trim().length > 0;
+  const visible = uiState.deadVisible || hasDead;
+  if (el.deadWrap) el.deadWrap.classList.toggle("hidden", !visible);
+  if (el.deadToggle) {
+    el.deadToggle.classList.toggle("is-active", visible);
+    el.deadToggle.textContent = visible ? "Hide Dead" : "Dead Cards";
+  }
 }
 
 function handSizeForVariant(variant) {
@@ -1218,6 +1227,7 @@ function saveLocal() {
     percentileProfile,
     board: el.board.value,
     dead: el.dead.value,
+    deadVisible: uiState.deadVisible,
     players: state.players
   }));
 }
@@ -1232,6 +1242,7 @@ function loadLocal() {
     if (el.orderingProfile) el.orderingProfile.value = s.percentileProfile || DEFAULT_PERCENTILE_PROFILE;
     el.board.value = s.board || "";
     el.dead.value = s.dead || "";
+    uiState.deadVisible = !!s.deadVisible || String(el.dead.value || "").trim().length > 0;
     if (Array.isArray(s.players) && s.players.length >= 2) {
       state.players = s.players.slice(0, 6).map((p, i) => ({
         name: p.name || `P${i + 1}`,
@@ -1242,6 +1253,7 @@ function loadLocal() {
     // ignore corrupt local storage
   }
   updateBoardPrettyPreview();
+  syncDeadVisibility();
 }
 
 function renderQuickPicks() {
@@ -1779,7 +1791,7 @@ async function run() {
   if (state.isRunning) return;
   state.isRunning = true;
   el.run.disabled = true;
-  el.stop.disabled = false;
+  if (el.stop) el.stop.disabled = false;
   runAbortController = new AbortController();
   const endToEndStarted = performance.now();
 
@@ -1835,7 +1847,7 @@ async function run() {
     state.isRunning = false;
     runAbortController = null;
     el.run.disabled = false;
-    el.stop.disabled = true;
+    if (el.stop) el.stop.disabled = true;
   }
 }
 
@@ -1849,6 +1861,8 @@ function clearAllFields() {
   if (state.isRunning) return;
   el.board.value = "";
   el.dead.value = "";
+  uiState.deadVisible = false;
+  syncDeadVisibility();
   state.lastResult = null;
   state.players = state.players.map((p, i) => ({
     name: p.name || `P${i + 1}`,
@@ -1899,6 +1913,8 @@ function importSetup(file) {
       syncOrderingProfileControl();
       el.board.value = setup.board || "";
       el.dead.value = setup.dead || "";
+      uiState.deadVisible = String(el.dead.value || "").trim().length > 0;
+      syncDeadVisibility();
       updateBoardPrettyPreview();
       state.players = setup.players.slice(0, 6).map((p, i) => ({
         name: p.name || `P${i + 1}`,
@@ -1950,7 +1966,7 @@ function wire() {
   });
 
   el.run.addEventListener("click", run);
-  el.stop.addEventListener("click", stopRun);
+  if (el.stop) el.stop.addEventListener("click", stopRun);
   if (el.bombpotRun) el.bombpotRun.addEventListener("click", runBombpot);
   if (el.clearAll) el.clearAll.addEventListener("click", clearAllFields);
   el.helpOpen.addEventListener("click", openHelp);
@@ -2006,8 +2022,22 @@ function wire() {
       renderPlayers();
     });
   }
-  el.board.addEventListener("input", renderPlayers);
-  el.dead.addEventListener("input", renderPlayers);
+  el.board.addEventListener("input", () => {
+    renderPlayers();
+  });
+  el.dead.addEventListener("input", () => {
+    if (!String(el.dead.value || "").trim()) uiState.deadVisible = false;
+    syncDeadVisibility();
+    renderPlayers();
+  });
+  if (el.deadToggle) {
+    el.deadToggle.addEventListener("click", () => {
+      uiState.deadVisible = !uiState.deadVisible;
+      syncDeadVisibility();
+      saveLocal();
+    });
+  }
+
 }
 
 loadLocal();
@@ -2022,7 +2052,7 @@ wire();
 window.addEventListener("beforeunload", () => {
   if (liveInfoState.worker) liveInfoState.worker.terminate();
 });
-el.stop.disabled = true;
+if (el.stop) el.stop.disabled = true;
 setBombpotMeta("Uses P1 range as hero filter. Opponents are always 100% random.");
 if (!supportsBombpotVariant(el.variant.value)) setBombpotStatus("Bombpot supports only PLO4 and PLO5.");
 setBombpotRunning(false);

@@ -23,12 +23,24 @@ const PROFILE_OPTIONS_BY_VARIANT = {
 
 const PROFILE_TABLE_MODULES = {
   [PERCENTILE_PROFILE_OURS]: {
-    modulePath: "./percentile-tables.js",
-    exportName: "PRECOMPUTED_PERCENTILE_TABLES"
+    plo4: {
+      modulePath: "./percentile-tables-ours-plo4.js",
+      exportName: "PRECOMPUTED_PERCENTILE_TABLE_PLO4"
+    },
+    plo5: {
+      modulePath: "./percentile-tables-ours-plo5.js",
+      exportName: "PRECOMPUTED_PERCENTILE_TABLE_PLO5"
+    }
   },
   [PERCENTILE_PROFILE_PPT6MAX]: {
-    modulePath: "./percentile-tables-ppt6max.js",
-    exportName: "PPT_6MAX_PERCENTILE_TABLES"
+    plo4: {
+      modulePath: "./percentile-tables-ppt6max-plo4.js",
+      exportName: "PPT_6MAX_PERCENTILE_TABLE_PLO4"
+    },
+    plo5: {
+      modulePath: "./percentile-tables-ppt6max-plo5.js",
+      exportName: "PPT_6MAX_PERCENTILE_TABLE_PLO5"
+    }
   }
 };
 
@@ -36,17 +48,22 @@ const PROFILE_TABLE_CACHE = new Map();
 const PROFILE_TABLE_LOADS = new Map();
 let BUILD_VERSION_LOAD = null;
 
-function loadedProfileTables(profile) {
-  return PROFILE_TABLE_CACHE.get(profile) || null;
+function profileTableCacheKey(profile, variant) {
+  return `${profile}|${variant}`;
 }
 
-async function loadProfileTables(profile) {
-  if (PROFILE_TABLE_CACHE.has(profile)) return PROFILE_TABLE_CACHE.get(profile) || null;
-  if (PROFILE_TABLE_LOADS.has(profile)) return PROFILE_TABLE_LOADS.get(profile);
+function loadedProfileTable(profile, variant) {
+  return PROFILE_TABLE_CACHE.get(profileTableCacheKey(profile, variant)) || null;
+}
 
-  const spec = PROFILE_TABLE_MODULES[profile];
+async function loadProfileTable(profile, variant) {
+  const key = profileTableCacheKey(profile, variant);
+  if (PROFILE_TABLE_CACHE.has(key)) return PROFILE_TABLE_CACHE.get(key) || null;
+  if (PROFILE_TABLE_LOADS.has(key)) return PROFILE_TABLE_LOADS.get(key);
+
+  const spec = PROFILE_TABLE_MODULES[profile]?.[variant];
   if (!spec) {
-    PROFILE_TABLE_CACHE.set(profile, null);
+    PROFILE_TABLE_CACHE.set(key, null);
     return null;
   }
 
@@ -55,18 +72,18 @@ async function loadProfileTables(profile) {
       const version = await loadBuildVersion();
       const modulePath = withVersionQuery(spec.modulePath, version);
       const mod = await import(modulePath);
-      const tables = mod?.[spec.exportName] || null;
-      PROFILE_TABLE_CACHE.set(profile, tables);
-      return tables;
+      const table = mod?.[spec.exportName] || null;
+      PROFILE_TABLE_CACHE.set(key, table);
+      return table;
     } catch {
-      PROFILE_TABLE_CACHE.set(profile, null);
+      PROFILE_TABLE_CACHE.set(key, null);
       return null;
     } finally {
-      PROFILE_TABLE_LOADS.delete(profile);
+      PROFILE_TABLE_LOADS.delete(key);
     }
   })();
 
-  PROFILE_TABLE_LOADS.set(profile, load);
+  PROFILE_TABLE_LOADS.set(key, load);
   return load;
 }
 
@@ -114,20 +131,20 @@ export function resolvePercentileTable(variant, rawProfile) {
   const v = String(variant || "").toLowerCase();
   const profile = normalizePercentileProfile(v, rawProfile);
   if (profile === PERCENTILE_PROFILE_PPT6MAX) {
-    return loadedProfileTables(PERCENTILE_PROFILE_PPT6MAX)?.[v]
-      || loadedProfileTables(PERCENTILE_PROFILE_OURS)?.[v]
+    return loadedProfileTable(PERCENTILE_PROFILE_PPT6MAX, v)
+      || loadedProfileTable(PERCENTILE_PROFILE_OURS, v)
       || null;
   }
-  return loadedProfileTables(PERCENTILE_PROFILE_OURS)?.[v] || null;
+  return loadedProfileTable(PERCENTILE_PROFILE_OURS, v) || null;
 }
 
 export async function ensurePercentileTableLoaded(variant, rawProfile) {
   const v = String(variant || "").toLowerCase();
   const profile = normalizePercentileProfile(v, rawProfile);
-  await loadProfileTables(profile);
+  await loadProfileTable(profile, v);
   if (profile === PERCENTILE_PROFILE_PPT6MAX) {
-    const ppt = loadedProfileTables(PERCENTILE_PROFILE_PPT6MAX);
-    if (!ppt?.[v]) await loadProfileTables(PERCENTILE_PROFILE_OURS);
+    const ppt = loadedProfileTable(PERCENTILE_PROFILE_PPT6MAX, v);
+    if (!ppt) await loadProfileTable(PERCENTILE_PROFILE_OURS, v);
   }
   return resolvePercentileTable(v, profile);
 }

@@ -73,6 +73,10 @@ body {
   overflow: hidden;
 }
 
+.hidden {
+  display: none !important;
+}
+
 h2 { margin: 0 0 8px; font-size: 15px; }
 
 .content-grid {
@@ -93,6 +97,17 @@ h2 { margin: 0 0 8px; font-size: 15px; }
   gap: 8px;
   align-items: end;
   flex-wrap: wrap;
+}
+
+.compact-btn {
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
+#deadToggle.is-active {
+  border-color: #38bdf8;
+  color: #e8f6ff;
+  background: #123147;
 }
 
 label {
@@ -177,6 +192,11 @@ button.primary {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
+}
+
+.action-row button {
+  padding: 5px 8px;
+  font-size: 12px;
 }
 
 #players {
@@ -469,9 +489,19 @@ pre {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
-  max-height: 58px;
+  max-height: 96px;
   overflow: hidden;
   align-items: center;
+}
+
+.board-row {
+  align-items: end;
+}
+
+.board-row .range-picks {
+  margin-left: auto;
+  max-width: 58%;
+  justify-content: flex-end;
 }
 
 .range-pick-sep {
@@ -741,6 +771,11 @@ th { color: var(--muted); font-weight: 700; }
     overflow-y: hidden;
     padding-bottom: 2px;
     -webkit-overflow-scrolling: touch;
+  }
+  .board-row .range-picks {
+    margin-left: 0;
+    max-width: 100%;
+    justify-content: flex-start;
   }
   .range-picks button { flex: 0 0 auto; }
   .range-pick-sep { flex: 0 0 1px; }
