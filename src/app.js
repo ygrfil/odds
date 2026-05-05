@@ -47,9 +47,11 @@ const el = {
   precision: document.querySelector("#precision"),
   orderingProfile: document.querySelector("#orderingProfile"),
   board: document.querySelector("#board"),
+  boardCardKeyboard: document.querySelector("#boardCardKeyboard"),
   deadToggle: document.querySelector("#deadToggle"),
   deadWrap: document.querySelector("#deadWrap"),
   dead: document.querySelector("#dead"),
+  deadCardKeyboard: document.querySelector("#deadCardKeyboard"),
   boardPretty: document.querySelector("#boardPretty"),
   addPlayer: document.querySelector("#addPlayer"),
   removePlayer: document.querySelector("#removePlayer"),
@@ -72,7 +74,13 @@ const el = {
   bombpotMeta: document.querySelector("#bombpotMeta"),
   bombpotProgressWrap: document.querySelector("#bombpotProgressWrap"),
   bombpotProgressBar: document.querySelector("#bombpotProgressBar"),
-  bombpotResult: document.querySelector("#bombpotResult")
+  bombpotResult: document.querySelector("#bombpotResult"),
+  cardKeyboard: document.querySelector("#cardKeyboard"),
+  cardKeyboardPanel: document.querySelector("#cardKeyboardPanel"),
+  cardKeyboardTarget: document.querySelector("#cardKeyboardTarget"),
+  cardKeyboardSuits: document.querySelector("#cardKeyboardSuits"),
+  cardKeyboardRanks: document.querySelector("#cardKeyboardRanks"),
+  cardKeyboardClose: document.querySelector("#cardKeyboardClose")
 };
 const uiState = {
   rangeInputsByPlayer: new Map(),
@@ -92,6 +100,10 @@ const validationPreviewState = {
   timers: new Map(),
   requestSeqByPlayer: new Map()
 };
+const cardKeyboardState = {
+  suit: "s",
+  target: null
+};
 const SUIT_SYMBOLS = Object.freeze({
   c: "♣",
   d: "♦",
@@ -104,6 +116,13 @@ const SUIT_SYMBOL_CLASSES = Object.freeze({
   "♥": "suit-heart",
   "♠": "suit-spade"
 });
+const CARD_KEYBOARD_RANKS = Object.freeze(["2", "3", "4", "5", "6", "7", "8", "9", "T", "J", "Q", "K", "A"]);
+const CARD_KEYBOARD_SUITS = Object.freeze([
+  { value: "s", label: "♠" },
+  { value: "h", label: "♥" },
+  { value: "d", label: "♦" },
+  { value: "c", label: "♣" }
+]);
 
 const quickPicks = [
   { label: "Top Pair", token: "@tp", group: "ready" },
@@ -565,6 +584,59 @@ function isExplicitCardRun(text) {
     if (!isRankChar(run[i]) || !isSuitChar(run[i + 1])) return false;
   }
   return true;
+}
+
+function normalizeCardCode(rank, suit) {
+  const r = String(rank || "").toUpperCase();
+  const s = String(suit || "").toLowerCase();
+  if (!isRankChar(r) || !isSuitChar(s)) return "";
+  return `${r}${s}`;
+}
+
+function insertTextAtCursor(input, text) {
+  const current = String(input?.value || "");
+  const start = Number.isFinite(input?.selectionStart) ? input.selectionStart : current.length;
+  const end = Number.isFinite(input?.selectionEnd) ? input.selectionEnd : start;
+  const safeStart = Math.max(0, Math.min(current.length, start));
+  const safeEnd = Math.max(safeStart, Math.min(current.length, end));
+  const next = `${current.slice(0, safeStart)}${text}${current.slice(safeEnd)}`;
+  const cursor = safeStart + String(text || "").length;
+  return { value: next, cursor };
+}
+
+function appendCardToCardText(input, card, maxCards) {
+  const parsed = parseCardsText(input?.value || "");
+  const existing = parsed.invalid ? [] : parsed.cards;
+  if (existing.includes(card)) return null;
+  if (Number.isFinite(maxCards) && existing.length >= maxCards) return null;
+  return insertTextAtCursor(input, card);
+}
+
+function suffixInnerText(suffix) {
+  let src = String(suffix || "").trim();
+  if (src[0] === ":" || src[0] === ",") src = src.slice(1);
+  return unwrapWholeParens(src);
+}
+
+function appendCardToRangeInner(innerText, card, handSize) {
+  const inner = String(innerText || "").trim();
+  if (!inner) return card;
+  const parts = splitTopLevel(inner, ",").filter((part) => part !== "");
+  if (!parts.length) return card;
+  const last = parts[parts.length - 1];
+  const lastBare = unwrapWholeParens(last);
+  if (isExplicitCardRun(lastBare) && lastBare.length < handSize * 2 && !lastBare.toLowerCase().includes(card.toLowerCase())) {
+    parts[parts.length - 1] = `${lastBare}${card}`;
+  } else {
+    parts.push(card);
+  }
+  return parts.join(",");
+}
+
+function appendCardToScopedRange(rangeText, card, variant) {
+  const parsed = parsePercentileWindowRange(rangeText || DEFAULT_PLAYER_RANGE);
+  const inner = appendCardToRangeInner(suffixInnerText(parsed.suffix), card, handSizeForVariant(variant));
+  return normalizePercentileScopedRange(`${percentileWindowToken(parsed.from, parsed.to)}:(${inner})`, true);
 }
 
 function prettyRangeDisplayText(rangeText) {
@@ -1530,6 +1602,127 @@ function setFinalRunStatus(text) {
   setStatus(text);
 }
 
+function usedCardCodes() {
+  const out = new Set();
+  for (const source of [el.board?.value, el.dead?.value]) {
+    const parsed = parseCardsText(source || "");
+    if (!parsed.invalid) parsed.cards.forEach((card) => out.add(card));
+  }
+  state.players.forEach((player) => {
+    explicitCardsFromRange(player?.range || "").forEach((card) => out.add(card));
+  });
+  return out;
+}
+
+function targetCardCount(target) {
+  if (!target?.input) return 0;
+  if (target.kind === "board" || target.kind === "dead") {
+    const parsed = parseCardsText(target.input.value || "");
+    return parsed.invalid ? 0 : parsed.cards.length;
+  }
+  return explicitCardsFromRange(target.input.value || "").length;
+}
+
+function renderCardKeyboard() {
+  if (!el.cardKeyboardSuits || !el.cardKeyboardRanks) return;
+  const target = cardKeyboardState.target;
+  const used = usedCardCodes();
+  const maxReached = (target?.kind === "board" || target?.kind === "dead") && targetCardCount(target) >= 5;
+
+  el.cardKeyboardTarget.textContent = target?.label ? ` ${target.label}` : "";
+  el.cardKeyboardSuits.innerHTML = "";
+  for (const suit of CARD_KEYBOARD_SUITS) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = suit.label;
+    button.className = `card-keyboard-suit suit-key-${suit.value}`;
+    button.classList.toggle("is-active", cardKeyboardState.suit === suit.value);
+    button.addEventListener("click", () => {
+      cardKeyboardState.suit = suit.value;
+      renderCardKeyboard();
+    });
+    el.cardKeyboardSuits.appendChild(button);
+  }
+
+  el.cardKeyboardRanks.innerHTML = "";
+  for (const rank of CARD_KEYBOARD_RANKS) {
+    const card = normalizeCardCode(rank, cardKeyboardState.suit);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = rank;
+    button.className = `card-keyboard-rank suit-key-${cardKeyboardState.suit}`;
+    button.disabled = !target || maxReached || used.has(card);
+    button.addEventListener("click", () => insertCardFromKeyboard(card));
+    el.cardKeyboardRanks.appendChild(button);
+  }
+}
+
+function positionCardKeyboard(trigger) {
+  if (!el.cardKeyboardPanel || !trigger) return;
+  const rect = trigger.getBoundingClientRect();
+  const width = 286;
+  const left = Math.max(8, Math.min(window.innerWidth - width - 8, rect.left));
+  const top = Math.min(window.innerHeight - 190, rect.bottom + 6);
+  el.cardKeyboardPanel.style.left = `${left}px`;
+  el.cardKeyboardPanel.style.top = `${Math.max(8, top)}px`;
+}
+
+function openCardKeyboard(target, trigger) {
+  if (!el.cardKeyboard || !target?.input) return;
+  cardKeyboardState.target = { ...target, trigger };
+  document.querySelectorAll(".card-keyboard-trigger[aria-expanded='true']").forEach((node) => {
+    node.setAttribute("aria-expanded", "false");
+  });
+  trigger?.setAttribute("aria-expanded", "true");
+  el.cardKeyboard.classList.remove("hidden");
+  positionCardKeyboard(trigger);
+  renderCardKeyboard();
+}
+
+function closeCardKeyboard() {
+  if (!el.cardKeyboard) return;
+  el.cardKeyboard.classList.add("hidden");
+  cardKeyboardState.target?.trigger?.setAttribute("aria-expanded", "false");
+  cardKeyboardState.target = null;
+}
+
+function insertCardFromKeyboard(card) {
+  const target = cardKeyboardState.target;
+  if (!target?.input || !card) return;
+
+  if (target.kind === "board" || target.kind === "dead") {
+    const inserted = appendCardToCardText(target.input, card, 5);
+    if (!inserted) return;
+    target.input.value = inserted.value;
+    target.input.focus();
+    target.input.setSelectionRange(inserted.cursor, inserted.cursor);
+    target.onChange?.();
+  } else if (target.kind === "range") {
+    const next = appendCardToScopedRange(target.input.value || target.player?.range || DEFAULT_PLAYER_RANGE, card, el.variant.value);
+    target.input.value = next;
+    target.input.focus();
+    target.input.setSelectionRange(next.length, next.length);
+    if (target.player) target.player.range = next;
+    target.rangeWindow?.syncFromRangeText();
+    saveLocal();
+    target.refresh?.(false);
+  }
+
+  renderCardKeyboard();
+}
+
+function initCardKeyboard() {
+  renderCardKeyboard();
+  el.cardKeyboardClose?.addEventListener("click", closeCardKeyboard);
+  el.cardKeyboard?.addEventListener("click", (event) => {
+    if (event.target === el.cardKeyboard) closeCardKeyboard();
+  });
+  window.addEventListener("resize", () => {
+    if (el.cardKeyboard?.classList.contains("hidden")) return;
+    positionCardKeyboard(cardKeyboardState.target?.trigger);
+  });
+}
+
 function supportsBombpotVariant(variant) {
   const v = String(variant || "").toLowerCase();
   return v === "plo4" || v === "plo5";
@@ -1814,6 +2007,7 @@ async function collectRangeCoverageSnapshot(config, signal) {
 }
 
 function renderPlayers() {
+  if (cardKeyboardState.target?.kind === "range") closeCardKeyboard();
   el.players.innerHTML = "";
   liveInfoState.nodeByPlayer.clear();
   uiState.rangeInputsByPlayer.clear();
@@ -1849,6 +2043,12 @@ function renderPlayers() {
     main.appendChild(tag);
     main.appendChild(range);
 
+    const cardButton = document.createElement("button");
+    cardButton.type = "button";
+    cardButton.className = "card-keyboard-trigger";
+    cardButton.textContent = "A♠";
+    cardButton.setAttribute("aria-label", `Open P${i + 1} card keyboard`);
+
     const hint = document.createElement("button");
     hint.type = "button";
     hint.className = "tag-hint";
@@ -1878,6 +2078,7 @@ function renderPlayers() {
         }
       })();
     });
+    main.appendChild(cardButton);
     main.appendChild(hint);
     row.appendChild(main);
 
@@ -1973,6 +2174,17 @@ function renderPlayers() {
     const rangeWindow = createRangeWindowSlider(p, i, range, refreshDerived, closeAutocomplete);
     uiState.rangeWindowsByPlayer.set(i, rangeWindow);
     row.insertBefore(rangeWindow.node, validation);
+    cardButton.addEventListener("click", () => {
+      setFocusedPlayer(i);
+      openCardKeyboard({
+        kind: "range",
+        label: `P${i + 1}`,
+        input: range,
+        player: p,
+        refresh: refreshDerived,
+        rangeWindow
+      }, cardButton);
+    });
 
     range.addEventListener("input", (event) => {
       let nextValue = range.value;
@@ -2290,6 +2502,10 @@ function wire() {
   }
   window.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
+    if (el.cardKeyboard && !el.cardKeyboard.classList.contains("hidden")) {
+      closeCardKeyboard();
+      return;
+    }
     if (el.helpModal && !el.helpModal.classList.contains("hidden")) {
       closeHelp();
       return;
@@ -2331,12 +2547,41 @@ function wire() {
     });
   }
   el.board.addEventListener("input", () => {
+    renderCardKeyboard();
     renderPlayers();
   });
   el.dead.addEventListener("input", () => {
     if (!String(el.dead.value || "").trim()) uiState.deadVisible = false;
     syncDeadVisibility();
+    renderCardKeyboard();
     renderPlayers();
+  });
+  el.boardCardKeyboard?.addEventListener("click", () => {
+    openCardKeyboard({
+      kind: "board",
+      label: "Board",
+      input: el.board,
+      onChange: () => {
+        updateBoardPrettyPreview();
+        saveLocal();
+        renderPlayers();
+      }
+    }, el.boardCardKeyboard);
+  });
+  el.deadCardKeyboard?.addEventListener("click", () => {
+    uiState.deadVisible = true;
+    syncDeadVisibility();
+    openCardKeyboard({
+      kind: "dead",
+      label: "Dead",
+      input: el.dead,
+      onChange: () => {
+        uiState.deadVisible = true;
+        syncDeadVisibility();
+        saveLocal();
+        renderPlayers();
+      }
+    }, el.deadCardKeyboard);
   });
   if (el.deadToggle) {
     el.deadToggle.addEventListener("click", () => {
@@ -2353,6 +2598,7 @@ syncOrderingProfileControl();
 updateBoardPrettyPreview();
 initLiveInfoWorker();
 initBombpotUi();
+initCardKeyboard();
 renderQuickPicks();
 renderPlayers();
 wire();

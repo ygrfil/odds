@@ -237,6 +237,35 @@ button.primary {
   padding: 4px 6px;
 }
 
+.card-input-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.card-input-row input {
+  flex: 1 1 auto;
+}
+
+.card-keyboard-trigger {
+  width: 32px;
+  min-width: 32px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1;
+  border-color: #31506f;
+  color: #dbeaff;
+  background: #11243a;
+}
+
+.card-keyboard-trigger[aria-expanded="true"] {
+  border-color: #4fd3bf;
+  box-shadow: inset 0 0 0 1px rgba(79, 211, 191, 0.55);
+}
+
 .tag-hint {
   width: 20px;
   min-width: 20px;
@@ -765,6 +794,117 @@ th { color: var(--muted); font-weight: 700; }
   margin-top: 5px;
 }
 
+.card-keyboard {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  pointer-events: none;
+}
+
+.card-keyboard.hidden {
+  display: none;
+}
+
+.card-keyboard-panel {
+  position: absolute;
+  width: 286px;
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #335579;
+  border-radius: 8px;
+  background: #0c1b2e;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.38);
+  pointer-events: auto;
+}
+
+.card-keyboard-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.card-keyboard-head strong {
+  font-size: 12px;
+  color: #e5f1ff;
+}
+
+.card-keyboard-target {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.card-keyboard-head button {
+  min-height: 24px;
+  padding: 3px 8px;
+  font-size: 11px;
+}
+
+.card-keyboard-suits,
+.card-keyboard-ranks {
+  display: grid;
+  gap: 5px;
+}
+
+.card-keyboard-suits {
+  grid-template-columns: repeat(4, 1fr);
+}
+
+.card-keyboard-ranks {
+  grid-template-columns: repeat(7, 1fr);
+}
+
+.card-keyboard-suit,
+.card-keyboard-rank {
+  min-width: 0;
+  min-height: 30px;
+  padding: 0;
+  border-radius: 6px;
+  font-size: 13px;
+  background: #12263d;
+  border-color: #2e4c70;
+  color: #d9eaff;
+}
+
+.card-keyboard-suit.suit-key-s,
+.card-keyboard-rank.suit-key-s {
+  color: #f3f5f7;
+  background: #050607;
+  border-color: #4a4f57;
+}
+
+.card-keyboard-suit.suit-key-h,
+.card-keyboard-rank.suit-key-h {
+  color: #ffd7dd;
+  background: #35161c;
+  border-color: #8e3847;
+}
+
+.card-keyboard-suit.suit-key-d,
+.card-keyboard-rank.suit-key-d {
+  color: #e7f7ff;
+  background: #0646a8;
+  border-color: #4aa3ff;
+}
+
+.card-keyboard-suit.suit-key-c,
+.card-keyboard-rank.suit-key-c {
+  color: #d8f9e5;
+  background: #102b1d;
+  border-color: #3a8d5c;
+}
+
+.card-keyboard-suit.is-active {
+  box-shadow: inset 0 0 0 2px currentColor;
+  font-weight: 700;
+}
+
+.card-keyboard-rank:disabled {
+  opacity: 0.28;
+  cursor: not-allowed;
+}
+
 @media (max-width: 960px) {
   .topbar { flex-direction: column; gap: 10px; }
   .topbar h1 { font-size: 22px; }
@@ -787,6 +927,41 @@ th { color: var(--muted); font-weight: 700; }
   button {
     font-size: 15px;
     min-height: 44px;
+  }
+  .card-keyboard-trigger {
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+    min-height: 44px;
+    font-size: 14px;
+  }
+  .card-keyboard {
+    pointer-events: auto;
+    background: rgba(0, 0, 0, 0.38);
+  }
+  .card-keyboard-panel {
+    left: 0 !important;
+    right: 0;
+    top: auto !important;
+    bottom: 0;
+    width: 100%;
+    padding:
+      12px
+      calc(12px + var(--safe-right))
+      calc(12px + var(--safe-bottom))
+      calc(12px + var(--safe-left));
+    border-right: 0;
+    border-left: 0;
+    border-bottom: 0;
+    border-radius: 12px 12px 0 0;
+  }
+  .card-keyboard-ranks {
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+  }
+  .card-keyboard-suit,
+  .card-keyboard-rank {
+    min-height: 44px;
+    font-size: 16px;
   }
   .range-autocomplete {
     left: 6px;

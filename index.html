@@ -50,12 +50,18 @@
         <div class="control-row board-row">
           <label>
             Board (0-5 cards, e.g. AsKdJh)
-            <input id="board" class="cards-short" type="text" maxlength="10" placeholder="AsKdJh" />
+            <span class="card-input-row">
+              <input id="board" class="cards-short" type="text" maxlength="10" placeholder="AsKdJh" />
+              <button id="boardCardKeyboard" class="card-keyboard-trigger" type="button" aria-label="Open board card keyboard">A♠</button>
+            </span>
           </label>
           <button id="deadToggle" type="button" class="compact-btn">Dead Cards</button>
           <label id="deadWrap" class="hidden">
             Dead cards (optional)
-            <input id="dead" class="cards-short" type="text" maxlength="10" />
+            <span class="card-input-row">
+              <input id="dead" class="cards-short" type="text" maxlength="10" />
+              <button id="deadCardKeyboard" class="card-keyboard-trigger" type="button" aria-label="Open dead-card keyboard">A♠</button>
+            </span>
           </label>
           <div class="spacer"></div>
           <div class="range-picks" id="rangePicks"></div>
@@ -84,6 +90,20 @@
           </div>
           <div id="players"></div>
         </section>
+      </div>
+
+      <div id="cardKeyboard" class="card-keyboard hidden" role="dialog" aria-labelledby="cardKeyboardTitle">
+        <div id="cardKeyboardPanel" class="card-keyboard-panel">
+          <div class="card-keyboard-head">
+            <div>
+              <strong id="cardKeyboardTitle">Cards</strong>
+              <span id="cardKeyboardTarget" class="card-keyboard-target"></span>
+            </div>
+            <button id="cardKeyboardClose" type="button">Close</button>
+          </div>
+          <div id="cardKeyboardSuits" class="card-keyboard-suits"></div>
+          <div id="cardKeyboardRanks" class="card-keyboard-ranks"></div>
+        </div>
       </div>
 
       <div id="helpModal" class="help-modal hidden" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
