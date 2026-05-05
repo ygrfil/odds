@@ -153,22 +153,9 @@ async function previewTagCoverageFast(boardText, variant, tag, signal) {
   const tagToken = String(tag || "").trim().toLowerCase();
   const key = `${variant}|${boardKey}|${tagToken}`;
   if (REMOTE_TAG_COVERAGE_CACHE.has(key)) return REMOTE_TAG_COVERAGE_CACHE.get(key);
-  const bundle = REMOTE_TAG_BUNDLE_CACHE.get(`${variant}|${boardKey}`);
-  const bundledCov = coverageFromBundle(bundle, tagToken);
-  if (bundledCov) {
-    cacheSetBounded(REMOTE_TAG_COVERAGE_CACHE, key, bundledCov, 6000);
-    return bundledCov;
-  }
-  const payload = await fetchBackendJson("/api/sim/preview/tag", {
-    boardText,
-    variant,
-    tag
-  }, signal);
-  if (payload?.ok === false) {
-    throw new Error(payload?.error || "Tag: invalid expression");
-  }
-  const cov = payload?.coverage;
-  if (!cov || typeof cov !== "object") throw new Error("Tag: invalid backend response");
+  const bundle = await previewAllTagCoverageFast(boardText, variant, signal);
+  const cov = coverageFromBundle(bundle, tagToken);
+  if (!cov) throw new Error("Tag: invalid backend response");
   cacheSetBounded(REMOTE_TAG_COVERAGE_CACHE, key, cov, 6000);
   return cov;
 }

@@ -18,15 +18,9 @@ cargo run -p odds --release
 Open:
 - `http://localhost:8789/index.html`
 
-## Browser-only fallback
-```bash
-python3 -m http.server 8080
-```
-
-Open:
-- `http://localhost:8080/index.html`
-
-This mode skips backend APIs and runs simulation in-browser.
+## Backend requirement
+The frontend expects the Rust backend APIs to be available. Serving `index.html`
+with a generic static file server is not a supported simulation mode.
 
 ## API endpoints
 - `GET /api/health`
@@ -185,7 +179,7 @@ Compare two benchmark summaries:
 ## Project layout
 - `backend-rs-native/`: Axum server + API handlers
 - `native-sim/`: Rust simulation engine
-- `index.html` + `src/`: frontend UI and browser workers
+- `index.html` + `src/`: frontend UI and live preview worker
 
 ## Notes
 - Player count: 2 to 6.

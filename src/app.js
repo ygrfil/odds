@@ -41,6 +41,8 @@ const BOMBPOT_RUNTIME_MIN_MS = 20_000;
 const BOMBPOT_RUNTIME_MAX_MS = 900_000;
 const TAG_SHORTCUT_REMOTE_CACHE = new Map();
 const TAG_SHORTCUT_REMOTE_INFLIGHT = new Map();
+const TAG_SHORTCUT_BUNDLE_CACHE = new Map();
+const TAG_SHORTCUT_BUNDLE_INFLIGHT = new Map();
 
 const el = {
   variant: document.querySelector("#variant"),
@@ -928,34 +930,10 @@ async function fetchTagShortcutPayload(tagToken, boardText, variant) {
   if (TAG_SHORTCUT_REMOTE_INFLIGHT.has(cacheKey)) return TAG_SHORTCUT_REMOTE_INFLIGHT.get(cacheKey);
 
   const inflight = (async () => {
-    if (!canUseBackendPreview()) return { status: "helper-unavailable", combos: [] };
-    let res;
-    try {
-      res = await fetch("/api/sim/preview/tag", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          boardText: boardKey,
-          variant,
-          tag: normalizedTag
-        })
-      });
-    } catch {
-      return { status: "helper-unavailable", combos: [] };
-    }
-    if (!res.ok) {
-      if (res.status === 404 || res.status === 405) return { status: "helper-unavailable", combos: [] };
-      return { status: "invalid-board", combos: [] };
-    }
-    let payload = null;
-    try {
-      payload = await res.json();
-    } catch {
-      return { status: "invalid-board", combos: [] };
-    }
-    if (!payload || payload.ok === false) return { status: "invalid-board", combos: [] };
-    const combos = Array.isArray(payload.combos)
-      ? payload.combos.map((c) => String(c || "").trim()).filter(Boolean)
+    const bundle = await fetchTagShortcutBundle(boardKey, variant);
+    if (bundle.status !== "ok") return { status: bundle.status, combos: [] };
+    const combos = Array.isArray(bundle.combosByTag?.[normalizedTag])
+      ? bundle.combosByTag[normalizedTag].map((c) => String(c || "").trim()).filter(Boolean)
       : [];
     return { status: "ok", combos };
   })();
@@ -968,6 +946,55 @@ async function fetchTagShortcutPayload(tagToken, boardText, variant) {
   } finally {
     const current = TAG_SHORTCUT_REMOTE_INFLIGHT.get(cacheKey);
     if (current === inflight) TAG_SHORTCUT_REMOTE_INFLIGHT.delete(cacheKey);
+  }
+}
+
+async function fetchTagShortcutBundle(boardText, variant) {
+  const boardKey = String(boardText || "").trim();
+  const cacheKey = `${variant}|${boardKey}`;
+  if (TAG_SHORTCUT_BUNDLE_CACHE.has(cacheKey)) return TAG_SHORTCUT_BUNDLE_CACHE.get(cacheKey);
+  if (TAG_SHORTCUT_BUNDLE_INFLIGHT.has(cacheKey)) return TAG_SHORTCUT_BUNDLE_INFLIGHT.get(cacheKey);
+
+  const inflight = (async () => {
+    if (!canUseBackendPreview()) return { status: "helper-unavailable", combosByTag: {} };
+    let res;
+    try {
+      res = await fetch("/api/sim/preview/tags", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          boardText: boardKey,
+          variant
+        })
+      });
+    } catch {
+      return { status: "helper-unavailable", combosByTag: {} };
+    }
+    if (!res.ok) {
+      if (res.status === 404 || res.status === 405) return { status: "helper-unavailable", combosByTag: {} };
+      return { status: "invalid-board", combosByTag: {} };
+    }
+    let payload = null;
+    try {
+      payload = await res.json();
+    } catch {
+      return { status: "invalid-board", combosByTag: {} };
+    }
+    if (!payload || payload.ok === false) return { status: "invalid-board", combosByTag: {} };
+    const combosByTag = payload.combosByTag && typeof payload.combosByTag === "object"
+      ? payload.combosByTag
+      : {};
+    return { status: "ok", combosByTag };
+  })();
+
+  TAG_SHORTCUT_BUNDLE_INFLIGHT.set(cacheKey, inflight);
+  try {
+    const out = await inflight;
+    cacheSetBounded(TAG_SHORTCUT_BUNDLE_CACHE, cacheKey, out, 1200);
+    return out;
+  } finally {
+    const current = TAG_SHORTCUT_BUNDLE_INFLIGHT.get(cacheKey);
+    if (current === inflight) TAG_SHORTCUT_BUNDLE_INFLIGHT.delete(cacheKey);
   }
 }
 

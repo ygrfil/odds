@@ -9,6 +9,7 @@ ITER_CAP="${ITER_CAP:-200000}"
 BUILD_RELEASE="${BUILD_RELEASE:-1}"
 PRECOMPRESS_STATIC="${PRECOMPRESS_STATIC:-0}"
 OUT_DIR="${OUT_DIR:-${ROOT_DIR}/.bench/$(date +%Y%m%d-%H%M%S)}"
+STATIC_ASSET="${STATIC_ASSET:-/src/percentile-tables-ppt6max-plo5.js}"
 
 mkdir -p "${OUT_DIR}"
 
@@ -31,7 +32,7 @@ Usage:
   scripts/bench.sh compare <before_summary.json> <after_summary.json>
 
 Run mode env vars:
-  RUNS=7 ITER_CAP=200000 PORT_BASE=8920 BUILD_RELEASE=1 PRECOMPRESS_STATIC=0 OUT_DIR=...
+  RUNS=7 ITER_CAP=200000 PORT_BASE=8920 BUILD_RELEASE=1 PRECOMPRESS_STATIC=0 OUT_DIR=... STATIC_ASSET=...
 EOF
 }
 
@@ -143,8 +144,8 @@ measure_static() {
   local raw gz raw_bytes raw_time gz_bytes gz_time
   start_server false false "${port}"
   for _ in $(seq 1 "${RUNS}"); do
-    raw="$(curl -s -o /dev/null -w '%{size_download} %{time_total}' "http://127.0.0.1:${port}/src/percentile-tables.js")"
-    gz="$(curl --compressed -s -o /dev/null -w '%{size_download} %{time_total}' "http://127.0.0.1:${port}/src/percentile-tables.js")"
+    raw="$(curl -s -o /dev/null -w '%{size_download} %{time_total}' "http://127.0.0.1:${port}${STATIC_ASSET}")"
+    gz="$(curl --compressed -s -o /dev/null -w '%{size_download} %{time_total}' "http://127.0.0.1:${port}${STATIC_ASSET}")"
     raw_bytes="$(awk '{print $1}' <<<"${raw}")"
     raw_time="$(awk '{print $2}' <<<"${raw}")"
     gz_bytes="$(awk '{print $1}' <<<"${gz}")"

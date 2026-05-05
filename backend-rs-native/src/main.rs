@@ -767,11 +767,7 @@ async fn static_cache_headers(req: Request, next: Next) -> Response {
 }
 
 fn is_percentile_table_asset(path: &str) -> bool {
-    (path.ends_with("/src/percentile-tables.js")
-        || path.ends_with("/src/percentile-tables-ppt6max.js"))
-        || path == "/src/percentile-tables.js"
-        || path == "/src/percentile-tables-ppt6max.js"
-        || path.ends_with("/src/percentile-tables-ours-plo4.js")
+    path.ends_with("/src/percentile-tables-ours-plo4.js")
         || path.ends_with("/src/percentile-tables-ours-plo5.js")
         || path.ends_with("/src/percentile-tables-ppt6max-plo4.js")
         || path.ends_with("/src/percentile-tables-ppt6max-plo5.js")
@@ -954,16 +950,19 @@ async fn sim_preview_tags(Json(req): Json<PreviewTagsRequest>) -> (StatusCode, J
     };
 
     let mut coverage_by_tag = serde_json::Map::<String, Value>::new();
+    let mut combos_by_tag = serde_json::Map::<String, Value>::new();
     if board.len() < 3 || board.len() > 5 {
         for tag in TAG_COVERAGE_TOKEN_ORDER {
             coverage_by_tag.insert(tag.to_string(), coverage_json(0, 0));
+            combos_by_tag.insert(tag.to_string(), json!([]));
         }
         return (
             StatusCode::OK,
             Json(json!({
                 "ok": true,
                 "total": 0,
-                "coverageByTag": coverage_by_tag
+                "coverageByTag": coverage_by_tag,
+                "combosByTag": combos_by_tag
             })),
         );
     }
@@ -972,24 +971,26 @@ async fn sim_preview_tags(Json(req): Json<PreviewTagsRequest>) -> (StatusCode, J
 
     let cov_variant = variant.clone();
     let cov_board = board.clone();
-    let matched_by_tag = match tokio::task::spawn_blocking(move || {
-        let mut matched = Vec::<usize>::with_capacity(TAG_COVERAGE_TOKEN_ORDER.len());
+    let tag_rows = match tokio::task::spawn_blocking(move || {
+        let is_holdem = cov_variant == "holdem";
+        let bundle = tag_coverage_bundle_for(&cov_variant, hand_size, &cov_board);
+        let mut rows = Vec::<(usize, Vec<String>)>::with_capacity(TAG_COVERAGE_TOKEN_ORDER.len());
         for raw_tag in TAG_COVERAGE_TOKEN_ORDER {
-            let v = normalize_tag_token(raw_tag)
-                .map(|tag| {
-                    tag_alias_coverage_for_with_deadline(
-                        &cov_variant,
-                        hand_size,
-                        &cov_board,
-                        tag,
-                        deadline,
-                    )
-                })
-                .transpose()?
-                .unwrap_or(0);
-            matched.push(v);
+            let Some(tag) = normalize_tag_token(raw_tag) else {
+                rows.push((0, Vec::new()));
+                continue;
+            };
+            let matched = tag_alias_coverage_for_with_deadline(
+                &cov_variant,
+                hand_size,
+                &cov_board,
+                tag,
+                deadline,
+            )?;
+            let combos = preview_tag_core_combos_from_bundle(&bundle, &cov_board, tag, is_holdem);
+            rows.push((matched, combos));
         }
-        Ok::<Vec<usize>, PreviewDeadlineExceeded>(matched)
+        Ok::<Vec<(usize, Vec<String>)>, PreviewDeadlineExceeded>(rows)
     })
     .await
     {
@@ -1004,15 +1005,20 @@ async fn sim_preview_tags(Json(req): Json<PreviewTagsRequest>) -> (StatusCode, J
     };
 
     for (idx, tag) in TAG_COVERAGE_TOKEN_ORDER.iter().enumerate() {
-        let matched = matched_by_tag.get(idx).copied().unwrap_or(0);
+        let (matched, combos) = tag_rows
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| (0, Vec::new()));
         coverage_by_tag.insert((*tag).to_string(), coverage_json(matched, total_cov));
+        combos_by_tag.insert((*tag).to_string(), json!(combos));
     }
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
             "total": total_cov,
-            "coverageByTag": coverage_by_tag
+            "coverageByTag": coverage_by_tag,
+            "combosByTag": combos_by_tag
         })),
     )
 }
@@ -1397,6 +1403,30 @@ fn bombpot_positive_f64(value: Option<f64>, fallback: f64) -> f64 {
         .unwrap_or(fallback)
 }
 
+fn bombpot_exact_hero_range_override(range_text: &str, hand_size: usize) -> Option<String> {
+    let source = expand_expr_macros(&strip_spaces(range_text.trim()));
+    if source.is_empty() || source == "*" {
+        return None;
+    }
+
+    let tokens = tokenize_expr(&source).ok()?;
+    let mut exact = None::<String>;
+    for token in tokens {
+        let LexToken::Atom(atom) = token else {
+            continue;
+        };
+        let (raw_atom, _) = strip_weight_suffix(&atom);
+        let Some(cards_text) = parse_exact_literal_text(raw_atom.trim(), hand_size) else {
+            continue;
+        };
+        if exact.is_some() {
+            return None;
+        }
+        exact = Some(cards_text);
+    }
+    exact
+}
+
 async fn sim_bombpot_progress(Path(token): Path<String>) -> (StatusCode, Json<Value>) {
     let t = token.trim();
     if t.is_empty() {
@@ -1453,7 +1483,7 @@ async fn sim_bombpot(Json(req): Json<BombpotRequest>) -> (StatusCode, Json<Value
         return error_json(StatusCode::BAD_REQUEST, &msg);
     }
 
-    let hero_range = {
+    let hero_range_raw = {
         let t = req.hero_range.trim();
         if t.is_empty() {
             "*".to_string()
@@ -1461,6 +1491,8 @@ async fn sim_bombpot(Json(req): Json<BombpotRequest>) -> (StatusCode, Json<Value
             t.to_string()
         }
     };
+    let hero_range =
+        bombpot_exact_hero_range_override(&hero_range_raw, hand_size).unwrap_or(hero_range_raw);
 
     let mut iteration_cap = bombpot_positive_usize(req.iteration_cap, BOMBPOT_DEFAULT_ITER_CAP);
     let mut min_iterations = bombpot_positive_usize(req.min_iterations, BOMBPOT_DEFAULT_MIN_ITER);
@@ -3016,6 +3048,18 @@ fn cards_key(cards: &[u8]) -> String {
     cards
         .iter()
         .map(|c| format!("{c:02}"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn format_cards_text(cards: &[u8]) -> String {
+    cards
+        .iter()
+        .map(|c| {
+            let r = RANKS.chars().nth(card_rank(*c) as usize).unwrap_or('?');
+            let s = SUITS.chars().nth(card_suit(*c) as usize).unwrap_or('?');
+            format!("{r}{s}")
+        })
         .collect::<Vec<_>>()
         .join("")
 }
@@ -4861,6 +4905,17 @@ fn parse_exact_literal(text: &str, hand_size: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
+fn parse_exact_literal_text(text: &str, hand_size: usize) -> Option<String> {
+    if text.len() != hand_size * 2 {
+        return None;
+    }
+    let parsed = parse_cards_text(text).ok()?;
+    if parsed.len() != hand_size {
+        return None;
+    }
+    Some(format_cards_text(&parsed))
+}
+
 fn parse_rank_pattern(text: &str, hand_size: usize) -> Option<[u8; 13]> {
     let t = text.trim().to_uppercase();
     if t.chars().count() != hand_size {
@@ -6265,6 +6320,54 @@ mod tests {
             }
         }
         blocked
+    }
+
+    #[test]
+    fn bombpot_exact_hero_range_override_extracts_scoped_hand() {
+        assert_eq!(
+            bombpot_exact_hero_range_override("30%:(AsKdQhJc)", 4),
+            Some("AsKdQhJc".to_string())
+        );
+        assert_eq!(
+            bombpot_exact_hero_range_override("10%-35%:(As Kd Qh Jc)", 4),
+            Some("AsKdQhJc".to_string())
+        );
+    }
+
+    #[test]
+    fn bombpot_exact_hero_range_override_leaves_ambiguous_ranges() {
+        assert_eq!(bombpot_exact_hero_range_override("30%", 4), None);
+        assert_eq!(
+            bombpot_exact_hero_range_override("AsKdQhJc,AcKcQcJd", 4),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn bombpot_endpoint_uses_scoped_hero_hand_as_exact_hand() {
+        let (status, Json(payload)) = sim_bombpot(Json(BombpotRequest {
+            variant: "plo4".to_string(),
+            percentile_profile: None,
+            board: "AsKdQc".to_string(),
+            dead: String::new(),
+            hero_range: "0%-1%:(8c8d8h8s)".to_string(),
+            iteration_cap: Some(32),
+            min_iterations: Some(32),
+            target_half_width_pct: Some(100.0),
+            workers: Some(1),
+            progress_token: None,
+            max_runtime_ms: Some(60_000),
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(
+            payload
+                .get("result")
+                .and_then(|v| v.get("heroRange"))
+                .and_then(Value::as_str),
+            Some("8c8d8h8s")
+        );
     }
 
     #[test]
