@@ -1491,8 +1491,8 @@ async fn sim_bombpot(Json(req): Json<BombpotRequest>) -> (StatusCode, Json<Value
             t.to_string()
         }
     };
-    let hero_range =
-        bombpot_exact_hero_range_override(&hero_range_raw, hand_size).unwrap_or(hero_range_raw);
+    let hero_range = bombpot_exact_hero_range_override(&hero_range_raw, hand_size)
+        .unwrap_or_else(|| "*".to_string());
 
     let mut iteration_cap = bombpot_positive_usize(req.iteration_cap, BOMBPOT_DEFAULT_ITER_CAP);
     let mut min_iterations = bombpot_positive_usize(req.min_iterations, BOMBPOT_DEFAULT_MIN_ITER);
@@ -6332,6 +6332,10 @@ mod tests {
             bombpot_exact_hero_range_override("10%-35%:(As Kd Qh Jc)", 4),
             Some("AsKdQhJc".to_string())
         );
+        assert_eq!(
+            bombpot_exact_hero_range_override("30%:AsKdQhJc2s", 5),
+            Some("AsKdQhJc2s".to_string())
+        );
     }
 
     #[test]
@@ -6367,6 +6371,60 @@ mod tests {
                 .and_then(|v| v.get("heroRange"))
                 .and_then(Value::as_str),
             Some("8c8d8h8s")
+        );
+    }
+
+    #[tokio::test]
+    async fn bombpot_endpoint_ignores_non_exact_p1_range() {
+        let (status, Json(payload)) = sim_bombpot(Json(BombpotRequest {
+            variant: "plo4".to_string(),
+            percentile_profile: None,
+            board: "AsKdQc".to_string(),
+            dead: String::new(),
+            hero_range: "0%-1%:@fd".to_string(),
+            iteration_cap: Some(32),
+            min_iterations: Some(32),
+            target_half_width_pct: Some(100.0),
+            workers: Some(1),
+            progress_token: None,
+            max_runtime_ms: Some(60_000),
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(
+            payload
+                .get("result")
+                .and_then(|v| v.get("heroRange"))
+                .and_then(Value::as_str),
+            Some("*")
+        );
+    }
+
+    #[tokio::test]
+    async fn bombpot_endpoint_uses_plo5_exact_five_card_hand() {
+        let (status, Json(payload)) = sim_bombpot(Json(BombpotRequest {
+            variant: "plo5".to_string(),
+            percentile_profile: None,
+            board: "AsKdQc".to_string(),
+            dead: String::new(),
+            hero_range: "30%:8c8d8h8s2c".to_string(),
+            iteration_cap: Some(24),
+            min_iterations: Some(24),
+            target_half_width_pct: Some(100.0),
+            workers: Some(1),
+            progress_token: None,
+            max_runtime_ms: Some(60_000),
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(
+            payload
+                .get("result")
+                .and_then(|v| v.get("heroRange"))
+                .and_then(Value::as_str),
+            Some("8c8d8h8s2c")
         );
     }
 
