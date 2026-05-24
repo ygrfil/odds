@@ -1,5 +1,5 @@
 import { runSimulation } from "./engine.js";
-import { canUseNativeIosSim, previewNativeIosRangeCoverage } from "./native-ios.js";
+import { canUseNativeIosSim, previewNativeIosRangeCoverage, previewNativeIosTagShortcuts } from "./native-ios.js";
 import { extractNormalizedTags, splitTagToken } from "./tag-utils.js";
 import {
   normalizePercentileProfile,
@@ -963,6 +963,17 @@ async function fetchTagShortcutBundle(boardText, variant) {
   if (TAG_SHORTCUT_BUNDLE_INFLIGHT.has(cacheKey)) return TAG_SHORTCUT_BUNDLE_INFLIGHT.get(cacheKey);
 
   const inflight = (async () => {
+    if (canUseNativeIosSim()) {
+      try {
+        const combosByTag = await previewNativeIosTagShortcuts({
+          boardText: boardKey,
+          variant
+        });
+        return { status: "ok", combosByTag };
+      } catch {
+        return { status: "helper-unavailable", combosByTag: {} };
+      }
+    }
     if (!canUseBackendPreview()) return { status: "helper-unavailable", combosByTag: {} };
     let res;
     try {

@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -97,6 +98,8 @@ struct Request {
     plan: Option<PlanNodeReq>,
     range_text: Option<String>,
     percentile_profile: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,6 +124,7 @@ struct Response {
     equity_rank: Option<EquityRankOut>,
     pool_build: Option<PoolBuildOut>,
     coverage: Option<CoverageOut>,
+    tag_shortcuts: Option<TagShortcutsOut>,
 }
 
 #[derive(Debug, Serialize)]
@@ -173,6 +177,11 @@ struct CoverageOut {
     total: usize,
     pct: f64,
     approx: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TagShortcutsOut {
+    combos_by_tag: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -437,6 +446,7 @@ fn sim_request_to_internal(req: SimRequest) -> Request {
         plan: None,
         range_text: None,
         percentile_profile: None,
+        tags: Vec::new(),
     }
 }
 
@@ -453,7 +463,8 @@ fn error_response_value(msg: impl Into<String>) -> Value {
         "raw": null,
         "equity_rank": null,
         "pool_build": null,
-        "coverage": null
+        "coverage": null,
+        "tag_shortcuts": null
     })
 }
 
@@ -484,6 +495,7 @@ fn run_request(req: &Request) -> Result<Response> {
         "equity-rank" => run_equity_rank_mode(&req),
         "build-pool" => run_build_pool_mode(&req),
         "preview-range" => run_preview_range_mode(&req),
+        "tag-shortcuts" => run_tag_shortcuts_mode(&req),
         _ => anyhow::bail!("unsupported mode '{}'", mode),
     }
 }
@@ -607,6 +619,7 @@ fn run_sim_mode(req: &Request) -> Result<Response> {
         equity_rank: None,
         pool_build: None,
         coverage: None,
+        tag_shortcuts: None,
     };
     Ok(out)
 }
@@ -680,6 +693,7 @@ fn run_equity_rank_mode(req: &Request) -> Result<Response> {
         }),
         pool_build: None,
         coverage: None,
+        tag_shortcuts: None,
     };
     Ok(out)
 }
@@ -773,6 +787,7 @@ fn run_build_pool_mode(req: &Request) -> Result<Response> {
             pool,
         }),
         coverage: None,
+        tag_shortcuts: None,
     };
     Ok(out)
 }
@@ -875,7 +890,178 @@ fn run_preview_range_mode(req: &Request) -> Result<Response> {
             },
             approx: false,
         }),
+        tag_shortcuts: None,
     })
+}
+
+fn run_tag_shortcuts_mode(req: &Request) -> Result<Response> {
+    let expected = variant_hand_size(&req.variant);
+    if expected == 0 {
+        anyhow::bail!("unsupported variant '{}'", req.variant);
+    }
+    validate_board_and_dead(&req.board, &req.dead)?;
+    if req.board.len() < 3 || req.board.len() > 5 {
+        return Ok(Response {
+            ok: true,
+            error: None,
+            raw: None,
+            equity_rank: None,
+            pool_build: None,
+            coverage: None,
+            tag_shortcuts: Some(TagShortcutsOut {
+                combos_by_tag: BTreeMap::new(),
+            }),
+        });
+    }
+
+    let tags: Vec<String> = if req.tags.is_empty() {
+        vec![
+            "@tp",
+            "@tp+",
+            "@overpair",
+            "@overpair+",
+            "@2p",
+            "@2p+",
+            "@set",
+            "@set+",
+            "@s",
+            "@s+",
+            "@f",
+            "@f+",
+            "@fd",
+            "@sd",
+            "@sd4",
+            "@sd8",
+            "@sd12",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    } else {
+        req.tags.clone()
+    };
+
+    let is_holdem = req.variant == "holdem";
+    let base = available_deck(&req.board, &req.dead);
+    let mut combos_by_tag = BTreeMap::new();
+    for raw_tag in tags {
+        let Some(tag_req) = tag_plan_req(&raw_tag.to_ascii_lowercase()) else {
+            continue;
+        };
+        let tag = plan_tag_to_atom(tag_req);
+        let labels = tag_shortcut_labels_for_native(&base, &req.board, tag, is_holdem);
+        combos_by_tag.insert(normalize_tag_label(&raw_tag), labels);
+    }
+
+    Ok(Response {
+        ok: true,
+        error: None,
+        raw: None,
+        equity_rank: None,
+        pool_build: None,
+        coverage: None,
+        tag_shortcuts: Some(TagShortcutsOut { combos_by_tag }),
+    })
+}
+
+fn available_deck(board: &[u8], dead: &[u8]) -> Vec<u8> {
+    let mut blocked = [false; 52];
+    for &card in board.iter().chain(dead.iter()) {
+        blocked[card as usize] = true;
+    }
+    (0u8..52u8)
+        .filter(|card| !blocked[*card as usize])
+        .collect()
+}
+
+fn plan_tag_to_atom(tag: PlanTagReq) -> TagAtom {
+    match tag.kind {
+        PlanTagKind::TopPair => TagAtom::TopPair { plus: tag.plus },
+        PlanTagKind::Overpair => TagAtom::Overpair { plus: tag.plus },
+        PlanTagKind::TwoPair => TagAtom::TwoPair { plus: tag.plus },
+        PlanTagKind::Set => TagAtom::Set { plus: tag.plus },
+        PlanTagKind::FlushDraw => TagAtom::FlushDraw,
+        PlanTagKind::Flush => TagAtom::Flush { plus: tag.plus },
+        PlanTagKind::StraightDraw => TagAtom::StraightDraw {
+            min_outs: tag.min_outs.max(1),
+        },
+        PlanTagKind::Straight => TagAtom::Straight { plus: tag.plus },
+    }
+}
+
+fn tag_shortcut_labels_for_native(
+    base: &[u8],
+    board: &[u8],
+    tag: TagAtom,
+    is_holdem: bool,
+) -> Vec<String> {
+    let use_suit = tag_uses_suit_labels(tag);
+    let mut labels = BTreeSet::<String>::new();
+    for i in 0..base.len() {
+        let c1 = base[i];
+        for &c2 in base.iter().skip(i + 1) {
+            if !core_tag_match(tag, [c1, c2], board, is_holdem) {
+                continue;
+            }
+            let label = if use_suit {
+                core_suit_label(c1, c2)
+            } else {
+                core_rank_label_for_board(c1, c2, board)
+            };
+            labels.insert(label);
+        }
+    }
+    labels.into_iter().collect()
+}
+
+fn tag_uses_suit_labels(tag: TagAtom) -> bool {
+    matches!(tag, TagAtom::FlushDraw | TagAtom::Flush { plus: false })
+}
+
+fn core_rank_label(c1: u8, c2: u8) -> String {
+    let r1 = card_rank_value(c1);
+    let r2 = card_rank_value(c2);
+    let high = r1.max(r2);
+    let low = r1.min(r2);
+    let has_face_num_mix = high >= 11 && low <= 10;
+    let (a, b) = if has_face_num_mix {
+        (low, high)
+    } else {
+        (high, low)
+    };
+    format!("{}{}", rank_value_char(a), rank_value_char(b))
+}
+
+fn core_rank_label_for_board(c1: u8, c2: u8, board: &[u8]) -> String {
+    let r1 = card_rank_value(c1);
+    let r2 = card_rank_value(c2);
+    if r1 != r2 {
+        let pos1 = board.iter().position(|card| card_rank_value(*card) == r1);
+        let pos2 = board.iter().position(|card| card_rank_value(*card) == r2);
+        if let (Some(a), Some(b)) = (pos1, pos2) {
+            let (first, second) = if a <= b { (r1, r2) } else { (r2, r1) };
+            return format!("{}{}", rank_value_char(first), rank_value_char(second));
+        }
+    }
+    core_rank_label(c1, c2)
+}
+
+fn rank_value_char(rank: u8) -> char {
+    RANK_CHARS
+        .get(rank.saturating_sub(2) as usize)
+        .map(|c| *c as char)
+        .unwrap_or('?')
+}
+
+fn core_suit_label(c1: u8, c2: u8) -> String {
+    const SUITS: &[u8; 4] = b"cdhs";
+    let s1 = SUITS.get(card_suit(c1) as usize).copied().unwrap_or(b'x') as char;
+    let s2 = SUITS.get(card_suit(c2) as usize).copied().unwrap_or(b'x') as char;
+    format!("{s1}{s2}")
+}
+
+fn normalize_tag_label(tag: &str) -> String {
+    tag.trim().to_ascii_lowercase()
 }
 
 #[derive(Debug, Clone)]
@@ -4130,6 +4316,25 @@ mod tests {
         assert_eq!(out["ok"], true);
         assert_eq!(out["coverage"]["approx"], false);
         assert!(out["coverage"]["total"].as_u64().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn tag_shortcuts_return_two_pair_labels_in_rust() {
+        let out = run_request_value(json!({
+            "mode": "tag-shortcuts",
+            "variant": "plo5",
+            "board": [8, 16, 20],
+            "dead": [],
+            "tags": ["@2p"]
+        }));
+
+        assert_eq!(out["ok"], true);
+        let combos = out["tag_shortcuts"]["combos_by_tag"]["@2p"]
+            .as_array()
+            .expect("two-pair labels");
+        assert!(combos.iter().any(|v| v.as_str() == Some("46")));
+        assert!(combos.iter().any(|v| v.as_str() == Some("47")));
+        assert!(combos.iter().any(|v| v.as_str() == Some("67")));
     }
 
     #[test]

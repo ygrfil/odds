@@ -177,3 +177,29 @@ export async function previewNativeIosRangeCoverage(params, signal) {
   }
   return response.coverage;
 }
+
+export async function previewNativeIosTagShortcuts(params, signal) {
+  if (!canUseNativeIosSim()) {
+    throw new Error("Native iOS engine bridge is not available.");
+  }
+
+  const variant = String(params?.variant || "").trim().toLowerCase();
+  const board = parseCards(params?.boardText || "");
+  const tags = Array.isArray(params?.tags)
+    ? params.tags.map((tag) => String(tag || "").trim().toLowerCase()).filter(Boolean)
+    : [];
+  const response = await postNativeRequest({
+    mode: "tag-shortcuts",
+    variant,
+    board,
+    dead: [],
+    tags
+  }, signal);
+
+  const shortcuts = response?.tag_shortcuts ?? response?.tagShortcuts;
+  const combosByTag = shortcuts?.combos_by_tag ?? shortcuts?.combosByTag;
+  if (!response?.ok || !combosByTag || typeof combosByTag !== "object") {
+    throw new Error(response?.error || "Native iOS engine returned invalid tag shortcuts.");
+  }
+  return combosByTag;
+}
