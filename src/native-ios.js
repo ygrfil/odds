@@ -1,6 +1,5 @@
 import { buildNativeSimRequest } from "./native-sim-request.js";
 import { parseCards } from "./cards.js";
-import { tryCompileRangeNativePlan } from "./parser.js";
 import { rawToResult } from "./result-format.js";
 
 const pending = new Map();
@@ -146,15 +145,6 @@ export async function previewNativeIosRangeCoverage(params, signal) {
     return { matched: total, total, pct: 100, approx: false };
   }
 
-  const percentileProfile = String(params?.percentileProfile || "").trim().toLowerCase();
-  const plan = tryCompileRangeNativePlan(rangeText, variant, board, {
-    percentileProfile,
-    nativeExactPercentileRef: true
-  });
-  if (!plan) {
-    throw new Error("Range cannot be compiled for the native iOS engine.");
-  }
-
   const request = {
     mode: "preview-range",
     variant,
@@ -162,7 +152,8 @@ export async function previewNativeIosRangeCoverage(params, signal) {
     hand_size: handSize,
     board,
     dead: [],
-    plan
+    range_text: rangeText,
+    percentile_profile: String(params?.percentileProfile || "").trim().toLowerCase()
   };
   const response = await postNativeRequest(request, signal);
   if (response?.ok && response?.coverage) {

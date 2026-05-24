@@ -1,5 +1,4 @@
 import { parseCards } from "./cards.js";
-import { tryCompileRangeNativePlan } from "./parser.js";
 
 function handSizeForVariant(variant) {
   if (variant === "holdem") return 2;
@@ -20,29 +19,14 @@ function randomSeedU64() {
   return ((bytes[0] & 0x1fffff) * 0x100000000) + bytes[1];
 }
 
-async function playerToNativeSampler(player, variant, handSize, board, percentileProfile) {
+async function playerToNativeSampler(player, handSize) {
   const range = String(player?.range || "*").trim() || "*";
-  const weightPct = rangeWeightPct(range);
-  const weightField = weightPct < 100 ? { weight_pct: weightPct } : {};
 
   if (range.replace(/\s+/g, "") === "*") {
-    return { mode: "all", hand_size: handSize, ...weightField };
+    return { mode: "all", hand_size: handSize };
   }
 
-  const plan = tryCompileRangeNativePlan(range, variant, board, {
-    percentileProfile,
-    nativeExactPercentileRef: true
-  });
-  if (!plan) {
-    throw new Error(`Range "${range}" cannot be compiled for the native iOS engine.`);
-  }
-  return { mode: "plan", hand_size: handSize, plan, ...weightField };
-}
-
-function rangeWeightPct(range) {
-  const suffix = String(range || "").replace(/\s+/g, "").match(/@([0-9]{1,3})$/);
-  if (!suffix) return 100;
-  return Math.max(1, Math.min(100, Math.round(Number(suffix[1]) || 100)));
+  return { mode: "range", hand_size: handSize, range_text: range };
 }
 
 export async function buildNativeSimRequest(config) {
@@ -51,7 +35,6 @@ export async function buildNativeSimRequest(config) {
   const board = parseCards(config.board || "");
   const dead = parseCards(config.dead || "");
   const players = Array.isArray(config.players) ? config.players : [];
-  const percentileProfile = String(config.percentileProfile || "").trim().toLowerCase();
 
   if (players.length < 2 || players.length > 6) {
     throw new Error("players must be between 2 and 6");
@@ -59,7 +42,7 @@ export async function buildNativeSimRequest(config) {
 
   const nativePlayers = [];
   for (const player of players) {
-    nativePlayers.push(await playerToNativeSampler(player, variant, handSize, board, percentileProfile));
+    nativePlayers.push(await playerToNativeSampler(player, handSize));
   }
 
   const request = {
@@ -69,6 +52,7 @@ export async function buildNativeSimRequest(config) {
     board,
     dead,
     players: nativePlayers,
+    percentile_profile: String(config.percentileProfile || "").trim().toLowerCase(),
     seed: randomSeedU64()
   };
   if (Number(config.confidenceTargetPct || 0) > 0) request.confidence_target_pct = Number(config.confidenceTargetPct);

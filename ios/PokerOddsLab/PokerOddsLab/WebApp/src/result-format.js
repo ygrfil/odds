@@ -1,4 +1,14 @@
-import { CLASS_NAMES } from "./eval.js";
+const CLASS_NAMES = [
+  "High Card",
+  "Pair",
+  "Two Pair",
+  "Trips",
+  "Straight",
+  "Flush",
+  "Full House",
+  "Quads",
+  "Straight Flush"
+];
 
 export function rawToResult(raw, config) {
   const {

@@ -1,7 +1,5 @@
 import { runSimulation } from "./engine.js";
 import { canUseNativeIosSim, previewNativeIosRangeCoverage } from "./native-ios.js";
-import { validateRangeSyntax } from "./parser.js";
-import { previewTagCoreCombos } from "./sim-core.js";
 import { extractNormalizedTags, splitTagToken } from "./tag-utils.js";
 import {
   normalizePercentileProfile,
@@ -772,18 +770,11 @@ function insertTokenAtCursor(rangeText, token, start, end) {
   return { value, cursor };
 }
 
-function syntaxFeedback(rangeText, variant) {
-  const syntax = validateRangeSyntax(rangeText, variant);
-  if (syntax.ok) return { ok: true, message: "" };
-  const msg = String(syntax.error || "Syntax error");
-  const unexpectedLeaf = msg.match(/^Unexpected token '([^']+)' in (.+)$/);
-  if (unexpectedLeaf) {
-    return { ok: false, message: `Unexpected token '${unexpectedLeaf[1]}' in '${unexpectedLeaf[2]}'.` };
+function syntaxFeedback(rangeText, _variant) {
+  if (!String(rangeText || "").trim()) {
+    return { ok: false, message: "Range is empty." };
   }
-  if (/Missing '\)'/.test(msg)) return { ok: false, message: "Missing ')' in expression." };
-  if (/Expected range atom/.test(msg)) return { ok: false, message: "Expected range atom after an operator." };
-  if (/Unexpected trailing expression/.test(msg)) return { ok: false, message: "Unexpected trailing expression." };
-  return { ok: false, message: msg };
+  return { ok: true, message: "" };
 }
 
 function setValidationNodeText(node, text, mode = "ok") {
@@ -972,7 +963,7 @@ async function fetchTagShortcutBundle(boardText, variant) {
   if (TAG_SHORTCUT_BUNDLE_INFLIGHT.has(cacheKey)) return TAG_SHORTCUT_BUNDLE_INFLIGHT.get(cacheKey);
 
   const inflight = (async () => {
-    if (!canUseBackendPreview()) return localTagShortcutBundle(boardKey, variant);
+    if (!canUseBackendPreview()) return { status: "helper-unavailable", combosByTag: {} };
     let res;
     try {
       res = await fetch("/api/sim/preview/tags", {
@@ -984,10 +975,10 @@ async function fetchTagShortcutBundle(boardText, variant) {
         })
       });
     } catch {
-      return localTagShortcutBundle(boardKey, variant);
+      return { status: "helper-unavailable", combosByTag: {} };
     }
     if (!res.ok) {
-      if (res.status === 404 || res.status === 405) return localTagShortcutBundle(boardKey, variant);
+      if (res.status === 404 || res.status === 405) return { status: "helper-unavailable", combosByTag: {} };
       return { status: "invalid-board", combosByTag: {} };
     }
     let payload = null;
@@ -1011,23 +1002,6 @@ async function fetchTagShortcutBundle(boardText, variant) {
   } finally {
     const current = TAG_SHORTCUT_BUNDLE_INFLIGHT.get(cacheKey);
     if (current === inflight) TAG_SHORTCUT_BUNDLE_INFLIGHT.delete(cacheKey);
-  }
-}
-
-function localTagShortcutBundle(boardText, variant) {
-  const combosByTag = {};
-  try {
-    for (const pick of quickPicks) {
-      const token = String(pick?.token || "").trim().toLowerCase();
-      if (!token) continue;
-      combosByTag[token] = previewTagCoreCombos(boardText, variant, token);
-    }
-    for (const token of ["@sd", "@sd4"]) {
-      if (!combosByTag[token]) combosByTag[token] = previewTagCoreCombos(boardText, variant, token);
-    }
-    return { status: "ok", combosByTag };
-  } catch {
-    return { status: "invalid-board", combosByTag: {} };
   }
 }
 
@@ -2398,7 +2372,7 @@ function renderPlayers() {
         }
       }
       const scopedValue = shouldNormalizeScope ? normalizePercentileScopedRange(nextValue, true) : nextValue;
-      if (shouldNormalizeScope && scopedValue !== nextValue && validateRangeSyntax(scopedValue, el.variant.value).ok) {
+      if (shouldNormalizeScope && scopedValue !== nextValue) {
         nextValue = scopedValue;
         range.value = nextValue;
         range.setSelectionRange(nextValue.length, nextValue.length);

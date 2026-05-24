@@ -5944,6 +5944,7 @@ fn to_native_sim_request(payload: &NativeSimReq) -> native_sim::SimRequest {
                 hand_size: p.hand_size,
                 pool: p.pool.clone(),
                 plan: p.plan.clone(),
+                range_text: None,
                 weight_pct: p.weight_pct,
             })
             .collect(),

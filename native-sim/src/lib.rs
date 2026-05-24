@@ -68,6 +68,7 @@ pub struct SimPlayerReq {
     pub hand_size: usize,
     pub pool: Option<Vec<Vec<u8>>>,
     pub plan: Option<PlanNodeReq>,
+    pub range_text: Option<String>,
     pub weight_pct: Option<u8>,
 }
 
@@ -94,6 +95,8 @@ struct Request {
     hand_size: usize,
     pool_cap: Option<usize>,
     plan: Option<PlanNodeReq>,
+    range_text: Option<String>,
+    percentile_profile: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +107,8 @@ struct PlayerReq {
     pool: Option<Vec<Vec<u8>>>,
     #[serde(default)]
     plan: Option<PlanNodeReq>,
+    #[serde(default)]
+    range_text: Option<String>,
     #[serde(default)]
     weight_pct: Option<u8>,
 }
@@ -417,6 +422,7 @@ fn sim_request_to_internal(req: SimRequest) -> Request {
                 hand_size: p.hand_size,
                 pool: p.pool,
                 plan: p.plan,
+                range_text: p.range_text,
                 weight_pct: p.weight_pct,
             })
             .collect(),
@@ -429,6 +435,8 @@ fn sim_request_to_internal(req: SimRequest) -> Request {
         hand_size: 0,
         pool_cap: None,
         plan: None,
+        range_text: None,
+        percentile_profile: None,
     }
 }
 
@@ -698,10 +706,20 @@ fn run_build_pool_mode(req: &Request) -> Result<Response> {
     }
 
     let cap = req.pool_cap.unwrap_or(320_000).max(1);
-    let plan_req = req
-        .plan
-        .as_ref()
-        .context("missing plan for build-pool mode")?;
+    let raw_plan;
+    let plan_req = if let Some(plan) = req.plan.as_ref() {
+        Some(plan)
+    } else if let Some(range_text) = req.range_text.as_deref() {
+        raw_plan = compile_range_text_to_plan(
+            range_text,
+            &req.variant,
+            req.percentile_profile.as_deref().unwrap_or_default(),
+        )?;
+        raw_plan.as_ref()
+    } else {
+        None
+    }
+    .context("missing plan or range_text for build-pool mode")?;
     let plan = compile_plan_node(plan_req)?;
     let choose = build_choose_table();
     let seed = req.seed.unwrap_or(0xC0DE_F00D_9E37_79B9);
@@ -780,10 +798,21 @@ fn run_preview_range_mode(req: &Request) -> Result<Response> {
         );
     }
 
-    let plan_req = req
-        .plan
-        .as_ref()
-        .context("missing plan for preview-range mode")?;
+    let raw_plan;
+    let plan_req = if let Some(plan) = req.plan.as_ref() {
+        Some(plan)
+    } else {
+        let range_text = req
+            .range_text
+            .as_deref()
+            .context("missing plan or range_text for preview-range mode")?;
+        raw_plan = compile_range_text_to_plan(
+            range_text,
+            &req.variant,
+            req.percentile_profile.as_deref().unwrap_or_default(),
+        )?;
+        raw_plan.as_ref()
+    };
 
     let mut blocked = [false; 52];
     for &c in req.board.iter().chain(req.dead.iter()) {
@@ -800,9 +829,21 @@ fn run_preview_range_mode(req: &Request) -> Result<Response> {
     }
 
     let total = n_choose_k(base_deck.len(), hand_size);
-    let matched = if req.board.is_empty() && req.dead.is_empty() {
-        if let Some(count) = exact_preflop_count_for_plan(plan_req, &req.variant, hand_size) {
-            count
+    let matched = if let Some(plan_req) = plan_req {
+        if req.board.is_empty() && req.dead.is_empty() {
+            if let Some(count) = exact_preflop_count_for_plan(plan_req, &req.variant, hand_size) {
+                count
+            } else {
+                let plan = compile_plan_node(plan_req)?;
+                count_plan_matches(
+                    &base_deck,
+                    hand_size,
+                    &plan,
+                    &build_choose_table(),
+                    &req.board,
+                    req.variant == "holdem",
+                )
+            }
         } else {
             let plan = compile_plan_node(plan_req)?;
             count_plan_matches(
@@ -815,15 +856,7 @@ fn run_preview_range_mode(req: &Request) -> Result<Response> {
             )
         }
     } else {
-        let plan = compile_plan_node(plan_req)?;
-        count_plan_matches(
-            &base_deck,
-            hand_size,
-            &plan,
-            &build_choose_table(),
-            &req.board,
-            req.variant == "holdem",
-        )
+        total
     };
 
     Ok(Response {
@@ -843,6 +876,659 @@ fn run_preview_range_mode(req: &Request) -> Result<Response> {
             approx: false,
         }),
     })
+}
+
+#[derive(Debug, Clone)]
+enum RangeAst {
+    Atom(String),
+    Or(Box<RangeAst>, Box<RangeAst>),
+    And(Box<RangeAst>, Box<RangeAst>),
+    Not(Box<RangeAst>, Box<RangeAst>),
+}
+
+#[derive(Debug, Clone)]
+enum RangeToken {
+    Atom(String),
+    Comma,
+    Colon,
+    Bang,
+    LParen,
+    RParen,
+}
+
+struct RangeParser {
+    tokens: Vec<RangeToken>,
+    pos: usize,
+}
+
+const RANK_CHARS: &[u8; 13] = b"23456789TJQKA";
+const ALL_RANKS_MASK: u16 = 0x1fff;
+
+fn compile_range_text_to_plan(
+    range_text: &str,
+    variant: &str,
+    percentile_profile: &str,
+) -> Result<Option<PlanNodeReq>> {
+    let stripped = strip_range_spaces(range_text);
+    if stripped.is_empty() || stripped == "*" {
+        return Ok(None);
+    }
+    let expanded = expand_expr_macros(&stripped);
+    let tokens = tokenize_range_expr(&expanded)?;
+    let ast = RangeParser { tokens, pos: 0 }.parse()?;
+    Ok(Some(ast_to_plan(&ast, variant, percentile_profile)?))
+}
+
+fn strip_range_weight(range_text: &str) -> (&str, Option<u8>) {
+    let compact = range_text.trim();
+    let Some(at_pos) = compact.rfind('@') else {
+        return (compact, None);
+    };
+    let suffix = &compact[at_pos + 1..];
+    if suffix.is_empty() || suffix.len() > 3 || !suffix.chars().all(|c| c.is_ascii_digit()) {
+        return (compact, None);
+    }
+    let value = suffix.parse::<u8>().ok().map(|v| v.clamp(1, 100));
+    (compact[..at_pos].trim_end(), value)
+}
+
+fn strip_range_spaces(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| if c == '&' { ':' } else { c })
+        .collect()
+}
+
+fn expand_expr_macros(expr: &str) -> String {
+    const REPLACEMENTS: &[(&str, &str)] = &[
+        ("$overpair", ":RRON"),
+        ("$tpplus", ":RROO"),
+        ("$straight", "@s"),
+        ("$flush", "@f"),
+        ("$ds", ":xxyy"),
+        ("$ss", ":xxyz"),
+        ("$np", "!RR"),
+        ("$op", ":RRON"),
+        ("$tp", ":RROO"),
+        ("$nt", "!RRR"),
+        ("$0g", "AKQJ-"),
+        ("$1g", "(AKQT-,AKJT-,AQJT-)"),
+        ("$2g", "(AKQ9-,AKT9-,AJT9-)"),
+        ("$s", ":xx"),
+        ("$o", ":xy"),
+        ("$b", "[A-J]"),
+        ("$m", "[T-7]"),
+        ("$z", "[6-2]"),
+        ("$l", "[A,2,3,4,5,6,7,8]"),
+        ("$n", "[K-9]"),
+        ("$f", "[K-J]"),
+        ("$r", "[A-T]"),
+        ("$w", "[A,2,3,4,5]"),
+    ];
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < expr.len() {
+        let rest = &expr[i..];
+        if !rest.starts_with('$') {
+            let ch = rest.chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        let rest_lower = rest.to_ascii_lowercase();
+        let found = REPLACEMENTS
+            .iter()
+            .find(|(key, _)| rest_lower.starts_with(*key));
+        let Some((key, replacement)) = found else {
+            out.push('$');
+            i += 1;
+            continue;
+        };
+        let prev = out.chars().last().unwrap_or('\0');
+        let is_and = matches!(*key, "$s" | "$o" | "$ds" | "$ss" | "$op" | "$tp");
+        let is_not = matches!(*key, "$np" | "$nt");
+        if is_and {
+            let payload = replacement.strip_prefix(':').unwrap_or(replacement);
+            if prev == '\0' || prev == ',' || prev == '(' {
+                out.push_str("*:");
+                out.push_str(payload);
+            } else if prev == ':' {
+                out.push_str(payload);
+            } else {
+                out.push(':');
+                out.push_str(payload);
+            }
+        } else if is_not {
+            let payload = replacement.strip_prefix('!').unwrap_or(replacement);
+            if prev == '\0' || prev == ',' || prev == '(' || prev == ':' {
+                out.push_str("*!");
+                out.push_str(payload);
+            } else if prev == '!' {
+                out.push_str(payload);
+            } else {
+                out.push('!');
+                out.push_str(payload);
+            }
+        } else {
+            out.push_str(replacement);
+        }
+        i += key.len();
+    }
+    out
+}
+
+fn tokenize_range_expr(s: &str) -> Result<Vec<RangeToken>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut bracket_depth = 0i32;
+    for ch in s.chars() {
+        if ch == '[' {
+            bracket_depth += 1;
+        } else if ch == ']' {
+            bracket_depth -= 1;
+            if bracket_depth < 0 {
+                anyhow::bail!("unexpected ']' in range");
+            }
+        }
+        if bracket_depth == 0 && matches!(ch, ',' | ':' | '!' | '(' | ')') {
+            if !cur.is_empty() {
+                out.push(RangeToken::Atom(std::mem::take(&mut cur)));
+            }
+            out.push(match ch {
+                ',' => RangeToken::Comma,
+                ':' => RangeToken::Colon,
+                '!' => RangeToken::Bang,
+                '(' => RangeToken::LParen,
+                ')' => RangeToken::RParen,
+                _ => unreachable!(),
+            });
+        } else {
+            cur.push(ch);
+        }
+    }
+    if bracket_depth != 0 {
+        anyhow::bail!("missing ']' in range");
+    }
+    if !cur.is_empty() {
+        out.push(RangeToken::Atom(cur));
+    }
+    Ok(out)
+}
+
+impl RangeParser {
+    fn parse(mut self) -> Result<RangeAst> {
+        let ast = self.parse_union()?;
+        if self.pos != self.tokens.len() {
+            anyhow::bail!("unexpected trailing expression");
+        }
+        Ok(ast)
+    }
+
+    fn peek(&self) -> Option<&RangeToken> {
+        self.tokens.get(self.pos)
+    }
+
+    fn take(&mut self) -> Option<RangeToken> {
+        let tok = self.tokens.get(self.pos).cloned();
+        if tok.is_some() {
+            self.pos += 1;
+        }
+        tok
+    }
+
+    fn parse_primary(&mut self) -> Result<RangeAst> {
+        match self.take() {
+            Some(RangeToken::LParen) => {
+                let out = self.parse_union()?;
+                match self.take() {
+                    Some(RangeToken::RParen) => Ok(out),
+                    _ => anyhow::bail!("missing ')' in expression"),
+                }
+            }
+            Some(RangeToken::Atom(v)) => Ok(RangeAst::Atom(v)),
+            _ => anyhow::bail!("expected range atom"),
+        }
+    }
+
+    fn parse_constraint(&mut self) -> Result<RangeAst> {
+        let mut left = self.parse_primary()?;
+        while matches!(self.peek(), Some(RangeToken::Colon | RangeToken::Bang)) {
+            let is_not = matches!(self.take(), Some(RangeToken::Bang));
+            let right = self.parse_primary()?;
+            left = if is_not {
+                RangeAst::Not(Box::new(left), Box::new(right))
+            } else {
+                RangeAst::And(Box::new(left), Box::new(right))
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_union(&mut self) -> Result<RangeAst> {
+        let mut left = self.parse_constraint()?;
+        while matches!(self.peek(), Some(RangeToken::Comma)) {
+            self.take();
+            let right = self.parse_constraint()?;
+            left = RangeAst::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+}
+
+fn ast_to_plan(ast: &RangeAst, variant: &str, percentile_profile: &str) -> Result<PlanNodeReq> {
+    match ast {
+        RangeAst::Atom(atom) => atom_to_plan_req(atom, variant, percentile_profile),
+        RangeAst::Or(left, right) => Ok(PlanNodeReq::Or {
+            left: Box::new(ast_to_plan(left, variant, percentile_profile)?),
+            right: Box::new(ast_to_plan(right, variant, percentile_profile)?),
+        }),
+        RangeAst::And(left, right) => Ok(PlanNodeReq::And {
+            left: Box::new(ast_to_plan(left, variant, percentile_profile)?),
+            right: Box::new(ast_to_plan(right, variant, percentile_profile)?),
+        }),
+        RangeAst::Not(left, right) => Ok(PlanNodeReq::Not {
+            left: Box::new(ast_to_plan(left, variant, percentile_profile)?),
+            right: Box::new(ast_to_plan(right, variant, percentile_profile)?),
+        }),
+    }
+}
+
+fn atom_to_plan_req(atom: &str, variant: &str, percentile_profile: &str) -> Result<PlanNodeReq> {
+    let atom = expand_atom_shortcuts(atom, variant);
+    let atom = strip_range_weight(&atom).0.to_string();
+    if atom == "*" {
+        return Ok(PlanNodeReq::Specs {
+            entries: vec![Vec::new()],
+        });
+    }
+    let lower = atom.to_ascii_lowercase();
+    if let Some(tag) = tag_plan_req(&lower) {
+        return Ok(PlanNodeReq::Tag { tag });
+    }
+
+    if let Some((low, high)) = parse_percent_range_atom(&atom)? {
+        return Ok(PlanNodeReq::PctExactRange {
+            variant: variant.to_string(),
+            profile: normalize_exact_profile(variant, percentile_profile),
+            low_pct: low,
+            high_pct: high,
+        });
+    }
+    if let Some(pct) = parse_percent_top_atom(&atom)? {
+        return Ok(PlanNodeReq::PctExactTop {
+            variant: variant.to_string(),
+            profile: normalize_exact_profile(variant, percentile_profile),
+            pct,
+        });
+    }
+
+    let expanded = expand_span_atom(&atom);
+    let mut entries = Vec::with_capacity(expanded.len());
+    for leaf in expanded {
+        entries.push(parse_leaf_specs_to_req(&leaf)?);
+    }
+    Ok(PlanNodeReq::Specs { entries })
+}
+
+fn parse_percent_value(s: &str) -> Result<Option<f64>> {
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let v: f64 = s
+        .parse()
+        .with_context(|| format!("invalid percent value '{s}'"))?;
+    if !(0.0..=100.0).contains(&v) {
+        anyhow::bail!("percent value must be 0..100");
+    }
+    Ok(Some(v))
+}
+
+fn parse_percent_top_atom(atom: &str) -> Result<Option<f64>> {
+    let Some(raw) = atom.strip_suffix('%') else {
+        return Ok(None);
+    };
+    if raw.contains('%') || raw.contains('-') {
+        return Ok(None);
+    }
+    parse_percent_value(raw)
+}
+
+fn parse_percent_range_atom(atom: &str) -> Result<Option<(f64, f64)>> {
+    let Some(raw) = atom.strip_suffix('%') else {
+        return Ok(None);
+    };
+    let Some((left, right_with_pct)) = raw.split_once("%-") else {
+        return Ok(None);
+    };
+    let low = parse_percent_value(left)?.context("invalid percent range")?;
+    let high = parse_percent_value(right_with_pct)?.context("invalid percent range")?;
+    if low > high {
+        anyhow::bail!("percent range low bound exceeds high bound");
+    }
+    Ok(Some((low, high)))
+}
+
+fn tag_plan_req(atom: &str) -> Option<PlanTagReq> {
+    let (base, plus) = atom.strip_suffix('+').map_or((atom, false), |v| (v, true));
+    match base {
+        "@tp" => Some(PlanTagReq {
+            kind: PlanTagKind::TopPair,
+            plus,
+            min_outs: 0,
+        }),
+        "@overpair" => Some(PlanTagReq {
+            kind: PlanTagKind::Overpair,
+            plus,
+            min_outs: 0,
+        }),
+        "@2p" => Some(PlanTagReq {
+            kind: PlanTagKind::TwoPair,
+            plus,
+            min_outs: 0,
+        }),
+        "@set" => Some(PlanTagReq {
+            kind: PlanTagKind::Set,
+            plus,
+            min_outs: 0,
+        }),
+        "@fd" if !plus => Some(PlanTagReq {
+            kind: PlanTagKind::FlushDraw,
+            plus: false,
+            min_outs: 0,
+        }),
+        "@f" => Some(PlanTagReq {
+            kind: PlanTagKind::Flush,
+            plus,
+            min_outs: 0,
+        }),
+        "@s" => Some(PlanTagReq {
+            kind: PlanTagKind::Straight,
+            plus,
+            min_outs: 0,
+        }),
+        "@sd" if !plus => Some(straight_draw_tag(1)),
+        "@sd4" if !plus => Some(straight_draw_tag(4)),
+        "@sd8" if !plus => Some(straight_draw_tag(8)),
+        "@sd12" if !plus => Some(straight_draw_tag(12)),
+        "@straight" => Some(PlanTagReq {
+            kind: PlanTagKind::Straight,
+            plus,
+            min_outs: 0,
+        }),
+        "@flush" => Some(PlanTagReq {
+            kind: PlanTagKind::Flush,
+            plus,
+            min_outs: 0,
+        }),
+        _ => None,
+    }
+}
+
+fn straight_draw_tag(min_outs: u8) -> PlanTagReq {
+    PlanTagReq {
+        kind: PlanTagKind::StraightDraw,
+        plus: false,
+        min_outs,
+    }
+}
+
+fn expand_atom_shortcuts(atom: &str, variant: &str) -> String {
+    if variant != "holdem" {
+        return atom.to_string();
+    }
+    let chars: Vec<char> = atom.chars().collect();
+    if chars.len() == 3
+        && is_rank_char(chars[0])
+        && is_rank_char(chars[1])
+        && matches!(chars[2], 's' | 'S' | 'o' | 'O')
+    {
+        if chars[2].eq_ignore_ascii_case(&'s') {
+            return format!("{}x{}x", chars[0], chars[1]);
+        }
+        return format!("{}x{}y", chars[0], chars[1]);
+    }
+    atom.to_string()
+}
+
+fn expand_span_atom(atom: &str) -> Vec<String> {
+    let upper = atom.to_ascii_uppercase();
+    if upper.len() >= 3 && (upper.ends_with('+') || upper.ends_with('-')) {
+        let body = &upper[..upper.len() - 1];
+        if body.len() >= 2 && body.chars().all(is_rank_char) {
+            let dir: isize = if upper.ends_with('+') { 1 } else { -1 };
+            let mut i = rank_index(body.as_bytes()[0] as char).unwrap() as isize;
+            let mut j = rank_index(body.as_bytes()[1] as char).unwrap() as isize;
+            let suffix = &body[2..];
+            let mut out = Vec::new();
+            while (0..13).contains(&i) && (0..13).contains(&j) {
+                out.push(format!(
+                    "{}{}{}",
+                    RANK_CHARS[i as usize] as char, RANK_CHARS[j as usize] as char, suffix
+                ));
+                i += dir;
+                j += dir;
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+    }
+    if let Some((left, right)) = upper.split_once('-') {
+        if (2..=6).contains(&left.len())
+            && left.len() == right.len()
+            && left.chars().all(is_rank_char)
+            && right.chars().all(is_rank_char)
+        {
+            let pairs: Vec<(isize, isize)> = left
+                .chars()
+                .zip(right.chars())
+                .map(|(l, r)| {
+                    (
+                        rank_index(l).unwrap() as isize,
+                        rank_index(r).unwrap() as isize,
+                    )
+                })
+                .collect();
+            let steps = pairs
+                .iter()
+                .map(|(a, b)| (a - b).unsigned_abs())
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let mut out = Vec::new();
+            for step in 0..steps {
+                let mut hand = String::new();
+                let mut ok = true;
+                for (a, b) in &pairs {
+                    let dir = (b - a).signum();
+                    let v = a + step as isize * dir;
+                    if !(0..13).contains(&v) {
+                        ok = false;
+                        break;
+                    }
+                    hand.push(RANK_CHARS[v as usize] as char);
+                }
+                if ok {
+                    out.push(hand);
+                }
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+    }
+    vec![atom.to_string()]
+}
+
+fn parse_leaf_specs_to_req(leaf: &str) -> Result<Vec<SpecReq>> {
+    let chars: Vec<char> = leaf.chars().collect();
+    let mut specs = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '{' {
+            let end = chars[i + 1..]
+                .iter()
+                .position(|c| *c == '}')
+                .map(|pos| i + 1 + pos)
+                .context("missing '}'")?;
+            specs.extend(parse_leaf_specs_to_req(
+                &chars[i + 1..end].iter().collect::<String>(),
+            )?);
+            i = end + 1;
+            continue;
+        }
+        if ch == '*' {
+            let (suit_mode, suit_value, advance) = parse_optional_suit(&chars, i + 1);
+            specs.push(SpecReq {
+                ranks_mask: ALL_RANKS_MASK,
+                rank_var: -1,
+                suit_mode,
+                suit_value,
+            });
+            i += 1 + advance;
+            continue;
+        }
+        if ch == '[' {
+            let end = chars[i + 1..]
+                .iter()
+                .position(|c| *c == ']')
+                .map(|pos| i + 1 + pos)
+                .context("missing ']' in rank list")?;
+            let inner: String = chars[i..=end].iter().collect();
+            let ranks_mask = rank_mask_from_expr(&inner)
+                .with_context(|| format!("invalid rank list: {inner}"))?;
+            let (suit_mode, suit_value, advance) = parse_optional_suit(&chars, end + 1);
+            specs.push(SpecReq {
+                ranks_mask,
+                rank_var: -1,
+                suit_mode,
+                suit_value,
+            });
+            i = end + 1 + advance;
+            continue;
+        }
+        if is_rank_char(ch) || is_rank_var(ch) {
+            let rank_var = rank_var_index(ch).unwrap_or(-1);
+            let mut ranks_mask = if is_rank_char(ch) {
+                1u16 << rank_index(ch).unwrap()
+            } else {
+                ALL_RANKS_MASK
+            };
+            let mut consumed_rank_suffix = 0usize;
+            if is_rank_char(ch) && i + 1 < chars.len() && matches!(chars[i + 1], '+' | '-') {
+                let idx = rank_index(ch).unwrap();
+                ranks_mask = if chars[i + 1] == '+' {
+                    (!0u16 << idx) & ALL_RANKS_MASK
+                } else {
+                    (1u16 << (idx + 1)) - 1
+                };
+                consumed_rank_suffix = 1;
+            }
+            let suit_pos = i + 1 + consumed_rank_suffix;
+            let (suit_mode, suit_value, advance) = parse_optional_suit(&chars, suit_pos);
+            specs.push(SpecReq {
+                ranks_mask,
+                rank_var,
+                suit_mode,
+                suit_value,
+            });
+            i += 1 + consumed_rank_suffix + advance;
+            continue;
+        }
+        if let Some((suit_mode, suit_value)) = suit_spec(ch) {
+            specs.push(SpecReq {
+                ranks_mask: ALL_RANKS_MASK,
+                rank_var: -1,
+                suit_mode,
+                suit_value,
+            });
+            i += 1;
+            continue;
+        }
+        anyhow::bail!("unexpected token '{}' in {}", ch, leaf);
+    }
+    Ok(specs)
+}
+
+fn parse_optional_suit(chars: &[char], idx: usize) -> (u8, i8, usize) {
+    if idx >= chars.len() {
+        return (0, -1, 0);
+    }
+    if let Some((mode, value)) = suit_spec(chars[idx]) {
+        (mode, value, 1)
+    } else {
+        (0, -1, 0)
+    }
+}
+
+fn suit_spec(ch: char) -> Option<(u8, i8)> {
+    match ch.to_ascii_lowercase() {
+        'c' => Some((1, 0)),
+        'd' => Some((1, 1)),
+        'h' => Some((1, 2)),
+        's' => Some((1, 3)),
+        'x' => Some((2, 0)),
+        'y' => Some((2, 1)),
+        'z' => Some((2, 2)),
+        'w' => Some((2, 3)),
+        _ => None,
+    }
+}
+
+fn rank_mask_from_expr(expr: &str) -> Option<u16> {
+    let upper = expr.to_ascii_uppercase();
+    if upper.len() == 1 {
+        return rank_index(upper.chars().next()?).map(|idx| 1u16 << idx);
+    }
+    if let Some((a, b)) = upper.split_once('-') {
+        if a.len() == 1 && b.len() == 1 {
+            let ia = rank_index(a.chars().next()?)?;
+            let ib = rank_index(b.chars().next()?)?;
+            let lo = ia.min(ib);
+            let hi = ia.max(ib);
+            let mut mask = 0u16;
+            for idx in lo..=hi {
+                mask |= 1u16 << idx;
+            }
+            return Some(mask);
+        }
+    }
+    if upper.starts_with('[') && upper.ends_with(']') {
+        let mut mask = 0u16;
+        for part in upper[1..upper.len() - 1].split(',') {
+            let sub = rank_mask_from_expr(part.trim())?;
+            mask |= sub;
+        }
+        return (mask != 0).then_some(mask);
+    }
+    None
+}
+
+fn is_rank_char(ch: char) -> bool {
+    matches!(
+        ch.to_ascii_uppercase(),
+        '2'..='9' | 'T' | 'J' | 'Q' | 'K' | 'A'
+    )
+}
+
+fn rank_index(ch: char) -> Option<usize> {
+    RANK_CHARS
+        .iter()
+        .position(|r| *r as char == ch.to_ascii_uppercase())
+}
+
+fn is_rank_var(ch: char) -> bool {
+    matches!(ch.to_ascii_uppercase(), 'R' | 'O' | 'N')
+}
+
+fn rank_var_index(ch: char) -> Option<i8> {
+    match ch.to_ascii_uppercase() {
+        'R' => Some(0),
+        'O' => Some(1),
+        'N' => Some(2),
+        _ => None,
+    }
 }
 
 fn compile_plan_node(req: &PlanNodeReq) -> Result<PlanNode> {
@@ -1882,7 +2568,14 @@ fn build_samplers(req: &Request) -> Result<Vec<Sampler>> {
                     expected
                 );
             }
-            let weight_pct = p.weight_pct.unwrap_or(100);
+            let mut weight_pct = p.weight_pct.unwrap_or(100);
+            if p.mode == "range" && p.weight_pct.is_none() {
+                if let Some(raw) = p.range_text.as_deref() {
+                    if let Some(w) = strip_range_weight(raw).1 {
+                        weight_pct = w;
+                    }
+                }
+            }
             if weight_pct == 0 || weight_pct > 100 {
                 anyhow::bail!(
                     "player {} weight_pct {} is invalid (must be 1..=100)",
@@ -1895,6 +2588,69 @@ fn build_samplers(req: &Request) -> Result<Vec<Sampler>> {
                     hand_size: p.hand_size,
                     weight_pct,
                 })
+            } else if p.mode == "range" {
+                let raw = p
+                    .range_text
+                    .as_deref()
+                    .with_context(|| format!("player {} range_text is missing", i + 1))?;
+                let range_text = strip_range_weight(raw).0;
+                let plan_req = compile_range_text_to_plan(
+                    range_text,
+                    &req.variant,
+                    req.percentile_profile.as_deref().unwrap_or_default(),
+                )
+                .with_context(|| format!("player {} range is invalid", i + 1))?;
+                let Some(plan_req) = plan_req else {
+                    return Ok(Sampler::All {
+                        hand_size: p.hand_size,
+                        weight_pct,
+                    });
+                };
+                let plan = compile_plan_node(&plan_req)
+                    .with_context(|| format!("player {} range is invalid", i + 1))?;
+                let has_pct = plan_has_pct_bits(&plan);
+                let try_small_pool = !has_pct;
+                if try_small_pool {
+                    let limit = small_plan_pool_limit(p.hand_size);
+                    match collect_small_plan_pool(
+                        req,
+                        p.hand_size,
+                        &plan,
+                        &choose,
+                        is_holdem,
+                        limit,
+                    )? {
+                        SmallPlanPool::Empty => anyhow::bail!(
+                            "player {} range appears empty on this board/dead setup",
+                            i + 1
+                        ),
+                        SmallPlanPool::Small(mut pool) => {
+                            pool.sort_unstable();
+                            pool.dedup();
+                            pool.shrink_to_fit();
+                            let pool = pool
+                                .into_iter()
+                                .map(|cards| PoolEntry::new(&cards))
+                                .collect();
+                            Ok(Sampler::Pool {
+                                hand_size: p.hand_size,
+                                pool,
+                                weight_pct,
+                            })
+                        }
+                        SmallPlanPool::Large => Ok(Sampler::Plan {
+                            hand_size: p.hand_size,
+                            plan,
+                            weight_pct,
+                        }),
+                    }
+                } else {
+                    Ok(Sampler::Plan {
+                        hand_size: p.hand_size,
+                        plan,
+                        weight_pct,
+                    })
+                }
             } else if p.mode == "pool" {
                 let mut pool = p.pool.clone().unwrap_or_default();
                 if pool.is_empty() {
@@ -3332,12 +4088,8 @@ mod tests {
             "hand_size": 6,
             "board": [],
             "dead": [],
-            "plan": {
-                "kind": "pct_exact_top",
-                "variant": "plo6",
-                "profile": "ours",
-                "pct": 30.0
-            }
+            "percentile_profile": "ours",
+            "range_text": "30%"
         }));
 
         assert_eq!(out["ok"], true);
@@ -3354,22 +4106,8 @@ mod tests {
             "hand_size": 6,
             "board": [],
             "dead": [],
-            "plan": {
-                "kind": "and",
-                "left": {
-                    "kind": "pct_exact_top",
-                    "variant": "plo6",
-                    "profile": "ours",
-                    "pct": 30.0
-                },
-                "right": {
-                    "kind": "specs",
-                    "entries": [[
-                        { "ranks_mask": 4096, "rank_var": -1, "suit_mode": 0, "suit_value": -1 },
-                        { "ranks_mask": 4096, "rank_var": -1, "suit_mode": 0, "suit_value": -1 }
-                    ]]
-                }
-            }
+            "percentile_profile": "ours",
+            "range_text": "30%:(AA)"
         }));
 
         assert_eq!(out["ok"], true);
@@ -3386,14 +4124,31 @@ mod tests {
             "hand_size": 5,
             "board": [0, 5, 10],
             "dead": [],
-            "plan": {
-                "kind": "tag",
-                "tag": { "kind": "flush_draw" }
-            }
+            "range_text": "@fd"
         }));
 
         assert_eq!(out["ok"], true);
         assert_eq!(out["coverage"]["approx"], false);
         assert!(out["coverage"]["total"].as_u64().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn sim_mode_accepts_raw_range_text() {
+        let out = run_request_value(json!({
+            "mode": "sim",
+            "variant": "plo5",
+            "iteration_cap": 128,
+            "board": [],
+            "dead": [],
+            "percentile_profile": "ours",
+            "players": [
+                { "mode": "range", "hand_size": 5, "range_text": "30%:(AA)" },
+                { "mode": "range", "hand_size": 5, "range_text": "30%:(KK)" }
+            ],
+            "seed": 12345
+        }));
+
+        assert_eq!(out["ok"], true);
+        assert!(out["raw"]["iterations"].as_u64().unwrap_or(0) > 0);
     }
 }
