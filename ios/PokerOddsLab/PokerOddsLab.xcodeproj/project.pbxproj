@@ -138,6 +138,8 @@
 /* Begin PBXShellScriptBuildPhase section */
 		666666666666666666666663 /* Build Rust Native Sim */ = {
 			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			basedOnDependencyAnalysis = 0;
 			buildActionMask = 2147483647;
 			files = (
 			);

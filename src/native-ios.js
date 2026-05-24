@@ -115,6 +115,22 @@ function chooseCount(n, k) {
   return out;
 }
 
+function coverageFromPoolBuild(poolBuild) {
+  const total = Number(poolBuild?.total || 0);
+  const matched = Number(poolBuild?.matched || 0);
+  return {
+    matched,
+    total,
+    pct: total > 0 ? (matched * 100) / total : 0,
+    approx: false
+  };
+}
+
+function isUnsupportedPreviewRange(response) {
+  const msg = String(response?.error || "").toLowerCase();
+  return msg.includes("unsupported mode") && msg.includes("preview-range");
+}
+
 export async function previewNativeIosRangeCoverage(params, signal) {
   if (!canUseNativeIosSim()) {
     throw new Error("Native iOS engine bridge is not available.");
@@ -139,7 +155,7 @@ export async function previewNativeIosRangeCoverage(params, signal) {
     throw new Error("Range cannot be compiled for the native iOS engine.");
   }
 
-  const response = await postNativeRequest({
+  const request = {
     mode: "preview-range",
     variant,
     iteration_cap: 1,
@@ -147,7 +163,24 @@ export async function previewNativeIosRangeCoverage(params, signal) {
     board,
     dead: [],
     plan
-  }, signal);
+  };
+  const response = await postNativeRequest(request, signal);
+  if (response?.ok && response?.coverage) {
+    return response.coverage;
+  }
+
+  if (isUnsupportedPreviewRange(response)) {
+    const compat = await postNativeRequest({
+      ...request,
+      mode: "build-pool",
+      pool_cap: 1
+    }, signal);
+    if (compat?.ok && compat?.pool_build) {
+      return coverageFromPoolBuild(compat.pool_build);
+    }
+    throw new Error(compat?.error || "Native iOS engine returned invalid compatibility coverage.");
+  }
+
   if (!response?.ok || !response?.coverage) {
     throw new Error(response?.error || "Native iOS engine returned invalid coverage.");
   }

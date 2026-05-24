@@ -1527,9 +1527,13 @@ function dispatchLiveInfoUpdate(playerIndex) {
         }
         liveInfoState.coverageReadyByPlayer.set(playerIndex, requestId);
       })
-      .catch(() => {
+      .catch((err) => {
         if (liveInfoState.latestRequestByPlayer.get(playerIndex) !== requestId) return;
-        renderLiveInfo(node, [{ tone: "error", text: "Helper: native Rust unavailable" }]);
+        const message = String(err?.message || "").trim();
+        const text = message
+          ? `Helper: ${message}`
+          : "Helper: native Rust unavailable";
+        renderLiveInfo(node, [{ tone: "error", text }]);
         liveInfoState.coverageByPlayer.delete(playerIndex);
         liveInfoState.coverageReadyByPlayer.set(playerIndex, requestId);
       });
