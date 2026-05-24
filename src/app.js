@@ -977,7 +977,7 @@ async function fetchTagShortcutBundle(boardText, variant) {
     if (!canUseBackendPreview()) return { status: "helper-unavailable", combosByTag: {} };
     let res;
     try {
-      res = await fetch("/api/sim/preview/tags", {
+      res = await fetch("/api/sim/preview/tag-shortcuts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -985,6 +985,16 @@ async function fetchTagShortcutBundle(boardText, variant) {
           variant
         })
       });
+      if (res.status === 404 || res.status === 405) {
+        res = await fetch("/api/sim/preview/tags", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            boardText: boardKey,
+            variant
+          })
+        });
+      }
     } catch {
       return { status: "helper-unavailable", combosByTag: {} };
     }

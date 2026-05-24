@@ -487,6 +487,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/sim/run", post(sim_run))
         .route("/api/sim/preview/tag", post(sim_preview_tag))
         .route("/api/sim/preview/tags", post(sim_preview_tags))
+        .route(
+            "/api/sim/preview/tag-shortcuts",
+            post(sim_preview_tag_shortcuts),
+        )
         .route("/api/sim/preview/range", post(sim_preview_range))
         .route(
             "/api/sim/bombpot/progress/{token}",
@@ -1001,6 +1005,78 @@ async fn sim_preview_tags(Json(req): Json<PreviewTagsRequest>) -> (StatusCode, J
             "ok": true,
             "total": total_cov,
             "coverageByTag": coverage_by_tag,
+            "combosByTag": combos_by_tag
+        })),
+    )
+}
+
+async fn sim_preview_tag_shortcuts(
+    Json(req): Json<PreviewTagsRequest>,
+) -> (StatusCode, Json<Value>) {
+    let variant = req.variant.trim().to_lowercase();
+    let hand_size = match variant_hand_size(&variant) {
+        Some(v) => v,
+        None => return error_json(StatusCode::BAD_REQUEST, "unsupported variant"),
+    };
+    let board = match parse_cards_text(&req.board_text) {
+        Ok(v) => v,
+        Err(msg) => return error_json(StatusCode::BAD_REQUEST, &msg),
+    };
+
+    let mut combos_by_tag = serde_json::Map::<String, Value>::new();
+    if board.len() < 3 || board.len() > 5 {
+        for tag in TAG_COVERAGE_TOKEN_ORDER {
+            combos_by_tag.insert(tag.to_string(), json!([]));
+        }
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "combosByTag": combos_by_tag
+            })),
+        );
+    }
+
+    let variant_for_task = variant.clone();
+    let board_for_task = board.clone();
+    let rows = match tokio::task::spawn_blocking(move || {
+        let is_holdem = variant_for_task == "holdem";
+        let bundle = tag_coverage_bundle_for(&variant_for_task, hand_size, &board_for_task);
+        TAG_COVERAGE_TOKEN_ORDER
+            .iter()
+            .map(|raw_tag| {
+                let combos = normalize_tag_token(raw_tag)
+                    .map(|tag| {
+                        preview_tag_core_combos_from_bundle(
+                            &bundle,
+                            &board_for_task,
+                            tag,
+                            is_holdem,
+                        )
+                    })
+                    .unwrap_or_default();
+                ((*raw_tag).to_string(), combos)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("preview tag shortcuts task failed: {e}"),
+            )
+        }
+    };
+
+    for (tag, combos) in rows {
+        combos_by_tag.insert(tag, json!(combos));
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
             "combosByTag": combos_by_tag
         })),
     )
@@ -3366,7 +3442,7 @@ fn preview_tag_core_combos_from_bundle(
             let label = if use_suit {
                 core_suit_label(c1, c2)
             } else {
-                core_rank_label(c1, c2)
+                core_rank_label_for_board(c1, c2, board)
             };
             labels.insert(label);
         }
@@ -5924,6 +6000,23 @@ fn core_rank_label(c1: u8, c2: u8) -> String {
     format!("{ac}{bc}")
 }
 
+fn core_rank_label_for_board(c1: u8, c2: u8, board: &[u8]) -> String {
+    let r1 = card_rank_value(c1);
+    let r2 = card_rank_value(c2);
+    if r1 != r2 {
+        let pos1 = board.iter().position(|card| card_rank_value(*card) == r1);
+        let pos2 = board.iter().position(|card| card_rank_value(*card) == r2);
+        if let (Some(a), Some(b)) = (pos1, pos2) {
+            let (first, second) = if a <= b { (r1, r2) } else { (r2, r1) };
+            const RANK_CHARS: &str = "??23456789TJQKA";
+            let ac = RANK_CHARS.chars().nth(first as usize).unwrap_or('?');
+            let bc = RANK_CHARS.chars().nth(second as usize).unwrap_or('?');
+            return format!("{ac}{bc}");
+        }
+    }
+    core_rank_label(c1, c2)
+}
+
 fn core_suit_label(c1: u8, c2: u8) -> String {
     let s1 = SUITS.chars().nth(card_suit(c1) as usize).unwrap_or('x');
     let s2 = SUITS.chars().nth(card_suit(c2) as usize).unwrap_or('x');
@@ -6122,6 +6215,15 @@ mod tests {
             }
         }
         blocked
+    }
+
+    #[test]
+    fn plo6_two_pair_shortcuts_use_board_core_labels() {
+        let board = cards("6c7d8h");
+        let labels = tag_shortcut_labels_for("plo6", 6, &board, TagAtom::TwoPair { plus: false });
+        assert!(labels.iter().any(|label| label == "67"));
+        assert!(labels.iter().any(|label| label == "68"));
+        assert!(labels.iter().any(|label| label == "78"));
     }
 
     #[test]
