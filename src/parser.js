@@ -189,16 +189,38 @@ function nativePack(node, cost = 8, selectivity = 0.35) {
   };
 }
 
+function nativeTagPlan(tagToken) {
+  const plus = String(tagToken || "").endsWith("+");
+  const base = plus ? tagToken.slice(0, -1) : tagToken;
+  if (base === "@tp") return { kind: "top_pair", plus };
+  if (base === "@overpair") return { kind: "overpair", plus };
+  if (base === "@2p") return { kind: "two_pair", plus };
+  if (base === "@set") return { kind: "set", plus };
+  if (base === "@fd") return { kind: "flush_draw" };
+  if (base === "@f") return { kind: "flush", plus };
+  if (base === "@s") return { kind: "straight", plus };
+  if (base === "@sd") return { kind: "straight_draw", min_outs: 1 };
+  if (base === "@sd4") return { kind: "straight_draw", min_outs: 4 };
+  if (base === "@sd8") return { kind: "straight_draw", min_outs: 8 };
+  if (base === "@sd12") return { kind: "straight_draw", min_outs: 12 };
+  return null;
+}
+
 function nativeAtomPlan(rawAtom, variant, contextBoard, options = {}) {
   let atom = expandShortcuts(stripSpaces(rawAtom), variant);
   const percentileProfile = options.percentileProfile;
+  const useNativeExactPercentileRef = options.nativeExactPercentileRef === true;
+  const normalizedPercentileProfile = normalizePercentileProfile(variant, percentileProfile);
 
   const w = atom.match(/@([0-9]{1,3})$/);
   if (w) atom = atom.slice(0, atom.length - w[0].length);
 
   const lowAtom = atom.toLowerCase();
   const normalizedTag = normalizeTagToken(lowAtom);
-  if (normalizedTag) return null;
+  if (normalizedTag) {
+    const tag = nativeTagPlan(normalizedTag);
+    return tag ? nativePack({ kind: "tag", tag }, 2, 0.18) : null;
+  }
 
   const PCT_TOKEN_RE = "(?:100(?:\\.0+)?|[0-9]{1,2}(?:\\.[0-9]+)?)";
   const pctRange = atom.match(new RegExp(`^(${PCT_TOKEN_RE})%-(${PCT_TOKEN_RE})%$`));
@@ -206,8 +228,21 @@ function nativeAtomPlan(rawAtom, variant, contextBoard, options = {}) {
     const low = Number(pctRange[1]);
     const high = Number(pctRange[2]);
     const spanSel = Math.max(0, Math.min(1, (high - low) / 100));
+    if (useNativeExactPercentileRef) {
+      return nativePack({
+        kind: "pct_exact_range",
+        variant,
+        profile: normalizedPercentileProfile,
+        low_pct: low,
+        high_pct: high
+      }, 0.8, spanSel);
+    }
     const exact = exactPercentileTable(variant, percentileProfile);
-    if (!exact || !Array.isArray(exact.scoreKeysByComboRank) || exact.scoreKeysByComboRank.length < exact.sampleSize) return null;
+    if (!exact || !Array.isArray(exact.scoreKeysByComboRank) || exact.scoreKeysByComboRank.length < exact.sampleSize) {
+      const lowThreshold = percentileThreshold(variant, low, percentileProfile);
+      const highThreshold = percentileThreshold(variant, high, percentileProfile);
+      return nativePack({ kind: "heuristic_range", low_threshold: lowThreshold, high_threshold: highThreshold }, 1.6, spanSel);
+    }
     const bitsB64 = nativePercentileBitsCached(
       variant,
       percentileProfile,
@@ -225,8 +260,19 @@ function nativeAtomPlan(rawAtom, variant, contextBoard, options = {}) {
   if (pctTop) {
     const p = Number(pctTop[1]);
     const sel = Math.max(0, Math.min(1, p / 100));
+    if (useNativeExactPercentileRef) {
+      return nativePack({
+        kind: "pct_exact_top",
+        variant,
+        profile: normalizedPercentileProfile,
+        pct: p
+      }, 0.7, sel);
+    }
     const exact = exactPercentileTable(variant, percentileProfile);
-    if (!exact || !Array.isArray(exact.scoreKeysByComboRank) || exact.scoreKeysByComboRank.length < exact.sampleSize) return null;
+    if (!exact || !Array.isArray(exact.scoreKeysByComboRank) || exact.scoreKeysByComboRank.length < exact.sampleSize) {
+      const threshold = percentileThreshold(variant, p, percentileProfile);
+      return nativePack({ kind: "heuristic_top", threshold }, 1.4, sel);
+    }
     const bitsB64 = nativePercentileBitsCached(
       variant,
       percentileProfile,

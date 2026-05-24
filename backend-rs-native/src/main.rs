@@ -11,7 +11,6 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -220,16 +219,20 @@ enum RangeAtom {
     Exact(Vec<u8>),
     Specs(Vec<Vec<Spec>>),
     PercentTopExact {
-        table: Arc<PercentileTable>,
+        table: native_sim::ExactPercentileTableRef,
+        variant: String,
+        profile: String,
         pct: f64,
-        boundary: PercentBoundary,
+        boundary: native_sim::ExactPercentBoundary,
     },
     PercentRangeExact {
-        table: Arc<PercentileTable>,
+        table: native_sim::ExactPercentileTableRef,
+        variant: String,
+        profile: String,
         low_pct: f64,
         high_pct: f64,
-        low_boundary: PercentBoundary,
-        high_boundary: PercentBoundary,
+        low_boundary: native_sim::ExactPercentBoundary,
+        high_boundary: native_sim::ExactPercentBoundary,
     },
     PercentTopHeuristic {
         threshold: f64,
@@ -277,30 +280,6 @@ enum LexToken {
     Bang,
     LParen,
     RParen,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PercentileTable {
-    basis: usize,
-    #[serde(rename = "sampleSize")]
-    sample_size: usize,
-    #[serde(rename = "topScoreKeys")]
-    top_score_keys: Vec<u32>,
-    #[serde(rename = "topRanks")]
-    top_ranks: Vec<u32>,
-    #[serde(rename = "scoreKeysByComboRank")]
-    score_keys_by_combo_rank: Vec<u32>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum PercentBoundary {
-    None,
-    All,
-    Partial {
-        boundary_score: u32,
-        boundary_rank: usize,
-    },
 }
 
 const RANKS: &str = "23456789TJQKA";
@@ -767,12 +746,16 @@ async fn static_cache_headers(req: Request, next: Next) -> Response {
 }
 
 fn is_percentile_table_asset(path: &str) -> bool {
-    path.ends_with("/src/percentile-tables-ours-plo4.js")
+    path.ends_with("/src/percentile-tables-ours-holdem.js")
+        || path.ends_with("/src/percentile-tables-ours-plo4.js")
         || path.ends_with("/src/percentile-tables-ours-plo5.js")
+        || path.ends_with("/src/percentile-tables-ours-plo6.js")
         || path.ends_with("/src/percentile-tables-ppt6max-plo4.js")
         || path.ends_with("/src/percentile-tables-ppt6max-plo5.js")
+        || path == "/src/percentile-tables-ours-holdem.js"
         || path == "/src/percentile-tables-ours-plo4.js"
         || path == "/src/percentile-tables-ours-plo5.js"
+        || path == "/src/percentile-tables-ours-plo6.js"
         || path == "/src/percentile-tables-ppt6max-plo4.js"
         || path == "/src/percentile-tables-ppt6max-plo5.js"
 }
@@ -811,7 +794,7 @@ async fn shutdown_signal() {
 
 fn prewarm_percentile_tables() {
     for variant in ["holdem", "plo4", "plo5", "plo6"] {
-        let _ = exact_percentile_table(variant, "ours");
+        let _ = native_sim::exact_percentile_table_ref(variant, "ours");
     }
 }
 
@@ -1090,6 +1073,10 @@ async fn sim_preview_range(Json(req): Json<PreviewRangeRequest>) -> (StatusCode,
 
     if is_any_expr(&compiled.expr) {
         let out = json!({ "matched": total, "total": total, "pct": 100, "approx": false });
+        return (StatusCode::OK, Json(json!({ "ok": true, "coverage": out })));
+    }
+
+    if let Some(out) = exact_preflop_percent_coverage(&board, &base, hand_size, &compiled) {
         return (StatusCode::OK, Json(json!({ "ok": true, "coverage": out })));
     }
 
@@ -2847,26 +2834,28 @@ fn atom_to_plan(atom: &RangeAtom) -> Option<native_sim::PlanNodeReq> {
                 .map(|entry| entry.iter().copied().map(spec_to_plan_spec).collect())
                 .collect(),
         }),
-        RangeAtom::PercentTopExact { table, pct, .. } => Some(native_sim::PlanNodeReq::PctBits {
-            bits_b64: None,
-            bits: Some(pct_top_bits(&table, *pct)),
+        RangeAtom::PercentTopExact {
+            variant,
+            profile,
+            pct,
+            ..
+        } => Some(native_sim::PlanNodeReq::PctExactTop {
+            variant: variant.clone(),
+            profile: profile.clone(),
+            pct: *pct,
         }),
         RangeAtom::PercentRangeExact {
             low_pct,
             high_pct,
-            table,
+            variant,
+            profile,
             ..
-        } => {
-            let mut high_bits = pct_top_bits(&table, *high_pct);
-            let low_bits = pct_top_bits(&table, *low_pct);
-            for (dst, low) in high_bits.iter_mut().zip(low_bits.iter()) {
-                *dst &= !*low;
-            }
-            Some(native_sim::PlanNodeReq::PctBits {
-                bits_b64: None,
-                bits: Some(high_bits),
-            })
-        }
+        } => Some(native_sim::PlanNodeReq::PctExactRange {
+            variant: variant.clone(),
+            profile: profile.clone(),
+            low_pct: *low_pct,
+            high_pct: *high_pct,
+        }),
         RangeAtom::PercentTopHeuristic { threshold } => {
             Some(native_sim::PlanNodeReq::HeuristicTop {
                 threshold: *threshold,
@@ -2973,50 +2962,6 @@ fn plan_tag_from_atom(tag: TagAtom) -> native_sim::PlanTagReq {
             min_outs: 0,
         },
     }
-}
-
-fn pct_top_bits(table: &PercentileTable, pct: f64) -> Vec<u8> {
-    let combo_space = table.score_keys_by_combo_rank.len();
-    let mut bits = vec![0u8; (combo_space + 7) / 8];
-    if combo_space == 0 || table.sample_size == 0 {
-        return bits;
-    }
-
-    let clamped = pct.clamp(0.0, 100.0);
-    let basis = table.basis.max(1);
-    let steps = 100usize.saturating_mul(basis);
-    let idx = ((clamped * basis as f64).round() as usize).min(steps);
-    let count = ((idx as f64 / steps as f64) * table.sample_size as f64).floor() as usize;
-    if count == 0 {
-        return bits;
-    }
-    if count >= table.sample_size {
-        for combo_idx in 0..combo_space {
-            set_bit(&mut bits, combo_idx);
-        }
-        return bits;
-    }
-    if idx >= table.top_score_keys.len() || idx >= table.top_ranks.len() {
-        return bits;
-    }
-
-    let boundary_score = table.top_score_keys[idx];
-    let boundary_rank = table.top_ranks[idx] as usize;
-    for rank in 0..combo_space {
-        let score = table.score_keys_by_combo_rank[rank];
-        if score > boundary_score || (score == boundary_score && rank <= boundary_rank) {
-            set_bit(&mut bits, rank);
-        }
-    }
-    bits
-}
-
-fn set_bit(bits: &mut [u8], idx: usize) {
-    let byte = idx >> 3;
-    if byte >= bits.len() {
-        return;
-    }
-    bits[byte] |= 1u8 << (idx & 7);
 }
 
 fn sampler_cache_key(
@@ -3438,6 +3383,44 @@ fn coverage_json(matched: usize, total: usize) -> Value {
     })
 }
 
+fn exact_preflop_percent_coverage(
+    board: &[u8],
+    base: &[u8],
+    hand_size: usize,
+    compiled: &CompiledRangeExpr,
+) -> Option<Value> {
+    if !board.is_empty() || base.len() != CARD_COUNT || compiled.weight_pct != 100 {
+        return None;
+    }
+
+    let (matched, sample_size) = match &compiled.expr {
+        RangeExpr::Atom(RangeAtom::PercentTopExact { table, pct, .. }) => (
+            native_sim::exact_percent_count_for_ref(table, *pct),
+            native_sim::exact_percent_sample_size(table),
+        ),
+        RangeExpr::Atom(RangeAtom::PercentRangeExact {
+            table,
+            low_pct,
+            high_pct,
+            ..
+        }) => {
+            let high = native_sim::exact_percent_count_for_ref(table, *high_pct);
+            let low = native_sim::exact_percent_count_for_ref(table, *low_pct);
+            (
+                high.saturating_sub(low),
+                native_sim::exact_percent_sample_size(table),
+            )
+        }
+        _ => return None,
+    };
+
+    let total = n_choose_k(CARD_COUNT, hand_size);
+    if sample_size != total {
+        return None;
+    }
+    Some(coverage_json(matched.min(total), total))
+}
+
 fn estimate_coverage_with_deadline<F>(
     base: &[u8],
     hand_size: usize,
@@ -3772,9 +3755,6 @@ static SAMPLER_CACHE: OnceLock<Mutex<SamplerCacheStore>> = OnceLock::new();
 static TAG_COVERAGE_CACHE: OnceLock<Mutex<TagCoverageCacheStore>> = OnceLock::new();
 static TAG_EXPR_COVERAGE_CACHE: OnceLock<Mutex<TagExprCoverageCacheStore>> = OnceLock::new();
 static PLAN_POOL_TOO_LARGE_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-static EXACT_PERCENTILE_TABLES: OnceLock<Mutex<HashMap<String, Option<Arc<PercentileTable>>>>> =
-    OnceLock::new();
-static CHOOSE_52_TABLE: OnceLock<[[usize; 7]; 53]> = OnceLock::new();
 const SAMPLER_CACHE_MAX: usize = 96;
 
 #[derive(Clone)]
@@ -3991,189 +3971,6 @@ fn normalize_percentile_profile(variant: &str, raw_profile: &str) -> String {
         }
         _ => "ours".to_string(),
     }
-}
-
-fn exact_percentile_table(variant: &str, profile: &str) -> Option<Arc<PercentileTable>> {
-    let variant_norm = variant.to_lowercase();
-    let profile_norm = normalize_percentile_profile(variant, profile);
-    let key = format!("{profile_norm}|{variant_norm}");
-    let cache = EXACT_PERCENTILE_TABLES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().ok()?;
-    if !guard.contains_key(&key) {
-        let loaded = load_percentile_table(&profile_norm, &variant_norm).ok();
-        guard.insert(key.clone(), loaded);
-    }
-    guard.get(&key).cloned().flatten()
-}
-
-fn load_percentile_table(profile: &str, variant: &str) -> Result<Arc<PercentileTable>, String> {
-    let (path, export_name) = percentile_table_module_spec(profile, variant)
-        .ok_or_else(|| format!("no exact percentile table for {profile}/{variant}"))?;
-    let text = fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-    let object_text = extract_exported_object_literal(&text, export_name)
-        .ok_or_else(|| format!("failed to parse {export_name} in {path}"))?;
-    let parsed: PercentileTable =
-        json5::from_str(&object_text).map_err(|e| format!("parse {path}: {e}"))?;
-    Ok(Arc::new(parsed))
-}
-
-fn percentile_table_module_spec(
-    profile: &str,
-    variant: &str,
-) -> Option<(&'static str, &'static str)> {
-    match (profile, variant) {
-        ("ppt6max", "plo4") => Some((
-            "src/percentile-tables-ppt6max-plo4.js",
-            "PPT_6MAX_PERCENTILE_TABLE_PLO4",
-        )),
-        ("ppt6max", "plo5") => Some((
-            "src/percentile-tables-ppt6max-plo5.js",
-            "PPT_6MAX_PERCENTILE_TABLE_PLO5",
-        )),
-        (_, "plo4") => Some((
-            "src/percentile-tables-ours-plo4.js",
-            "PRECOMPUTED_PERCENTILE_TABLE_PLO4",
-        )),
-        (_, "plo5") => Some((
-            "src/percentile-tables-ours-plo5.js",
-            "PRECOMPUTED_PERCENTILE_TABLE_PLO5",
-        )),
-        _ => None,
-    }
-}
-
-fn extract_exported_object_literal(text: &str, export_name: &str) -> Option<String> {
-    let marker = format!("export const {export_name}");
-    let start_marker = text.find(&marker)?;
-    let after = &text[start_marker..];
-    let eq_pos = after.find('=')?;
-    let tail = &after[eq_pos + 1..];
-    let open_rel = tail.find('{')?;
-    let start = start_marker + eq_pos + 1 + open_rel;
-    let chars: Vec<char> = text.chars().collect();
-
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut quote = '\0';
-    let mut escaped = false;
-    let mut end = None;
-
-    for (i, ch) in chars.iter().enumerate().skip(start) {
-        if in_string {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if *ch == '\\' {
-                escaped = true;
-                continue;
-            }
-            if *ch == quote {
-                in_string = false;
-            }
-            continue;
-        }
-
-        if *ch == '"' || *ch == '\'' {
-            in_string = true;
-            quote = *ch;
-            continue;
-        }
-        if *ch == '{' {
-            depth += 1;
-        } else if *ch == '}' {
-            depth -= 1;
-            if depth == 0 {
-                end = Some(i);
-                break;
-            }
-        }
-    }
-    let end = end?;
-    Some(chars[start..=end].iter().collect())
-}
-
-fn percent_boundary_for(table: &PercentileTable, pct: f64) -> PercentBoundary {
-    if table.sample_size == 0 {
-        return PercentBoundary::None;
-    }
-    let clamped = pct.clamp(0.0, 100.0);
-    let steps = 100usize.saturating_mul(table.basis.max(1));
-    let idx = ((clamped * table.basis.max(1) as f64).round() as usize).min(steps);
-    let count = ((idx as f64 / steps as f64) * table.sample_size as f64).floor() as usize;
-    if count == 0 {
-        return PercentBoundary::None;
-    }
-    if count >= table.sample_size {
-        return PercentBoundary::All;
-    }
-
-    if table.top_score_keys.len() <= idx || table.top_ranks.len() <= idx {
-        return PercentBoundary::None;
-    }
-    PercentBoundary::Partial {
-        boundary_score: table.top_score_keys[idx],
-        boundary_rank: table.top_ranks[idx] as usize,
-    }
-}
-
-fn in_top_exact_boundary(table: &PercentileTable, boundary: PercentBoundary, hand: &[u8]) -> bool {
-    if hand.is_empty() {
-        return false;
-    }
-    match boundary {
-        PercentBoundary::None => return false,
-        PercentBoundary::All => return true,
-        PercentBoundary::Partial { .. } => {}
-    }
-    let hand_rank = combo_rank_52(hand);
-    if hand_rank >= table.sample_size || hand_rank >= table.score_keys_by_combo_rank.len() {
-        return false;
-    }
-    let score_key = table.score_keys_by_combo_rank[hand_rank];
-    match boundary {
-        PercentBoundary::Partial {
-            boundary_score,
-            boundary_rank,
-        } => {
-            score_key > boundary_score
-                || (score_key == boundary_score && hand_rank <= boundary_rank)
-        }
-        PercentBoundary::None => false,
-        PercentBoundary::All => true,
-    }
-}
-
-fn combo_rank_52(hand_cards: &[u8]) -> usize {
-    let choose = CHOOSE_52_TABLE.get_or_init(build_choose_52_table);
-    let k = hand_cards.len();
-    let mut rank = 0usize;
-    let mut start = 0usize;
-    for i in 0..k {
-        let ci = hand_cards[i] as usize;
-        for v in start..ci {
-            rank += choose[52 - (v + 1)][k - i - 1];
-        }
-        start = ci + 1;
-    }
-    rank
-}
-
-fn build_choose_52_table() -> [[usize; 7]; 53] {
-    let mut table = [[0usize; 7]; 53];
-    for n in 0..=52 {
-        table[n][0] = 1;
-        for k in 1..=6 {
-            if k > n {
-                table[n][k] = 0;
-            } else if k == n {
-                table[n][k] = 1;
-            } else {
-                table[n][k] = table[n - 1][k - 1] + table[n - 1][k];
-            }
-        }
-    }
-    table
 }
 
 fn compile_range_expr(
@@ -4480,12 +4277,14 @@ fn compile_atom(
 
     if let Some((low, high)) = parse_percent_range(atom_text) {
         let profile = normalize_percentile_profile(variant, percentile_profile);
-        if let Some(table) = exact_percentile_table(variant, &profile) {
+        if let Some(table) = native_sim::exact_percentile_table_ref(variant, &profile) {
             return Ok((
                 RangeAtom::PercentRangeExact {
-                    low_boundary: percent_boundary_for(&table, low),
-                    high_boundary: percent_boundary_for(&table, high),
+                    low_boundary: native_sim::exact_percent_boundary_for_ref(&table, low),
+                    high_boundary: native_sim::exact_percent_boundary_for_ref(&table, high),
                     table,
+                    variant: variant.to_string(),
+                    profile,
                     low_pct: low,
                     high_pct: high,
                 },
@@ -4504,11 +4303,13 @@ fn compile_atom(
     }
     if let Some(p) = parse_percent_top(atom_text) {
         let profile = normalize_percentile_profile(variant, percentile_profile);
-        if let Some(table) = exact_percentile_table(variant, &profile) {
+        if let Some(table) = native_sim::exact_percentile_table_ref(variant, &profile) {
             return Ok((
                 RangeAtom::PercentTopExact {
-                    boundary: percent_boundary_for(&table, p),
+                    boundary: native_sim::exact_percent_boundary_for_ref(&table, p),
                     table,
+                    variant: variant.to_string(),
+                    profile,
                     pct: p,
                 },
                 weight,
@@ -5238,15 +5039,15 @@ fn atom_match(atom: &RangeAtom, hand: &[u8], board: &[u8]) -> bool {
         RangeAtom::Specs(entries) => entries.iter().any(|specs| match_specs(specs, hand)),
         RangeAtom::PercentTopExact {
             table, boundary, ..
-        } => in_top_exact_boundary(table, *boundary, hand),
+        } => native_sim::in_top_exact_percentile_ref(table, *boundary, hand),
         RangeAtom::PercentRangeExact {
             table,
             low_boundary,
             high_boundary,
             ..
         } => {
-            in_top_exact_boundary(table, *high_boundary, hand)
-                && !in_top_exact_boundary(table, *low_boundary, hand)
+            native_sim::in_top_exact_percentile_ref(table, *high_boundary, hand)
+                && !native_sim::in_top_exact_percentile_ref(table, *low_boundary, hand)
         }
         RangeAtom::PercentTopHeuristic { threshold } => evaluate_heuristic(hand) >= *threshold,
         RangeAtom::PercentRangeHeuristic {

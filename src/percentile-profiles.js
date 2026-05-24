@@ -23,6 +23,10 @@ const PROFILE_OPTIONS_BY_VARIANT = {
 
 const PROFILE_TABLE_MODULES = {
   [PERCENTILE_PROFILE_OURS]: {
+    holdem: {
+      modulePath: "./percentile-tables-ours-holdem.js",
+      exportName: "PRECOMPUTED_PERCENTILE_TABLE_HOLDEM"
+    },
     plo4: {
       modulePath: "./percentile-tables-ours-plo4.js",
       exportName: "PRECOMPUTED_PERCENTILE_TABLE_PLO4"
@@ -30,6 +34,10 @@ const PROFILE_TABLE_MODULES = {
     plo5: {
       modulePath: "./percentile-tables-ours-plo5.js",
       exportName: "PRECOMPUTED_PERCENTILE_TABLE_PLO5"
+    },
+    plo6: {
+      modulePath: "./percentile-tables-ours-plo6.js",
+      exportName: "PRECOMPUTED_PERCENTILE_TABLE_PLO6"
     }
   },
   [PERCENTILE_PROFILE_PPT6MAX]: {

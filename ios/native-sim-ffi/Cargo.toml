@@ -1,0 +1,12 @@
+[package]
+name = "odds-native-sim-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "odds_native_sim_ffi"
+crate-type = ["staticlib"]
+
+[dependencies]
+native-sim = { path = "../../native-sim" }
+serde_json = "1.0.149"

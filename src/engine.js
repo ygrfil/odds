@@ -1,4 +1,5 @@
 import { rawToResult } from "./result-format.js";
+import { canUseNativeIosSim, runNativeIosSimulation } from "./native-ios.js";
 
 class BackendUnavailableError extends Error {
   constructor(message) {
@@ -71,12 +72,26 @@ async function runSimulationBackend(config, onProgress, signal) {
   }
 }
 
+function shouldForceLocal() {
+  return !!(typeof window !== "undefined" && window.POKER_ODDS_LAB_FORCE_LOCAL);
+}
+
+function isIosShell() {
+  return !!(typeof window !== "undefined" && window.POKER_ODDS_LAB_IOS);
+}
+
 export async function runSimulation(config, onProgress, signal) {
   const canTryBackend = typeof window !== "undefined"
     && typeof fetch !== "undefined"
     && String(window.location.protocol || "").startsWith("http");
-  if (!canTryBackend) {
-    throw new BackendUnavailableError("Backend endpoint is not available. Open app over http:// with backend running.");
+  if (!canTryBackend || shouldForceLocal()) {
+    if (canUseNativeIosSim()) {
+      return await runNativeIosSimulation(config, onProgress, signal);
+    }
+    if (isIosShell()) {
+      throw new Error("Native iOS engine bridge is unavailable. The iOS build does not use the JavaScript simulation fallback.");
+    }
+    throw new BackendUnavailableError("Rust backend is not available. Open the app over http:// with the Rust backend running.");
   }
   return await runSimulationBackend(config, onProgress, signal);
 }

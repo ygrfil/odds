@@ -9,41 +9,25 @@
   <body>
     <div class="app-shell">
       <header class="topbar">
-        <div>
-          <h1>Poker Odds Lab</h1>
-          <p>Hold'em, PLO4, PLO5, PLO6 equity calculator</p>
+        <h1>Poker Odds Lab</h1>
+        <div class="topbar-actions">
+          <button id="settingsOpen" type="button" class="compact-btn">Settings</button>
+          <button id="helpOpen" type="button" class="compact-btn">Help</button>
         </div>
       </header>
 
       <section class="panel controls">
-        <div class="control-row">
-          <label>
-            Variant
-            <select id="variant">
-              <option value="holdem">Hold'em</option>
-              <option value="plo4">Omaha 4 (PLO4)</option>
-              <option value="plo5">Omaha 5 (PLO5)</option>
-              <option value="plo6">Omaha 6 (PLO6)</option>
-            </select>
-          </label>
-          <label>
-            Precision stop
-            <select id="precision">
-              <option value="ci30">CI95 ±0.30% (faster)</option>
-              <option value="ci20" selected>CI95 ±0.20%</option>
-              <option value="ci10">CI95 ±0.10%</option>
-              <option value="ci05">CI95 ±0.05%</option>
-            </select>
-          </label>
-          <label>
-            Hand ordering
-            <select id="orderingProfile">
-              <option value="ours">Ours (equity vs random)</option>
-              <option value="ppt6max">PPT 6-max (evolution)</option>
-            </select>
-          </label>
-          <div class="spacer"></div>
-          <button id="helpOpen" type="button">Help</button>
+        <div class="variant-strip" aria-label="Game variant">
+          <select id="variant" class="native-control-hidden" aria-label="Game variant" tabindex="-1">
+            <option value="holdem">Hold'em</option>
+            <option value="plo4">PLO4</option>
+            <option value="plo5">PLO5</option>
+            <option value="plo6">PLO6</option>
+          </select>
+          <button type="button" class="variant-button" data-variant="holdem" aria-pressed="true">Hold'em</button>
+          <button type="button" class="variant-button" data-variant="plo4" aria-pressed="false">PLO4</button>
+          <button type="button" class="variant-button" data-variant="plo5" aria-pressed="false">PLO5</button>
+          <button type="button" class="variant-button" data-variant="plo6" aria-pressed="false">PLO6</button>
         </div>
 
         <div class="control-row board-row">
@@ -75,9 +59,6 @@
           <button id="clearAll" type="button">Clear All</button>
           <button id="bombpotRun" type="button">Bombpot</button>
           <button id="run" type="button" class="primary">Run Simulation</button>
-          <button id="exportSetup" type="button">Export Setup</button>
-          <button id="importSetup" type="button">Import Setup</button>
-          <input id="importFile" type="file" accept=".json,application/json" hidden />
         </div>
       </section>
 
@@ -105,6 +86,38 @@
         </div>
       </div>
 
+      <div id="settingsModal" class="help-modal hidden" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+        <div class="help-card settings-card">
+          <div class="help-head">
+            <h2 id="settingsTitle">Settings</h2>
+            <button id="settingsClose" type="button">Close</button>
+          </div>
+          <div class="settings-grid">
+            <label>
+              Precision stop
+              <select id="precision">
+                <option value="ci30">CI95 +/-0.30% (faster)</option>
+                <option value="ci20" selected>CI95 +/-0.20%</option>
+                <option value="ci10">CI95 +/-0.10%</option>
+                <option value="ci05">CI95 +/-0.05%</option>
+              </select>
+            </label>
+            <label>
+              Hand ordering
+              <select id="orderingProfile">
+                <option value="ours">Ours (equity vs random)</option>
+                <option value="ppt6max">PPT 6-max (evolution)</option>
+              </select>
+            </label>
+            <div class="settings-actions">
+              <button id="exportSetup" type="button">Export Setup</button>
+              <button id="importSetup" type="button">Import Setup</button>
+              <input id="importFile" type="file" accept=".json,application/json" hidden />
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div id="helpModal" class="help-modal hidden" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
         <div class="help-card">
           <div class="help-head">
@@ -114,7 +127,7 @@
           <div class="help-body">
             <p class="help-intro">
               Poker Odds Lab estimates equity for Hold'em, PLO4, PLO5, and PLO6. A setup has a game variant, optional board/dead cards, and 2 to 6 player ranges.
-              Start with simple ranges like <code>AA</code>, <code>AKs</code>, or <code>30%</code>, then add filters when needed.
+              It is a strategy calculator only; it does not offer real-money gaming, wagering, contests, or prizes. Start with simple ranges like <code>AA</code>, <code>AKs</code>, or <code>30%</code>, then add filters when needed.
             </p>
 
             <div class="help-grid">
@@ -130,6 +143,7 @@
               <div>
                 <h3>2) Main Controls</h3>
                 <ul>
+                  <li><strong>Settings</strong> opens precision, hand ordering, import, and export controls.</li>
                   <li><strong>Precision stop</strong> controls speed vs accuracy. Smaller CI95 targets run longer.</li>
                   <li><strong>Hand ordering</strong> controls what <code>15%</code> or <code>30%-50%</code> means.</li>
                   <li><strong>Dead Cards</strong> removes known unavailable cards from the deck.</li>
@@ -235,8 +249,8 @@
             <h3>13) Save, Import, and Export</h3>
             <ul>
               <li>The current setup is saved in this browser automatically.</li>
-              <li><strong>Export Setup</strong> downloads a JSON file with the current setup and latest result.</li>
-              <li><strong>Import Setup</strong> loads a previously exported JSON setup.</li>
+              <li><strong>Export Setup</strong> in Settings downloads a JSON file with the current setup and latest result.</li>
+              <li><strong>Import Setup</strong> in Settings loads a previously exported JSON setup.</li>
             </ul>
 
             <h3>14) Practical Examples</h3>

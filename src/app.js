@@ -1,5 +1,7 @@
 import { runSimulation } from "./engine.js";
+import { canUseNativeIosSim, previewNativeIosRangeCoverage } from "./native-ios.js";
 import { validateRangeSyntax } from "./parser.js";
+import { previewTagCoreCombos } from "./sim-core.js";
 import { extractNormalizedTags, splitTagToken } from "./tag-utils.js";
 import {
   normalizePercentileProfile,
@@ -46,6 +48,7 @@ const TAG_SHORTCUT_BUNDLE_INFLIGHT = new Map();
 
 const el = {
   variant: document.querySelector("#variant"),
+  variantButtons: document.querySelectorAll(".variant-button[data-variant]"),
   precision: document.querySelector("#precision"),
   orderingProfile: document.querySelector("#orderingProfile"),
   board: document.querySelector("#board"),
@@ -64,6 +67,9 @@ const el = {
   helpOpen: document.querySelector("#helpOpen"),
   helpClose: document.querySelector("#helpClose"),
   helpModal: document.querySelector("#helpModal"),
+  settingsOpen: document.querySelector("#settingsOpen"),
+  settingsClose: document.querySelector("#settingsClose"),
+  settingsModal: document.querySelector("#settingsModal"),
   bombpotModal: document.querySelector("#bombpotModal"),
   bombpotClose: document.querySelector("#bombpotClose"),
   exportSetup: document.querySelector("#exportSetup"),
@@ -515,6 +521,15 @@ function syncDeadVisibility() {
   }
 }
 
+function syncVariantButtons() {
+  const selected = String(el.variant?.value || "holdem").toLowerCase();
+  el.variantButtons?.forEach((button) => {
+    const isActive = String(button.dataset.variant || "").toLowerCase() === selected;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-pressed", isActive ? "true" : "false");
+  });
+}
+
 function handSizeForVariant(variant) {
   const v = String(variant || "").toLowerCase();
   if (v === "holdem") return 2;
@@ -913,6 +928,7 @@ function tagHintText(tagToken) {
 
 function canUseBackendPreview() {
   if (typeof fetch !== "function") return false;
+  if (typeof window !== "undefined" && window.POKER_ODDS_LAB_FORCE_LOCAL) return false;
   const proto = String(window?.location?.protocol || "");
   return proto.startsWith("http");
 }
@@ -956,7 +972,7 @@ async function fetchTagShortcutBundle(boardText, variant) {
   if (TAG_SHORTCUT_BUNDLE_INFLIGHT.has(cacheKey)) return TAG_SHORTCUT_BUNDLE_INFLIGHT.get(cacheKey);
 
   const inflight = (async () => {
-    if (!canUseBackendPreview()) return { status: "helper-unavailable", combosByTag: {} };
+    if (!canUseBackendPreview()) return localTagShortcutBundle(boardKey, variant);
     let res;
     try {
       res = await fetch("/api/sim/preview/tags", {
@@ -968,10 +984,10 @@ async function fetchTagShortcutBundle(boardText, variant) {
         })
       });
     } catch {
-      return { status: "helper-unavailable", combosByTag: {} };
+      return localTagShortcutBundle(boardKey, variant);
     }
     if (!res.ok) {
-      if (res.status === 404 || res.status === 405) return { status: "helper-unavailable", combosByTag: {} };
+      if (res.status === 404 || res.status === 405) return localTagShortcutBundle(boardKey, variant);
       return { status: "invalid-board", combosByTag: {} };
     }
     let payload = null;
@@ -995,6 +1011,23 @@ async function fetchTagShortcutBundle(boardText, variant) {
   } finally {
     const current = TAG_SHORTCUT_BUNDLE_INFLIGHT.get(cacheKey);
     if (current === inflight) TAG_SHORTCUT_BUNDLE_INFLIGHT.delete(cacheKey);
+  }
+}
+
+function localTagShortcutBundle(boardText, variant) {
+  const combosByTag = {};
+  try {
+    for (const pick of quickPicks) {
+      const token = String(pick?.token || "").trim().toLowerCase();
+      if (!token) continue;
+      combosByTag[token] = previewTagCoreCombos(boardText, variant, token);
+    }
+    for (const token of ["@sd", "@sd4"]) {
+      if (!combosByTag[token]) combosByTag[token] = previewTagCoreCombos(boardText, variant, token);
+    }
+    return { status: "ok", combosByTag };
+  } catch {
+    return { status: "invalid-board", combosByTag: {} };
   }
 }
 
@@ -1139,6 +1172,82 @@ function renderLiveInfo(node, parts) {
     node.appendChild(span);
   }
   node.style.display = "";
+}
+
+function extractPercentAtoms(rangeText) {
+  const src = String(rangeText || "").replace(/\s+/g, "");
+  const raw = src.match(/\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)?%/g) || [];
+  const out = [];
+  for (const tok of raw) {
+    const nums = tok.slice(0, -1).split("-").map(Number);
+    if (!nums.every((n) => Number.isFinite(n) && n >= 0 && n <= 100)) continue;
+    if (nums.length === 2 && nums[0] > nums[1]) continue;
+    if (!out.includes(tok)) out.push(tok);
+  }
+  return out;
+}
+
+function coverageCounts(cov) {
+  if (!cov) return { matched: 0, total: 0, approx: false };
+  if (cov.approx) {
+    const matched = Number.isFinite(cov.estimatedMatched) ? cov.estimatedMatched : cov.matched;
+    const total = Number.isFinite(cov.population) ? cov.population : cov.total;
+    return { matched, total, approx: true };
+  }
+  return { matched: cov.matched, total: cov.total, approx: false };
+}
+
+function coverageText(cov) {
+  if (!cov || cov.total <= 0) return "";
+  if (cov.approx) {
+    const pct = `~${cov.pct.toFixed(1)}%`;
+    if (Number.isFinite(cov.estimatedMatched) && Number.isFinite(cov.population) && cov.population > 0) {
+      return `${pct}, ~${cov.estimatedMatched.toLocaleString()}/${cov.population.toLocaleString()} combos`;
+    }
+    return `${pct}, ${cov.matched.toLocaleString()}/${cov.total.toLocaleString()} samples`;
+  }
+  return `${cov.pct.toFixed(1)}%, ${cov.matched.toLocaleString()}/${cov.total.toLocaleString()} combos`;
+}
+
+async function computeNativeIosLiveInfo(ctx) {
+  const expr = String(ctx.rangeText || "").trim();
+  if (!expr) return { parts: [], coverage: null };
+
+  const covExpr = await previewNativeIosRangeCoverage({
+    boardText: ctx.boardText,
+    variant: ctx.variant,
+    rangeText: expr,
+    percentileProfile: ctx.percentileProfile
+  });
+  const parts = [];
+  const statExpr = coverageText(covExpr);
+  if (statExpr) parts.push({ tone: "primary", text: `Range: ${statExpr}` });
+
+  const pctAtoms = extractPercentAtoms(expr);
+  if (pctAtoms.length) {
+    const compact = expr.replace(/\s+/g, "");
+    const isSimplePercent = pctAtoms.length === 1 && compact === pctAtoms[0];
+    if (!isSimplePercent) {
+      const baseExpr = pctAtoms.join(",");
+      const baseCov = await previewNativeIosRangeCoverage({
+        boardText: ctx.boardText,
+        variant: ctx.variant,
+        rangeText: baseExpr,
+        percentileProfile: ctx.percentileProfile
+      });
+      const exprCnt = coverageCounts(covExpr);
+      const baseCnt = coverageCounts(baseCov);
+      if (baseCnt.matched > 0) {
+        const within = (exprCnt.matched * 100) / baseCnt.matched;
+        const shownExpr = `${Math.max(0, Math.round(exprCnt.matched)).toLocaleString()}`;
+        const shownBase = `${Math.max(0, Math.round(baseCnt.matched)).toLocaleString()}`;
+        const pctLabel = pctAtoms.length === 1 ? pctAtoms[0] : "% filters";
+        parts.push({ tone: "focus", text: `Inside ${pctLabel}: ${within.toFixed(1)}% (${shownExpr}/${shownBase} combos)` });
+      }
+    }
+  }
+
+  return { parts, coverage: covExpr };
 }
 
 function initLiveInfoWorker() {
@@ -1406,6 +1515,27 @@ function dispatchLiveInfoUpdate(playerIndex) {
   const requestId = ++liveInfoState.requestSeq;
   liveInfoState.latestRequestByPlayer.set(playerIndex, requestId);
 
+  if (canUseNativeIosSim()) {
+    computeNativeIosLiveInfo(ctx)
+      .then((out) => {
+        if (liveInfoState.latestRequestByPlayer.get(playerIndex) !== requestId) return;
+        renderLiveInfo(node, Array.isArray(out.parts) ? out.parts : []);
+        if (out.coverage && typeof out.coverage === "object") {
+          liveInfoState.coverageByPlayer.set(playerIndex, out.coverage);
+        } else {
+          liveInfoState.coverageByPlayer.delete(playerIndex);
+        }
+        liveInfoState.coverageReadyByPlayer.set(playerIndex, requestId);
+      })
+      .catch(() => {
+        if (liveInfoState.latestRequestByPlayer.get(playerIndex) !== requestId) return;
+        renderLiveInfo(node, [{ tone: "error", text: "Helper: native Rust unavailable" }]);
+        liveInfoState.coverageByPlayer.delete(playerIndex);
+        liveInfoState.coverageReadyByPlayer.set(playerIndex, requestId);
+      });
+    return;
+  }
+
   if (liveInfoState.worker) {
     liveInfoState.worker.postMessage({
       type: "range-live-info",
@@ -1549,6 +1679,7 @@ function applyQuickPick(token) {
 }
 
 function openHelp() {
+  closeSettings();
   closeBombpot();
   el.helpModal.classList.remove("hidden");
 }
@@ -1557,8 +1688,19 @@ function closeHelp() {
   el.helpModal.classList.add("hidden");
 }
 
+function openSettings() {
+  closeHelp();
+  closeBombpot();
+  if (el.settingsModal) el.settingsModal.classList.remove("hidden");
+}
+
+function closeSettings() {
+  if (el.settingsModal) el.settingsModal.classList.add("hidden");
+}
+
 function openBombpot() {
   closeHelp();
+  closeSettings();
   if (el.bombpotModal) el.bombpotModal.classList.remove("hidden");
 }
 
@@ -2466,6 +2608,7 @@ function importSetup(file) {
       if (!setup.players || setup.players.length < 2) throw new Error("Invalid setup file");
 
       el.variant.value = setup.variant || "holdem";
+      syncVariantButtons();
       if (el.precision) {
         el.precision.value = normalizePrecisionPreset(setup.precision || precisionPresetFromTarget(setup.confidenceTargetPct));
       }
@@ -2532,10 +2675,17 @@ function wire() {
   if (el.clearAll) el.clearAll.addEventListener("click", clearAllFields);
   el.helpOpen.addEventListener("click", openHelp);
   el.helpClose.addEventListener("click", closeHelp);
+  el.settingsOpen?.addEventListener("click", openSettings);
+  el.settingsClose?.addEventListener("click", closeSettings);
   if (el.bombpotClose) el.bombpotClose.addEventListener("click", closeBombpot);
   el.helpModal.addEventListener("click", (event) => {
     if (event.target === el.helpModal) closeHelp();
   });
+  if (el.settingsModal) {
+    el.settingsModal.addEventListener("click", (event) => {
+      if (event.target === el.settingsModal) closeSettings();
+    });
+  }
   if (el.bombpotModal) {
     el.bombpotModal.addEventListener("click", (event) => {
       if (event.target === el.bombpotModal) closeBombpot();
@@ -2551,7 +2701,24 @@ function wire() {
       closeHelp();
       return;
     }
+    if (el.settingsModal && !el.settingsModal.classList.contains("hidden")) {
+      closeSettings();
+      return;
+    }
     if (el.bombpotModal && !el.bombpotModal.classList.contains("hidden")) closeBombpot();
+  });
+
+  el.variantButtons?.forEach((button) => {
+    button.addEventListener("click", () => {
+      const nextVariant = button.dataset.variant;
+      if (!nextVariant || nextVariant === el.variant.value) {
+        syncVariantButtons();
+        return;
+      }
+      el.variant.value = nextVariant;
+      syncVariantButtons();
+      el.variant.dispatchEvent(new Event("change", { bubbles: true }));
+    });
   });
 
   el.exportSetup.addEventListener("click", exportSetup);
@@ -2568,6 +2735,7 @@ function wire() {
   });
   el.board.addEventListener("input", updateBoardPrettyPreview);
   el.variant.addEventListener("change", () => {
+    syncVariantButtons();
     syncOrderingProfileControl();
     saveLocal();
     renderPlayers();
@@ -2580,6 +2748,9 @@ function wire() {
       setBombpotStatus("Idle.");
     }
   });
+  if (el.precision) {
+    el.precision.addEventListener("change", saveLocal);
+  }
   if (el.orderingProfile) {
     el.orderingProfile.addEventListener("change", () => {
       syncOrderingProfileControl();
@@ -2635,6 +2806,7 @@ function wire() {
 }
 
 loadLocal();
+syncVariantButtons();
 syncOrderingProfileControl();
 updateBoardPrettyPreview();
 initLiveInfoWorker();

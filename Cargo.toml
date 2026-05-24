@@ -1,5 +1,5 @@
 [workspace]
-members = ["backend-rs-native", "native-sim"]
+members = ["backend-rs-native", "native-sim", "ios/native-sim-ffi"]
 default-members = ["backend-rs-native"]
 resolver = "2"
 

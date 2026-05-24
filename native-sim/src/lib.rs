@@ -9,12 +9,43 @@ use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 type ChooseTable = [[usize; 7]; 53];
 
 static COMBO_RANK_PREFIX: OnceLock<[[usize; 53]; 7]> = OnceLock::new();
+static EXACT_OURS_HOLDEM: OnceLock<Option<Arc<ExactPercentileTable>>> = OnceLock::new();
+static EXACT_OURS_PLO4: OnceLock<Option<Arc<ExactPercentileTable>>> = OnceLock::new();
+static EXACT_OURS_PLO5: OnceLock<Option<Arc<ExactPercentileTable>>> = OnceLock::new();
+static EXACT_OURS_PLO6: OnceLock<Option<Arc<ExactPercentileTable>>> = OnceLock::new();
+static EXACT_PPT6MAX_PLO4: OnceLock<Option<Arc<ExactPercentileTable>>> = OnceLock::new();
+static EXACT_PPT6MAX_PLO5: OnceLock<Option<Arc<ExactPercentileTable>>> = OnceLock::new();
+static EXACT_CHOOSE: OnceLock<ChooseTable> = OnceLock::new();
+
+#[derive(Debug)]
+struct ExactPercentileTable {
+    basis: usize,
+    sample_size: usize,
+    top_score_keys: Vec<u16>,
+    top_ranks: Vec<u32>,
+    score_keys_by_combo_rank: Vec<u16>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExactPercentileTableRef {
+    table: Arc<ExactPercentileTable>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ExactPercentBoundary {
+    None,
+    All,
+    Partial {
+        boundary_score: u16,
+        boundary_rank: usize,
+    },
+}
 
 #[derive(Debug, Clone)]
 pub struct SimRequest {
@@ -45,6 +76,7 @@ struct Request {
     #[serde(default)]
     mode: String,
     variant: String,
+    #[serde(default)]
     iteration_cap: usize,
     #[serde(default)]
     board: Vec<u8>,
@@ -83,6 +115,7 @@ struct Response {
     raw: Option<RawOut>,
     equity_rank: Option<EquityRankOut>,
     pool_build: Option<PoolBuildOut>,
+    coverage: Option<CoverageOut>,
 }
 
 #[derive(Debug, Serialize)]
@@ -129,6 +162,14 @@ struct PoolBuildOut {
     pool: Vec<Vec<u8>>,
 }
 
+#[derive(Debug, Serialize)]
+struct CoverageOut {
+    matched: usize,
+    total: usize,
+    pct: f64,
+    approx: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum PlanNodeReq {
@@ -155,6 +196,19 @@ pub enum PlanNodeReq {
         bits_b64: Option<String>,
         #[serde(default)]
         bits: Option<Vec<u8>>,
+    },
+    #[serde(rename = "pct_exact_top")]
+    PctExactTop {
+        variant: String,
+        profile: String,
+        pct: f64,
+    },
+    #[serde(rename = "pct_exact_range")]
+    PctExactRange {
+        variant: String,
+        profile: String,
+        low_pct: f64,
+        high_pct: f64,
     },
     #[serde(rename = "heuristic_top")]
     HeuristicTop { threshold: f64 },
@@ -207,6 +261,15 @@ enum PlanNode {
     },
     PctBits {
         bits: Vec<u8>,
+    },
+    PctExactTop {
+        table: Arc<ExactPercentileTable>,
+        boundary: ExactPercentBoundary,
+    },
+    PctExactRange {
+        table: Arc<ExactPercentileTable>,
+        low_boundary: ExactPercentBoundary,
+        high_boundary: ExactPercentBoundary,
     },
     HeuristicTop {
         threshold: f64,
@@ -381,7 +444,8 @@ fn error_response_value(msg: impl Into<String>) -> Value {
         "error": msg.into(),
         "raw": null,
         "equity_rank": null,
-        "pool_build": null
+        "pool_build": null,
+        "coverage": null
     })
 }
 
@@ -411,6 +475,7 @@ fn run_request(req: &Request) -> Result<Response> {
         "sim" => run_sim_mode(&req),
         "equity-rank" => run_equity_rank_mode(&req),
         "build-pool" => run_build_pool_mode(&req),
+        "preview-range" => run_preview_range_mode(&req),
         _ => anyhow::bail!("unsupported mode '{}'", mode),
     }
 }
@@ -533,6 +598,7 @@ fn run_sim_mode(req: &Request) -> Result<Response> {
         }),
         equity_rank: None,
         pool_build: None,
+        coverage: None,
     };
     Ok(out)
 }
@@ -605,6 +671,7 @@ fn run_equity_rank_mode(req: &Request) -> Result<Response> {
             top_ranks: stats.top_ranks,
         }),
         pool_build: None,
+        coverage: None,
     };
     Ok(out)
 }
@@ -687,8 +754,95 @@ fn run_build_pool_mode(req: &Request) -> Result<Response> {
             matched,
             pool,
         }),
+        coverage: None,
     };
     Ok(out)
+}
+
+fn run_preview_range_mode(req: &Request) -> Result<Response> {
+    let expected = variant_hand_size(&req.variant);
+    if expected == 0 {
+        anyhow::bail!("unsupported variant '{}'", req.variant);
+    }
+    validate_board_and_dead(&req.board, &req.dead)?;
+
+    let hand_size = if req.hand_size > 0 {
+        req.hand_size
+    } else {
+        expected
+    };
+    if hand_size != expected {
+        anyhow::bail!(
+            "hand_size {} does not match variant {} ({})",
+            hand_size,
+            req.variant,
+            expected
+        );
+    }
+
+    let plan_req = req
+        .plan
+        .as_ref()
+        .context("missing plan for preview-range mode")?;
+
+    let mut blocked = [false; 52];
+    for &c in req.board.iter().chain(req.dead.iter()) {
+        blocked[c as usize] = true;
+    }
+    let mut base_deck = Vec::with_capacity(52 - req.board.len() - req.dead.len());
+    for c in 0u8..52u8 {
+        if !blocked[c as usize] {
+            base_deck.push(c);
+        }
+    }
+    if base_deck.len() < hand_size {
+        anyhow::bail!("not enough available cards for hand_size {}", hand_size);
+    }
+
+    let total = n_choose_k(base_deck.len(), hand_size);
+    let matched = if req.board.is_empty() && req.dead.is_empty() {
+        if let Some(count) = exact_preflop_count_for_plan(plan_req, &req.variant, hand_size) {
+            count
+        } else {
+            let plan = compile_plan_node(plan_req)?;
+            count_plan_matches(
+                &base_deck,
+                hand_size,
+                &plan,
+                &build_choose_table(),
+                &req.board,
+                req.variant == "holdem",
+            )
+        }
+    } else {
+        let plan = compile_plan_node(plan_req)?;
+        count_plan_matches(
+            &base_deck,
+            hand_size,
+            &plan,
+            &build_choose_table(),
+            &req.board,
+            req.variant == "holdem",
+        )
+    };
+
+    Ok(Response {
+        ok: true,
+        error: None,
+        raw: None,
+        equity_rank: None,
+        pool_build: None,
+        coverage: Some(CoverageOut {
+            matched: matched.min(total),
+            total,
+            pct: if total > 0 {
+                (matched.min(total) as f64 * 100.0) / total as f64
+            } else {
+                0.0
+            },
+            approx: false,
+        }),
+    })
 }
 
 fn compile_plan_node(req: &PlanNodeReq) -> Result<PlanNode> {
@@ -747,6 +901,34 @@ fn compile_plan_node(req: &PlanNodeReq) -> Result<PlanNode> {
                 anyhow::bail!("pct_bits payload is empty");
             }
             Ok(PlanNode::PctBits { bits })
+        }
+        PlanNodeReq::PctExactTop {
+            variant,
+            profile,
+            pct,
+        } => {
+            let table = exact_percentile_table(variant, profile).with_context(|| {
+                format!("exact percentile table is unavailable for {profile}/{variant}")
+            })?;
+            Ok(PlanNode::PctExactTop {
+                boundary: percent_boundary_for(&table, *pct),
+                table,
+            })
+        }
+        PlanNodeReq::PctExactRange {
+            variant,
+            profile,
+            low_pct,
+            high_pct,
+        } => {
+            let table = exact_percentile_table(variant, profile).with_context(|| {
+                format!("exact percentile table is unavailable for {profile}/{variant}")
+            })?;
+            Ok(PlanNode::PctExactRange {
+                low_boundary: percent_boundary_for(&table, *low_pct),
+                high_boundary: percent_boundary_for(&table, *high_pct),
+                table,
+            })
         }
         PlanNodeReq::HeuristicTop { threshold } => Ok(PlanNode::HeuristicTop {
             threshold: *threshold,
@@ -849,6 +1031,17 @@ fn eval_plan(
             let idx = combo_rank_52(hand, choose);
             bit_is_set(bits, idx)
         }
+        PlanNode::PctExactTop { table, boundary } => {
+            in_top_exact_boundary(table, *boundary, hand, choose)
+        }
+        PlanNode::PctExactRange {
+            table,
+            low_boundary,
+            high_boundary,
+        } => {
+            in_top_exact_boundary(table, *high_boundary, hand, choose)
+                && !in_top_exact_boundary(table, *low_boundary, hand, choose)
+        }
         PlanNode::HeuristicTop { threshold } => evaluate_heuristic(hand) >= *threshold,
         PlanNode::HeuristicRange {
             low_threshold,
@@ -859,6 +1052,343 @@ fn eval_plan(
         }
         PlanNode::Tag(tag) => full_tag_match(*tag, hand, board, is_holdem),
     }
+}
+
+fn exact_percentile_table(variant: &str, profile: &str) -> Option<Arc<ExactPercentileTable>> {
+    let variant_norm = variant.trim().to_lowercase();
+    let profile_norm = normalize_exact_profile(&variant_norm, profile);
+    match (profile_norm.as_str(), variant_norm.as_str()) {
+        (_, "holdem") => load_included_percentile_table(
+            &EXACT_OURS_HOLDEM,
+            include_bytes!(concat!(env!("OUT_DIR"), "/percentile-ours-holdem.bin")),
+        ),
+        ("ppt6max", "plo4") => load_included_percentile_table(
+            &EXACT_PPT6MAX_PLO4,
+            include_bytes!(concat!(env!("OUT_DIR"), "/percentile-ppt6max-plo4.bin")),
+        ),
+        ("ppt6max", "plo5") => load_included_percentile_table(
+            &EXACT_PPT6MAX_PLO5,
+            include_bytes!(concat!(env!("OUT_DIR"), "/percentile-ppt6max-plo5.bin")),
+        ),
+        (_, "plo4") => load_included_percentile_table(
+            &EXACT_OURS_PLO4,
+            include_bytes!(concat!(env!("OUT_DIR"), "/percentile-ours-plo4.bin")),
+        ),
+        (_, "plo5") => load_included_percentile_table(
+            &EXACT_OURS_PLO5,
+            include_bytes!(concat!(env!("OUT_DIR"), "/percentile-ours-plo5.bin")),
+        ),
+        (_, "plo6") => load_included_percentile_table(
+            &EXACT_OURS_PLO6,
+            include_bytes!(concat!(env!("OUT_DIR"), "/percentile-ours-plo6.bin")),
+        ),
+        _ => None,
+    }
+}
+
+pub fn exact_percentile_table_ref(variant: &str, profile: &str) -> Option<ExactPercentileTableRef> {
+    exact_percentile_table(variant, profile).map(|table| ExactPercentileTableRef { table })
+}
+
+pub fn exact_percent_boundary_for_ref(
+    table: &ExactPercentileTableRef,
+    pct: f64,
+) -> ExactPercentBoundary {
+    percent_boundary_for(&table.table, pct)
+}
+
+pub fn exact_percent_count_for_ref(table: &ExactPercentileTableRef, pct: f64) -> usize {
+    percent_count_for(&table.table, pct)
+}
+
+pub fn exact_percent_sample_size(table: &ExactPercentileTableRef) -> usize {
+    table.table.sample_size
+}
+
+pub fn in_top_exact_percentile_ref(
+    table: &ExactPercentileTableRef,
+    boundary: ExactPercentBoundary,
+    hand: &[u8],
+) -> bool {
+    let choose = EXACT_CHOOSE.get_or_init(build_choose_table);
+    in_top_exact_boundary(&table.table, boundary, hand, choose)
+}
+
+fn normalize_exact_profile(variant: &str, profile: &str) -> String {
+    let wanted = profile.trim().to_lowercase();
+    match variant {
+        "plo4" | "plo5" if wanted == "ppt6max" => "ppt6max".to_string(),
+        "holdem" | "plo4" | "plo5" | "plo6" => "ours".to_string(),
+        _ => "ours".to_string(),
+    }
+}
+
+fn load_included_percentile_table(
+    cache: &'static OnceLock<Option<Arc<ExactPercentileTable>>>,
+    bytes: &'static [u8],
+) -> Option<Arc<ExactPercentileTable>> {
+    cache
+        .get_or_init(|| decode_exact_percentile_table(bytes).ok().map(Arc::new))
+        .clone()
+}
+
+fn decode_exact_percentile_table(bytes: &[u8]) -> Result<ExactPercentileTable> {
+    const HEADER_LEN: usize = 28;
+    if bytes.len() < HEADER_LEN || &bytes[..8] != b"EVPTBL1\0" {
+        anyhow::bail!("invalid exact percentile table header");
+    }
+    let mut offset = 8usize;
+    let basis = read_u32(bytes, &mut offset)? as usize;
+    let sample_size = read_u32(bytes, &mut offset)? as usize;
+    let top_score_len = read_u32(bytes, &mut offset)? as usize;
+    let top_rank_len = read_u32(bytes, &mut offset)? as usize;
+    let score_by_rank_len = read_u32(bytes, &mut offset)? as usize;
+
+    let top_score_keys = read_u16_vec(bytes, &mut offset, top_score_len)?;
+    let top_ranks = read_u32_vec(bytes, &mut offset, top_rank_len)?;
+    let score_keys_by_combo_rank = read_u16_vec(bytes, &mut offset, score_by_rank_len)?;
+
+    let steps = 100usize.saturating_mul(basis.max(1));
+    if sample_size == 0
+        || top_score_keys.len() < steps + 1
+        || top_ranks.len() < steps + 1
+        || score_keys_by_combo_rank.len() < sample_size
+    {
+        anyhow::bail!("invalid exact percentile table lengths");
+    }
+
+    Ok(ExactPercentileTable {
+        basis,
+        sample_size,
+        top_score_keys,
+        top_ranks,
+        score_keys_by_combo_rank,
+    })
+}
+
+fn read_u16_vec(bytes: &[u8], offset: &mut usize, len: usize) -> Result<Vec<u16>> {
+    let end = offset
+        .checked_add(len.saturating_mul(2))
+        .context("exact percentile table offset overflow")?;
+    if end > bytes.len() {
+        anyhow::bail!("truncated exact percentile table");
+    }
+    let mut out = Vec::with_capacity(len);
+    while *offset < end {
+        out.push(read_u16(bytes, offset)?);
+    }
+    Ok(out)
+}
+
+fn read_u32_vec(bytes: &[u8], offset: &mut usize, len: usize) -> Result<Vec<u32>> {
+    let end = offset
+        .checked_add(len.saturating_mul(4))
+        .context("exact percentile table offset overflow")?;
+    if end > bytes.len() {
+        anyhow::bail!("truncated exact percentile table");
+    }
+    let mut out = Vec::with_capacity(len);
+    while *offset < end {
+        out.push(read_u32(bytes, offset)?);
+    }
+    Ok(out)
+}
+
+fn read_u16(bytes: &[u8], offset: &mut usize) -> Result<u16> {
+    if *offset + 2 > bytes.len() {
+        anyhow::bail!("truncated exact percentile table");
+    }
+    let value = u16::from_le_bytes([bytes[*offset], bytes[*offset + 1]]);
+    *offset += 2;
+    Ok(value)
+}
+
+fn read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32> {
+    if *offset + 4 > bytes.len() {
+        anyhow::bail!("truncated exact percentile table");
+    }
+    let value = u32::from_le_bytes([
+        bytes[*offset],
+        bytes[*offset + 1],
+        bytes[*offset + 2],
+        bytes[*offset + 3],
+    ]);
+    *offset += 4;
+    Ok(value)
+}
+
+fn percent_boundary_for(table: &ExactPercentileTable, pct: f64) -> ExactPercentBoundary {
+    let count = percent_count_for(table, pct);
+    if count == 0 {
+        return ExactPercentBoundary::None;
+    }
+    if count >= table.sample_size {
+        return ExactPercentBoundary::All;
+    }
+
+    let idx = percent_step_index_for(table, pct);
+    if table.top_score_keys.len() <= idx || table.top_ranks.len() <= idx {
+        return ExactPercentBoundary::None;
+    }
+    ExactPercentBoundary::Partial {
+        boundary_score: table.top_score_keys[idx],
+        boundary_rank: table.top_ranks[idx] as usize,
+    }
+}
+
+fn percent_step_index_for(table: &ExactPercentileTable, pct: f64) -> usize {
+    let clamped = pct.clamp(0.0, 100.0);
+    let basis = table.basis.max(1);
+    let steps = 100usize.saturating_mul(basis);
+    ((clamped * basis as f64).round() as usize).min(steps)
+}
+
+fn percent_count_for(table: &ExactPercentileTable, pct: f64) -> usize {
+    if table.sample_size == 0 {
+        return 0;
+    }
+    let basis = table.basis.max(1);
+    let steps = 100usize.saturating_mul(basis);
+    let idx = percent_step_index_for(table, pct);
+    ((idx as f64 / steps as f64) * table.sample_size as f64).floor() as usize
+}
+
+fn in_top_exact_boundary(
+    table: &ExactPercentileTable,
+    boundary: ExactPercentBoundary,
+    hand: &[u8],
+    choose: &ChooseTable,
+) -> bool {
+    if hand.is_empty() {
+        return false;
+    }
+    match boundary {
+        ExactPercentBoundary::None => return false,
+        ExactPercentBoundary::All => return true,
+        ExactPercentBoundary::Partial { .. } => {}
+    }
+    let hand_rank = combo_rank_52(hand, choose);
+    if hand_rank >= table.sample_size || hand_rank >= table.score_keys_by_combo_rank.len() {
+        return false;
+    }
+    let score_key = table.score_keys_by_combo_rank[hand_rank];
+    match boundary {
+        ExactPercentBoundary::Partial {
+            boundary_score,
+            boundary_rank,
+        } => {
+            score_key > boundary_score
+                || (score_key == boundary_score && hand_rank <= boundary_rank)
+        }
+        ExactPercentBoundary::None => false,
+        ExactPercentBoundary::All => true,
+    }
+}
+
+fn exact_preflop_count_for_plan(
+    plan: &PlanNodeReq,
+    request_variant: &str,
+    hand_size: usize,
+) -> Option<usize> {
+    match plan {
+        PlanNodeReq::PctExactTop {
+            variant,
+            profile,
+            pct,
+        } if variant == request_variant => {
+            let table = exact_percentile_table(variant, profile)?;
+            if table.sample_size != n_choose_k(52, hand_size) {
+                return None;
+            }
+            Some(percent_count_for(&table, *pct))
+        }
+        PlanNodeReq::PctExactRange {
+            variant,
+            profile,
+            low_pct,
+            high_pct,
+        } if variant == request_variant => {
+            let table = exact_percentile_table(variant, profile)?;
+            if table.sample_size != n_choose_k(52, hand_size) {
+                return None;
+            }
+            let high = percent_count_for(&table, *high_pct);
+            let low = percent_count_for(&table, *low_pct);
+            Some(high.saturating_sub(low))
+        }
+        _ => None,
+    }
+}
+
+fn count_plan_matches(
+    base_deck: &[u8],
+    hand_size: usize,
+    plan: &PlanNode,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+) -> usize {
+    if hand_size == 0 || base_deck.len() < hand_size {
+        return 0;
+    }
+    let first_limit = base_deck.len() - hand_size;
+    if n_choose_k(base_deck.len(), hand_size) >= 100_000 && rayon::current_num_threads() > 1 {
+        (0..=first_limit)
+            .into_par_iter()
+            .map(|i| {
+                let mut hand = vec![0u8; hand_size];
+                hand[0] = base_deck[i];
+                count_plan_matches_rec(
+                    i + 1,
+                    1,
+                    base_deck,
+                    hand_size,
+                    &mut hand,
+                    plan,
+                    choose,
+                    board,
+                    is_holdem,
+                )
+            })
+            .sum()
+    } else {
+        let mut hand = vec![0u8; hand_size];
+        count_plan_matches_rec(
+            0, 0, base_deck, hand_size, &mut hand, plan, choose, board, is_holdem,
+        )
+    }
+}
+
+fn count_plan_matches_rec(
+    start: usize,
+    depth: usize,
+    base_deck: &[u8],
+    hand_size: usize,
+    hand: &mut [u8],
+    plan: &PlanNode,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+) -> usize {
+    if depth == hand_size {
+        return usize::from(eval_plan(plan, hand, choose, board, is_holdem));
+    }
+    let mut matched = 0usize;
+    for i in start..=base_deck.len() - (hand_size - depth) {
+        hand[depth] = base_deck[i];
+        matched += count_plan_matches_rec(
+            i + 1,
+            depth + 1,
+            base_deck,
+            hand_size,
+            hand,
+            plan,
+            choose,
+            board,
+            is_holdem,
+        );
+    }
+    matched
 }
 
 fn bit_is_set(bits: &[u8], idx: usize) -> bool {
@@ -1457,7 +1987,9 @@ fn build_samplers(req: &Request) -> Result<Vec<Sampler>> {
 
 fn plan_has_pct_bits(plan: &PlanNode) -> bool {
     match plan {
-        PlanNode::PctBits { .. } => true,
+        PlanNode::PctBits { .. }
+        | PlanNode::PctExactTop { .. }
+        | PlanNode::PctExactRange { .. } => true,
         PlanNode::Specs { .. }
         | PlanNode::HeuristicTop { .. }
         | PlanNode::HeuristicRange { .. }
@@ -2785,4 +3317,83 @@ fn combo_rank_52(cards: &[u8], _choose: &ChooseTable) -> usize {
         start = ci + 1;
     }
     rank
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn preview_range_exact_preflop_percent_is_exact_count() {
+        let out = run_request_value(json!({
+            "mode": "preview-range",
+            "variant": "plo6",
+            "hand_size": 6,
+            "board": [],
+            "dead": [],
+            "plan": {
+                "kind": "pct_exact_top",
+                "variant": "plo6",
+                "profile": "ours",
+                "pct": 30.0
+            }
+        }));
+
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["coverage"]["approx"], false);
+        assert_eq!(out["coverage"]["matched"], 6_107_556);
+        assert_eq!(out["coverage"]["total"], 20_358_520);
+    }
+
+    #[test]
+    fn preview_range_exact_compound_plan_counts_in_rust() {
+        let out = run_request_value(json!({
+            "mode": "preview-range",
+            "variant": "plo6",
+            "hand_size": 6,
+            "board": [],
+            "dead": [],
+            "plan": {
+                "kind": "and",
+                "left": {
+                    "kind": "pct_exact_top",
+                    "variant": "plo6",
+                    "profile": "ours",
+                    "pct": 30.0
+                },
+                "right": {
+                    "kind": "specs",
+                    "entries": [[
+                        { "ranks_mask": 4096, "rank_var": -1, "suit_mode": 0, "suit_value": -1 },
+                        { "ranks_mask": 4096, "rank_var": -1, "suit_mode": 0, "suit_value": -1 }
+                    ]]
+                }
+            }
+        }));
+
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["coverage"]["approx"], false);
+        assert_eq!(out["coverage"]["matched"], 1_094_644);
+        assert_eq!(out["coverage"]["total"], 20_358_520);
+    }
+
+    #[test]
+    fn preview_range_tag_plan_counts_in_rust() {
+        let out = run_request_value(json!({
+            "mode": "preview-range",
+            "variant": "plo5",
+            "hand_size": 5,
+            "board": [0, 5, 10],
+            "dead": [],
+            "plan": {
+                "kind": "tag",
+                "tag": { "kind": "flush_draw" }
+            }
+        }));
+
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["coverage"]["approx"], false);
+        assert!(out["coverage"]["total"].as_u64().unwrap_or(0) > 0);
+    }
 }

@@ -82,6 +82,7 @@ function coverageFromBundle(bundle, tag) {
 
 function canUseBackendPreview() {
   if (typeof fetch !== "function") return false;
+  if (typeof self !== "undefined" && self.POKER_ODDS_LAB_FORCE_LOCAL) return false;
   const proto = String(self?.location?.protocol || "");
   return proto.startsWith("http");
 }
@@ -133,16 +134,22 @@ async function fetchBackendJson(path, body, signal) {
 async function previewRangeCoverageFast(boardText, variant, rangeText, percentileProfile = "", signal) {
   const key = `${variant}|${percentileProfile}|${String(boardText || "").trim()}|${String(rangeText || "").replace(/\s+/g, "")}`;
   if (REMOTE_COVERAGE_CACHE.has(key)) return REMOTE_COVERAGE_CACHE.get(key);
-  const payload = await fetchBackendJson("/api/sim/preview/range", {
-    boardText,
-    variant,
-    rangeText,
-    percentileProfile
-  }, signal);
-  if (payload?.ok === false) {
-    throw new Error(payload?.error || "Range: invalid expression");
+  let cov = null;
+  try {
+    const payload = await fetchBackendJson("/api/sim/preview/range", {
+      boardText,
+      variant,
+      rangeText,
+      percentileProfile
+    }, signal);
+    if (payload?.ok === false) {
+      throw new Error(payload?.error || "Range: invalid expression");
+    }
+    cov = payload?.coverage;
+  } catch (err) {
+    if (isBackendOfflineError(err)) throw err;
+    throw err;
   }
-  const cov = payload?.coverage;
   if (!cov || typeof cov !== "object") throw new Error("Range: invalid backend response");
   cacheSetBounded(REMOTE_COVERAGE_CACHE, key, cov, 4000);
   return cov;
@@ -166,9 +173,15 @@ async function previewAllTagCoverageFast(boardText, variant, signal) {
   if (REMOTE_TAG_BUNDLE_CACHE.has(key)) return REMOTE_TAG_BUNDLE_CACHE.get(key);
   if (REMOTE_TAG_BUNDLE_INFLIGHT.has(key)) return REMOTE_TAG_BUNDLE_INFLIGHT.get(key);
   const inflight = (async () => {
-    const payload = await fetchBackendJson("/api/sim/preview/tags", { boardText, variant }, signal);
-    if (payload?.ok === false) throw new Error(payload?.error || "Tags: invalid board input");
-    const coverageByTag = payload?.coverageByTag;
+    let coverageByTag = null;
+    try {
+      const payload = await fetchBackendJson("/api/sim/preview/tags", { boardText, variant }, signal);
+      if (payload?.ok === false) throw new Error(payload?.error || "Tags: invalid board input");
+      coverageByTag = payload?.coverageByTag;
+    } catch (err) {
+      if (isBackendOfflineError(err)) throw err;
+      throw err;
+    }
     if (!coverageByTag || typeof coverageByTag !== "object") {
       throw new Error("Tags: invalid backend response");
     }

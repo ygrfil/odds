@@ -621,6 +621,7 @@ dependencies = [
  "anyhow",
  "aya_poker",
  "base64",
+ "json5",
  "rand",
  "rayon",
  "serde",
@@ -641,7 +642,6 @@ name = "odds"
 version = "0.1.0"
 dependencies = [
  "axum",
- "json5",
  "native-sim",
  "rand",
  "rayon",
@@ -651,6 +651,14 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "odds-native-sim-ffi"
+version = "0.1.0"
+dependencies = [
+ "native-sim",
+ "serde_json",
 ]
 
 [[package]]

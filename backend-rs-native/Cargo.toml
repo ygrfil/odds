@@ -12,6 +12,5 @@ tower-http = { version = "0.6.8", features = ["compression-full", "fs", "trace"]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 rand = { version = "0.8.5", features = ["small_rng"] }
-json5 = "0.4.1"
 native-sim = { path = "../native-sim" }
 rayon = "1.10"

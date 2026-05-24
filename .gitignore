@@ -3,3 +3,6 @@ target/
 .codex/
 **/target/
 .bench/
+ios/PokerOddsLab/DerivedData/
+ios/PokerOddsLab/RustBridge/build/
+ios/PokerOddsLab/com.apple.DeveloperTools/

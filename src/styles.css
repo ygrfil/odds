@@ -17,11 +17,14 @@ html {
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
   overflow-x: hidden;
+  width: 100%;
 }
 
 * { box-sizing: border-box; }
 body {
   margin: 0;
+  width: 100%;
+  max-width: 100%;
   height: 100vh;
   height: 100dvh;
   overflow: hidden;
@@ -32,6 +35,7 @@ body {
 }
 
 .app-shell {
+  width: 100%;
   max-width: 1320px;
   height: 100%;
   margin: 0 auto;
@@ -45,16 +49,31 @@ body {
   gap: 8px;
   overflow: hidden;
   position: relative;
+  min-width: 0;
 }
 
 .topbar {
   display: flex;
   justify-content: space-between;
-  align-items: flex-start;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
 }
 
-.topbar h1 { margin: 0; font-size: 24px; line-height: 1.1; }
+.topbar h1 {
+  margin: 0;
+  font-size: 19px;
+  line-height: 1.1;
+  white-space: nowrap;
+}
 .topbar p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
+
+.topbar-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  min-width: 0;
+}
 
 .panel {
   background: var(--panel);
@@ -63,6 +82,8 @@ body {
   padding: 10px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
   min-height: 0;
+  min-width: 0;
+  max-width: 100%;
   overflow: hidden;
 }
 
@@ -83,6 +104,7 @@ h2 { margin: 0 0 8px; font-size: 15px; }
 .controls {
   display: grid;
   gap: 8px;
+  min-width: 0;
 }
 
 .control-row {
@@ -90,6 +112,8 @@ h2 { margin: 0 0 8px; font-size: 15px; }
   gap: 8px;
   align-items: end;
   flex-wrap: wrap;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .compact-btn {
@@ -108,6 +132,8 @@ label {
   gap: 3px;
   font-size: 12px;
   color: var(--muted);
+  min-width: 0;
+  max-width: 100%;
 }
 
 input, select, button, textarea {
@@ -122,6 +148,43 @@ input, select, button, textarea {
 }
 
 input, select { min-width: 130px; }
+
+.native-control-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  min-width: 0;
+  padding: 0;
+  margin: -1px;
+  border: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.variant-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  min-width: 0;
+}
+
+.variant-button {
+  min-width: 0;
+  min-height: 34px;
+  padding: 5px 7px;
+  border-color: #2d4564;
+  color: #cfe0f6;
+  background: #0b1624;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.variant-button.is-active,
+.variant-button[aria-pressed="true"] {
+  border-color: #4fd3bf;
+  color: #062720;
+  background: #5cf0cb;
+}
 
 .grow { flex: 1; }
 .grow input { width: 100%; }
@@ -190,6 +253,10 @@ button.primary {
 .action-row button {
   padding: 5px 8px;
   font-size: 12px;
+}
+
+.action-row #run {
+  flex: 1 0 100%;
 }
 
 #players {
@@ -569,6 +636,8 @@ pre {
   max-height: 96px;
   overflow: hidden;
   align-items: center;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .board-row {
@@ -761,6 +830,26 @@ th { color: var(--muted); font-weight: 700; }
   -webkit-overflow-scrolling: touch;
 }
 
+.settings-card {
+  width: min(460px, 100%);
+}
+
+.settings-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.settings-grid select {
+  width: 100%;
+}
+
+.settings-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  padding-top: 2px;
+}
+
 .help-head {
   display: flex;
   align-items: center;
@@ -930,14 +1019,31 @@ th { color: var(--muted); font-weight: 700; }
 }
 
 @media (max-width: 960px) {
-  .topbar { flex-direction: column; gap: 10px; }
-  .topbar h1 { font-size: 22px; }
+  html,
+  body {
+    max-width: 100vw;
+    overflow-x: clip;
+  }
+  .topbar {
+    flex-direction: row;
+    gap: 8px;
+  }
+  .topbar h1 { font-size: 17px; }
+  .topbar-actions {
+    margin-left: auto;
+  }
   .content-grid { grid-template-columns: 1fr; }
   .control-row {
     width: 100%;
+    max-width: 100%;
+    min-width: 0;
     display: grid;
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
     align-items: stretch;
+  }
+  .control-row > * {
+    min-width: 0;
+    max-width: 100%;
   }
   label { width: 100%; }
   .spacer { display: none; }
@@ -947,9 +1053,31 @@ th { color: var(--muted); font-weight: 700; }
     font-size: 16px;
     min-height: 44px;
   }
+  .player-range-input {
+    font-size: 16px;
+    min-height: 44px;
+    line-height: 1.25;
+  }
   button {
     font-size: 15px;
     min-height: 44px;
+  }
+  .topbar .compact-btn {
+    min-height: 34px;
+    padding: 5px 8px;
+    font-size: 12px;
+  }
+  .variant-strip {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 5px;
+  }
+  .variant-button {
+    min-height: 36px;
+    padding: 5px 4px;
+    font-size: 12px;
+  }
+  .settings-actions {
+    grid-template-columns: 1fr;
   }
   .card-keyboard-trigger {
     width: 44px;
@@ -998,6 +1126,8 @@ th { color: var(--muted); font-weight: 700; }
   .player-main,
   .card-input-row {
     width: 100%;
+    max-width: 100%;
+    min-width: 0;
   }
   .player-main {
     gap: 4px;
@@ -1027,17 +1157,29 @@ th { color: var(--muted); font-weight: 700; }
     display: flex;
     align-items: center;
   }
-  .action-row { gap: 8px; }
-  .action-row button { flex: 1 1 calc(50% - 4px); }
-  #run { flex-basis: 100%; }
+  .action-row {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+  }
+  .action-row button {
+    width: 100%;
+    min-width: 0;
+    white-space: normal;
+  }
+  #run { grid-column: 1 / -1; }
   .range-picks {
+    width: 100%;
+    min-width: 0;
     max-height: none;
     flex-wrap: nowrap;
-    overflow-x: auto;
+    overflow-x: scroll;
     overflow-y: hidden;
     padding-bottom: 2px;
     -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
   }
+  .range-picks::-webkit-scrollbar { display: none; }
   .board-row .range-picks {
     margin-left: 0;
     max-width: 100%;
@@ -1055,19 +1197,23 @@ th { color: var(--muted); font-weight: 700; }
   }
   .status-line { max-width: 100%; }
   body {
-    overflow-x: hidden;
+    overflow-x: clip;
     overflow-y: auto;
     height: auto;
     min-height: 100vh;
     min-height: 100dvh;
   }
   .app-shell {
+    width: 100%;
+    max-width: 100vw;
     height: auto;
     min-height: 100%;
-    overflow: visible;
+    overflow-x: clip;
+    overflow-y: visible;
   }
   .panel {
-    overflow: auto;
+    overflow-x: clip;
+    overflow-y: auto;
     -webkit-overflow-scrolling: touch;
   }
 }

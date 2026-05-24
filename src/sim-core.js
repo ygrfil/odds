@@ -516,105 +516,6 @@ export function previewTagCoreCombos(boardText, variant, tag) {
   return collectTagCoreLabels(board, variant, tagInfo);
 }
 
-export function previewTagCoverage(boardText, variant, tag) {
-  const normalized = normalizeTagToken(tag);
-  if (!normalized) return { matched: 0, total: 0, pct: 0, approx: false };
-  const k = `${variant}|${normalized}|${boardText}`;
-  if (TAG_COVERAGE_CACHE.has(k)) return TAG_COVERAGE_CACHE.get(k);
-  const board = parseCards(boardText || "");
-  if (board.length < 3 || board.length > 5) {
-    const z = { matched: 0, total: 0, pct: 0, approx: false };
-    TAG_COVERAGE_CACHE.set(k, z);
-    return z;
-  }
-
-  const blocked = new Set(board);
-  const deck = ALL_CARDS.filter((c) => !blocked.has(c));
-  const handSize = variantCardCount(variant);
-  const out = exactCoverage(deck, handSize, (hand) => categoryMatch(normalized, hand, board));
-  TAG_COVERAGE_CACHE.set(k, out);
-  return out;
-}
-
-export function previewRangeCoverage(boardText, variant, rangeText, options = {}) {
-  const percentileProfile = String(options?.percentileProfile || "").trim().toLowerCase();
-  const normalizedRange = String(rangeText || "").replace(/\s+/g, "");
-  const cacheKey = `${variant}|${percentileProfile}|${String(boardText || "").trim()}|${normalizedRange}`;
-  if (RANGE_COVERAGE_CACHE.has(cacheKey)) return RANGE_COVERAGE_CACHE.get(cacheKey);
-  if (/^@[a-z0-9_]+\+?$/i.test(normalizedRange)) {
-    const pureTag = normalizeTagToken(normalizedRange);
-    if (pureTag) {
-      const out = previewTagCoverage(boardText, variant, pureTag);
-      RANGE_COVERAGE_CACHE.set(cacheKey, out);
-      return out;
-    }
-  }
-
-  const board = parseCards(boardText || "");
-  if (board.length > 5) {
-    const out = { matched: 0, total: 0, pct: 0, approx: false };
-    RANGE_COVERAGE_CACHE.set(cacheKey, out);
-    return out;
-  }
-  const handSize = variantCardCount(variant);
-  const compiled = compileRange(rangeText || "*", variant, board, { percentileProfile });
-  const helpers = { categoryMatch };
-
-  if (variant !== "holdem") {
-    const blocked = new Set(board);
-    const deck = ALL_CARDS.filter((c) => !blocked.has(c));
-    const baseMask = new Uint8Array(52);
-    for (let i = 0; i < deck.length; i++) baseMask[deck[i]] = 1;
-    const population = nChooseK(deck.length, handSize);
-    if (!normalizedRange || normalizedRange === "*") {
-      const out = { matched: population, total: population, pct: 100, approx: false };
-      RANGE_COVERAGE_CACHE.set(cacheKey, out);
-      return out;
-    }
-    if ((compiled.weight || 0) <= 0) {
-      const out = { matched: 0, total: population, pct: 0, approx: false };
-      RANGE_COVERAGE_CACHE.set(cacheKey, out);
-      return out;
-    }
-
-    // Exact fast-path for plain fixed-pattern ranges (e.g. K9678, AsKdQhJcT).
-    // This avoids high-variance sampling noise on narrow PLO ranges.
-    const fixed = tryParseFixedPattern(rangeText || "*", handSize);
-    if (fixed) {
-      const pool = buildPoolFromFixedPattern(fixed, baseMask);
-      const matched = pool.length;
-      const out = {
-        matched,
-        total: population,
-        pct: population > 0 ? (matched * 100) / population : 0,
-        approx: false
-      };
-      RANGE_COVERAGE_CACHE.set(cacheKey, out);
-      return out;
-    }
-
-    const out = exactCoverage(deck, handSize, (hand) => compiled.predicate(hand, null, helpers));
-    RANGE_COVERAGE_CACHE.set(cacheKey, out);
-    return out;
-  }
-
-  const blocked = new Uint8Array(52);
-  for (const c of board) blocked[c] = 1;
-  let matched = 0;
-  let total = 0;
-  for (let c1 = 0; c1 < 52; c1++) {
-    if (blocked[c1]) continue;
-    for (let c2 = c1 + 1; c2 < 52; c2++) {
-      if (blocked[c2]) continue;
-      total++;
-      if (compiled.predicate([c1, c2], null, helpers)) matched++;
-    }
-  }
-  const out = { matched, total, pct: total > 0 ? (matched * 100) / total : 0, approx: false };
-  RANGE_COVERAGE_CACHE.set(cacheKey, out);
-  return out;
-}
-
 export function previewHoldemStraightDrawRankCombos(boardText, minOuts = 1) {
   if (minOuts <= 1) return previewTagCoreCombos(boardText, "holdem", "@sd");
   if (minOuts <= 4) return previewTagCoreCombos(boardText, "holdem", "@sd4");
@@ -890,7 +791,7 @@ function confidenceHalfWidthPct(it, shares, squares, z) {
   return maxHalf;
 }
 
-export async function runSimulationRaw(config, options = {}) {
+async function runSimulationRaw(config, options = {}) {
   const variant = config.variant;
   const players = config.players;
   const handSize = variantCardCount(variant);
@@ -1088,7 +989,7 @@ export async function runSimulationRaw(config, options = {}) {
   };
 }
 
-export async function runExhaustiveRaw(config, options = {}) {
+async function runExhaustiveRaw(config, options = {}) {
   const variant = config.variant;
   const players = config.players;
   const handSize = variantCardCount(variant);
