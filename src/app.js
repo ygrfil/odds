@@ -39,6 +39,7 @@ const bombpotState = {
 const BOMBPOT_RUNTIME_MULTIPLIER = 1.6;
 const BOMBPOT_RUNTIME_MIN_MS = 20_000;
 const BOMBPOT_RUNTIME_MAX_MS = 900_000;
+const SIM_RUNTIME_MAX_MS = 20_000;
 const TAG_SHORTCUT_REMOTE_CACHE = new Map();
 const TAG_SHORTCUT_REMOTE_INFLIGHT = new Map();
 const TAG_SHORTCUT_BUNDLE_CACHE = new Map();
@@ -2479,6 +2480,7 @@ function currentConfig() {
     confidenceTargetPct: conf.target,
     confidenceMinIterations: conf.min,
     confidenceLevel: 0.95,
+    maxRuntimeMs: SIM_RUNTIME_MAX_MS,
     board: el.board.value.trim(),
     dead: el.dead.value.trim(),
     players: state.players.map((p, i) => ({

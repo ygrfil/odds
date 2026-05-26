@@ -319,6 +319,12 @@ enum Sampler {
         plan: PlanNode,
         weight_pct: u8,
     },
+    SeededPlan {
+        hand_size: usize,
+        seed: CandidateSeed,
+        plan: PlanNode,
+        weight_pct: u8,
+    },
 }
 
 #[derive(Clone)]
@@ -511,14 +517,17 @@ fn request_mode(req: &Request) -> &str {
 fn run_sim_mode(req: &Request) -> Result<Response> {
     validate_request(req)?;
 
+    let start = Instant::now();
+    let deadline = simulation_deadline(start, req.max_runtime_ms);
     let samplers = build_samplers(req)?;
+    if deadline_reached(deadline) {
+        anyhow::bail!("simulation timed out while preparing ranges");
+    }
     let workers = choose_workers(req.workers, req.iteration_cap);
     let seed = req.seed.unwrap_or(0x9E37_79B9_A5A5_1234);
     let conf = confidence_cfg(req);
     let choose = build_choose_table();
     let combo_space = choose[52][variant_hand_size(&req.variant)];
-    let start = Instant::now();
-    let deadline = simulation_deadline(start, req.max_runtime_ms);
 
     let thread_pool = ThreadPoolBuilder::new()
         .num_threads(workers)
@@ -720,6 +729,56 @@ fn run_build_pool_mode(req: &Request) -> Result<Response> {
     }
 
     let cap = req.pool_cap.unwrap_or(320_000).max(1);
+    if req.plan.is_none() {
+        if let Some(range_text) = req.range_text.as_deref() {
+            if let Some(exact) = single_exact_hand_in_range_text(range_text, hand_size)? {
+                let blocked = cards_mask(&req.board) | cards_mask(&req.dead);
+                let total = n_choose_k(52 - req.board.len() - req.dead.len(), hand_size);
+                let conflicts = (cards_mask(&exact) & blocked) != 0;
+                let plan_matches = if conflicts {
+                    false
+                } else {
+                    let raw_plan = compile_range_text_to_plan(
+                        range_text,
+                        &req.variant,
+                        req.percentile_profile.as_deref().unwrap_or_default(),
+                    )?;
+                    match raw_plan {
+                        Some(plan_req) => {
+                            let plan = compile_plan_node(&plan_req)?;
+                            eval_plan(
+                                &plan,
+                                &exact,
+                                &build_choose_table(),
+                                &req.board,
+                                req.variant == "holdem",
+                            )
+                        }
+                        None => true,
+                    }
+                };
+                return Ok(Response {
+                    ok: true,
+                    error: None,
+                    raw: None,
+                    equity_rank: None,
+                    pool_build: Some(PoolBuildOut {
+                        variant: req.variant.clone(),
+                        hand_size,
+                        total,
+                        matched: usize::from(plan_matches),
+                        pool: if plan_matches {
+                            vec![exact]
+                        } else {
+                            Vec::new()
+                        },
+                    }),
+                    coverage: None,
+                    tag_shortcuts: None,
+                });
+            }
+        }
+    }
     let raw_plan;
     let plan_req = if let Some(plan) = req.plan.as_ref() {
         Some(plan)
@@ -813,6 +872,35 @@ fn run_preview_range_mode(req: &Request) -> Result<Response> {
         );
     }
 
+    if req.plan.is_none() {
+        if let Some(range_text) = req.range_text.as_deref() {
+            if let Some(exact) = parse_exact_hand_text(strip_range_weight(range_text).0, hand_size)?
+            {
+                let blocked = cards_mask(&req.board) | cards_mask(&req.dead);
+                let conflicts = (cards_mask(&exact) & blocked) != 0;
+                let total = n_choose_k(52 - req.board.len() - req.dead.len(), hand_size);
+                return Ok(Response {
+                    ok: true,
+                    error: None,
+                    raw: None,
+                    equity_rank: None,
+                    pool_build: None,
+                    coverage: Some(CoverageOut {
+                        matched: usize::from(!conflicts),
+                        total,
+                        pct: if !conflicts && total > 0 {
+                            100.0 / total as f64
+                        } else {
+                            0.0
+                        },
+                        approx: false,
+                    }),
+                    tag_shortcuts: None,
+                });
+            }
+        }
+    }
+
     let raw_plan;
     let plan_req = if let Some(plan) = req.plan.as_ref() {
         Some(plan)
@@ -844,6 +932,49 @@ fn run_preview_range_mode(req: &Request) -> Result<Response> {
     }
 
     let total = n_choose_k(base_deck.len(), hand_size);
+    if let Some(plan_req) = plan_req {
+        if req.plan.is_none() {
+            if let Some(range_text) = req.range_text.as_deref() {
+                if let Some(seeds) =
+                    candidate_seeds_from_range_text(range_text, hand_size, &req.board)?
+                {
+                    let limit = seeded_plan_pool_limit(hand_size);
+                    let work_limit = seeded_plan_work_limit(hand_size);
+                    if estimate_candidate_seed_work_for_req(req, &seeds, hand_size) <= work_limit {
+                        let plan = compile_plan_node(plan_req)?;
+                        if let Some(matched) = count_seeded_filtered_plan_matches(
+                            req,
+                            hand_size,
+                            &seeds,
+                            &plan,
+                            &build_choose_table(),
+                            req.variant == "holdem",
+                            limit,
+                        ) {
+                            return Ok(Response {
+                                ok: true,
+                                error: None,
+                                raw: None,
+                                equity_rank: None,
+                                pool_build: None,
+                                coverage: Some(CoverageOut {
+                                    matched,
+                                    total,
+                                    pct: if total > 0 {
+                                        (matched as f64 * 100.0) / total as f64
+                                    } else {
+                                        0.0
+                                    },
+                                    approx: false,
+                                }),
+                                tag_shortcuts: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
     let matched = if let Some(plan_req) = plan_req {
         if req.board.is_empty() && req.dead.is_empty() {
             if let Some(count) = exact_preflop_count_for_plan(plan_req, &req.variant, hand_size) {
@@ -1123,6 +1254,313 @@ fn strip_range_spaces(s: &str) -> String {
         .filter(|c| !c.is_whitespace())
         .map(|c| if c == '&' { ':' } else { c })
         .collect()
+}
+
+fn parse_exact_hand_text(text: &str, hand_size: usize) -> Result<Option<Vec<u8>>> {
+    let compact = strip_range_spaces(text);
+    if compact.len() != hand_size * 2 {
+        return Ok(None);
+    }
+    let chars: Vec<char> = compact.chars().collect();
+    let mut hand = Vec::with_capacity(hand_size);
+    let mut seen = [false; 52];
+    for i in 0..hand_size {
+        let rank_ch = chars[i * 2];
+        let suit_ch = chars[i * 2 + 1];
+        let Some(rank_idx) = rank_index(rank_ch) else {
+            return Ok(None);
+        };
+        let Some((mode, suit_idx)) = suit_spec(suit_ch) else {
+            return Ok(None);
+        };
+        if mode != 1 {
+            return Ok(None);
+        }
+        let card = (rank_idx as u8 * 4) + suit_idx as u8;
+        if seen[card as usize] {
+            anyhow::bail!("exact hand contains duplicate card");
+        }
+        seen[card as usize] = true;
+        hand.push(card);
+    }
+    Ok(Some(hand))
+}
+
+fn single_exact_hand_in_range_text(text: &str, hand_size: usize) -> Result<Option<Vec<u8>>> {
+    let compact = strip_range_spaces(strip_range_weight(text).0);
+    if compact.is_empty() || compact == "*" {
+        return Ok(None);
+    }
+    let expanded = expand_expr_macros(&compact);
+    let tokens = tokenize_range_expr(&expanded)?;
+    let mut found = None::<Vec<u8>>;
+    for token in tokens {
+        let RangeToken::Atom(atom) = token else {
+            continue;
+        };
+        let Some(mut hand) = parse_exact_hand_text(&atom, hand_size)? else {
+            continue;
+        };
+        hand.sort_unstable();
+        match &found {
+            None => found = Some(hand),
+            Some(prev) if prev == &hand => {}
+            Some(_) => return Ok(None),
+        }
+    }
+    Ok(found)
+}
+
+#[derive(Clone, Debug)]
+enum CandidateSeed {
+    FixedCards(Vec<u8>),
+    PairRank(usize),
+    RankCombo(Vec<usize>),
+}
+
+fn candidate_seeds_from_range_text(
+    text: &str,
+    hand_size: usize,
+    board: &[u8],
+) -> Result<Option<Vec<CandidateSeed>>> {
+    let compact = strip_range_spaces(strip_range_weight(text).0);
+    if compact.is_empty() || compact == "*" {
+        return Ok(None);
+    }
+    let expanded = expand_expr_macros(&compact);
+    let tokens = tokenize_range_expr(&expanded)?;
+    let ast = RangeParser { tokens, pos: 0 }.parse()?;
+    Ok(candidate_seeds_from_ast(&ast, hand_size, board))
+}
+
+fn candidate_seeds_from_ast(
+    ast: &RangeAst,
+    hand_size: usize,
+    board: &[u8],
+) -> Option<Vec<CandidateSeed>> {
+    match ast {
+        RangeAst::Atom(atom) => candidate_seeds_from_atom(atom, hand_size, board),
+        RangeAst::And(left, right) => {
+            let left_seeds = candidate_seeds_from_ast(left, hand_size, board);
+            let right_seeds = candidate_seeds_from_ast(right, hand_size, board);
+            match (left_seeds, right_seeds) {
+                (Some(left), Some(right)) => {
+                    if estimate_candidate_seed_work(&left, hand_size)
+                        <= estimate_candidate_seed_work(&right, hand_size)
+                    {
+                        Some(left)
+                    } else {
+                        Some(right)
+                    }
+                }
+                (Some(seeds), None) | (None, Some(seeds)) => Some(seeds),
+                (None, None) => None,
+            }
+        }
+        RangeAst::Or(left, right) => {
+            let mut left_seeds = candidate_seeds_from_ast(left, hand_size, board)?;
+            let right_seeds = candidate_seeds_from_ast(right, hand_size, board)?;
+            left_seeds.extend(right_seeds);
+            Some(left_seeds)
+        }
+        RangeAst::Not(left, _) => candidate_seeds_from_ast(left, hand_size, board),
+    }
+}
+
+fn candidate_seeds_from_atom(
+    atom: &str,
+    hand_size: usize,
+    board: &[u8],
+) -> Option<Vec<CandidateSeed>> {
+    if parse_percent_top_atom(atom).ok().flatten().is_some()
+        || parse_percent_range_atom(atom).ok().flatten().is_some()
+    {
+        return None;
+    }
+    if let Some(cards) = fixed_cards_seed_from_atom(atom, hand_size).ok().flatten() {
+        return Some(vec![CandidateSeed::FixedCards(cards)]);
+    }
+    if let Some(rank) = pair_rank_seed_from_atom(atom) {
+        return Some(vec![CandidateSeed::PairRank(rank)]);
+    }
+    tag_seeds_from_atom(atom, board)
+}
+
+fn tag_seeds_from_atom(atom: &str, board: &[u8]) -> Option<Vec<CandidateSeed>> {
+    let lower = atom.to_ascii_lowercase();
+    let tag = tag_plan_req(&lower)?;
+    if !matches!(tag.kind, PlanTagKind::TwoPair) || tag.plus {
+        return None;
+    }
+    if board.len() < 3 {
+        return None;
+    }
+    let mut ranks = board
+        .iter()
+        .map(|card| rank_index_for_card(*card))
+        .collect::<Vec<_>>();
+    ranks.sort_unstable();
+    ranks.dedup();
+    if ranks.len() != board.len() {
+        return None;
+    }
+
+    let mut seeds = Vec::<CandidateSeed>::new();
+    for i in 0..ranks.len() {
+        for j in (i + 1)..ranks.len() {
+            seeds.push(CandidateSeed::RankCombo(vec![ranks[i], ranks[j]]));
+        }
+    }
+    if seeds.is_empty() {
+        None
+    } else {
+        Some(seeds)
+    }
+}
+
+fn fixed_cards_seed_from_atom(atom: &str, hand_size: usize) -> Result<Option<Vec<u8>>> {
+    let compact = strip_range_spaces(atom);
+    if compact.len() < 2 || compact.len() > hand_size * 2 || compact.len() % 2 != 0 {
+        return Ok(None);
+    }
+    let chars: Vec<char> = compact.chars().collect();
+    let mut cards = Vec::with_capacity(chars.len() / 2);
+    let mut seen = [false; 52];
+    for pair in chars.chunks_exact(2) {
+        let Some(rank_idx) = rank_index(pair[0]) else {
+            return Ok(None);
+        };
+        let Some((mode, suit_idx)) = suit_spec(pair[1]) else {
+            return Ok(None);
+        };
+        if mode != 1 {
+            return Ok(None);
+        }
+        let card = (rank_idx as u8 * 4) + suit_idx as u8;
+        if seen[card as usize] {
+            anyhow::bail!("fixed-card range contains duplicate card");
+        }
+        seen[card as usize] = true;
+        cards.push(card);
+    }
+    cards.sort_unstable();
+    Ok(Some(cards))
+}
+
+fn pair_rank_seed_from_atom(atom: &str) -> Option<usize> {
+    let chars: Vec<char> = atom.chars().collect();
+    if chars.len() == 2 && is_rank_char(chars[0]) && chars[0].eq_ignore_ascii_case(&chars[1]) {
+        rank_index(chars[0])
+    } else {
+        None
+    }
+}
+
+fn estimate_candidate_seed_work(seeds: &[CandidateSeed], hand_size: usize) -> usize {
+    seeds
+        .iter()
+        .map(|seed| match seed {
+            CandidateSeed::FixedCards(cards) => {
+                if cards.len() > hand_size {
+                    0
+                } else {
+                    n_choose_k(52usize.saturating_sub(cards.len()), hand_size - cards.len())
+                }
+            }
+            CandidateSeed::PairRank(_) => {
+                if hand_size < 2 {
+                    0
+                } else {
+                    n_choose_k(4, 2) * n_choose_k(48, hand_size - 2)
+                }
+            }
+            CandidateSeed::RankCombo(ranks) => {
+                if ranks.len() > hand_size {
+                    0
+                } else {
+                    4usize.saturating_pow(ranks.len() as u32)
+                        * n_choose_k(52usize.saturating_sub(ranks.len()), hand_size - ranks.len())
+                }
+            }
+        })
+        .sum()
+}
+
+fn estimate_candidate_seed_work_for_req(
+    req: &Request,
+    seeds: &[CandidateSeed],
+    hand_size: usize,
+) -> usize {
+    let blocked_mask = cards_mask(&req.board) | cards_mask(&req.dead);
+    let base_len = 52usize.saturating_sub(blocked_mask.count_ones() as usize);
+    seeds
+        .iter()
+        .map(|seed| match seed {
+            CandidateSeed::FixedCards(cards) => {
+                let fixed_mask = cards_mask(cards);
+                if cards.len() > hand_size
+                    || fixed_mask.count_ones() as usize != cards.len()
+                    || (fixed_mask & blocked_mask) != 0
+                {
+                    0
+                } else {
+                    n_choose_k(
+                        base_len.saturating_sub(cards.len()),
+                        hand_size - cards.len(),
+                    )
+                }
+            }
+            CandidateSeed::PairRank(rank) => {
+                if hand_size < 2 {
+                    0
+                } else {
+                    let available_rank_cards = (0u8..52u8)
+                        .filter(|card| {
+                            rank_index_for_card(*card) == *rank
+                                && (blocked_mask & (1u64 << *card)) == 0
+                        })
+                        .count();
+                    if available_rank_cards < 2 {
+                        0
+                    } else {
+                        n_choose_k(available_rank_cards, 2)
+                            * n_choose_k(base_len.saturating_sub(2), hand_size - 2)
+                    }
+                }
+            }
+            CandidateSeed::RankCombo(ranks) => {
+                if ranks.is_empty() || ranks.len() > hand_size {
+                    0
+                } else {
+                    let mut unique = ranks.clone();
+                    unique.sort_unstable();
+                    unique.dedup();
+                    if unique.len() != ranks.len() {
+                        0
+                    } else {
+                        let mut ways = 1usize;
+                        for rank in ranks {
+                            let available_rank_cards = (0u8..52u8)
+                                .filter(|card| {
+                                    rank_index_for_card(*card) == *rank
+                                        && (blocked_mask & (1u64 << *card)) == 0
+                                })
+                                .count();
+                            if available_rank_cards == 0 {
+                                ways = 0;
+                                break;
+                            }
+                            ways = ways.saturating_mul(available_rank_cards);
+                        }
+                        ways.saturating_mul(n_choose_k(
+                            base_len.saturating_sub(ranks.len()),
+                            hand_size - ranks.len(),
+                        ))
+                    }
+                }
+            }
+        })
+        .sum()
 }
 
 fn expand_expr_macros(expr: &str) -> String {
@@ -2780,6 +3218,21 @@ fn build_samplers(req: &Request) -> Result<Vec<Sampler>> {
                     .as_deref()
                     .with_context(|| format!("player {} range_text is missing", i + 1))?;
                 let range_text = strip_range_weight(raw).0;
+                if let Some(mut hand) = parse_exact_hand_text(range_text, p.hand_size)? {
+                    hand.sort_unstable();
+                    let blocked = cards_mask(&req.board) | cards_mask(&req.dead);
+                    if (cards_mask(&hand) & blocked) != 0 {
+                        anyhow::bail!(
+                            "player {} exact hand conflicts with board/dead cards",
+                            i + 1
+                        );
+                    }
+                    return Ok(Sampler::Pool {
+                        hand_size: p.hand_size,
+                        pool: vec![PoolEntry::new(&hand)],
+                        weight_pct,
+                    });
+                }
                 let plan_req = compile_range_text_to_plan(
                     range_text,
                     &req.variant,
@@ -2795,6 +3248,71 @@ fn build_samplers(req: &Request) -> Result<Vec<Sampler>> {
                 let plan = compile_plan_node(&plan_req)
                     .with_context(|| format!("player {} range is invalid", i + 1))?;
                 let has_pct = plan_has_pct_bits(&plan);
+                if let Some(seeds) =
+                    candidate_seeds_from_range_text(range_text, p.hand_size, &req.board)?
+                {
+                    if seeds.len() == 1 {
+                        let seed = seeds[0].clone();
+                        if let CandidateSeed::FixedCards(cards) = &seed {
+                            if cards.len() == p.hand_size {
+                                let blocked = cards_mask(&req.board) | cards_mask(&req.dead);
+                                let plan_matches = (cards_mask(cards) & blocked) == 0
+                                    && eval_plan(&plan, cards, &choose, &req.board, is_holdem);
+                                if !plan_matches {
+                                    anyhow::bail!(
+                                        "player {} range appears empty on this board/dead setup",
+                                        i + 1
+                                    );
+                                }
+                                return Ok(Sampler::Pool {
+                                    hand_size: p.hand_size,
+                                    pool: vec![PoolEntry::new(cards)],
+                                    weight_pct,
+                                });
+                            }
+                        }
+                        return Ok(Sampler::SeededPlan {
+                            hand_size: p.hand_size,
+                            seed,
+                            plan,
+                            weight_pct,
+                        });
+                    }
+                    let limit = seeded_plan_pool_limit(p.hand_size);
+                    let work_limit = seeded_plan_work_limit(p.hand_size);
+                    if estimate_candidate_seed_work_for_req(req, &seeds, p.hand_size) <= work_limit
+                    {
+                        match collect_seeded_filtered_plan_pool(
+                            req,
+                            p.hand_size,
+                            &seeds,
+                            &plan,
+                            &choose,
+                            is_holdem,
+                            limit,
+                        )? {
+                            SmallPlanPool::Empty => anyhow::bail!(
+                                "player {} range appears empty on this board/dead setup",
+                                i + 1
+                            ),
+                            SmallPlanPool::Small(mut pool) => {
+                                pool.sort_unstable();
+                                pool.dedup();
+                                pool.shrink_to_fit();
+                                let pool = pool
+                                    .into_iter()
+                                    .map(|cards| PoolEntry::new(&cards))
+                                    .collect();
+                                return Ok(Sampler::Pool {
+                                    hand_size: p.hand_size,
+                                    pool,
+                                    weight_pct,
+                                });
+                            }
+                            SmallPlanPool::Large => {}
+                        }
+                    }
+                }
                 let try_small_pool = !has_pct;
                 if try_small_pool {
                     let limit = small_plan_pool_limit(p.hand_size);
@@ -2956,6 +3474,690 @@ fn small_plan_pool_limit(hand_size: usize) -> usize {
         6 => 60_000,
         _ => 40_000,
     }
+}
+
+fn seeded_plan_pool_limit(hand_size: usize) -> usize {
+    match hand_size {
+        2 => 80_000,
+        4 => 400_000,
+        5 => 900_000,
+        6 => 1_600_000,
+        _ => 400_000,
+    }
+}
+
+fn seeded_plan_work_limit(hand_size: usize) -> usize {
+    match hand_size {
+        2 => 120_000,
+        4 => 800_000,
+        5 => 1_200_000,
+        6 => 5_500_000,
+        _ => 800_000,
+    }
+}
+
+fn collect_seeded_filtered_plan_pool(
+    req: &Request,
+    hand_size: usize,
+    seeds: &[CandidateSeed],
+    full_plan: &PlanNode,
+    choose: &ChooseTable,
+    is_holdem: bool,
+    limit: usize,
+) -> Result<SmallPlanPool> {
+    if seeds.is_empty() || hand_size == 0 {
+        return Ok(SmallPlanPool::Empty);
+    }
+
+    let blocked_mask = cards_mask(&req.board) | cards_mask(&req.dead);
+    let mut base = Vec::<u8>::with_capacity(52 - req.board.len() - req.dead.len());
+    for card in 0u8..52u8 {
+        if (blocked_mask & (1u64 << card)) == 0 {
+            base.push(card);
+        }
+    }
+    if base.len() < hand_size {
+        return Ok(SmallPlanPool::Empty);
+    }
+
+    let mut seen = BTreeSet::<u64>::new();
+    let mut pool = Vec::<Vec<u8>>::new();
+    let mut overflow = false;
+    for seed in seeds {
+        match seed {
+            CandidateSeed::FixedCards(cards) => {
+                collect_fixed_seed_filtered_plan_pool(
+                    cards,
+                    &base,
+                    hand_size,
+                    full_plan,
+                    choose,
+                    &req.board,
+                    is_holdem,
+                    limit,
+                    &mut seen,
+                    &mut pool,
+                    &mut overflow,
+                );
+            }
+            CandidateSeed::PairRank(pair_rank) => {
+                collect_pair_seed_filtered_plan_pool(
+                    *pair_rank,
+                    &base,
+                    hand_size,
+                    full_plan,
+                    choose,
+                    &req.board,
+                    is_holdem,
+                    limit,
+                    &mut seen,
+                    &mut pool,
+                    &mut overflow,
+                );
+            }
+            CandidateSeed::RankCombo(ranks) => {
+                collect_rank_combo_seed_filtered_plan_pool(
+                    ranks,
+                    &base,
+                    hand_size,
+                    full_plan,
+                    choose,
+                    &req.board,
+                    is_holdem,
+                    limit,
+                    &mut seen,
+                    &mut pool,
+                    &mut overflow,
+                );
+            }
+        }
+        if overflow {
+            return Ok(SmallPlanPool::Large);
+        }
+    }
+
+    if pool.is_empty() {
+        Ok(SmallPlanPool::Empty)
+    } else {
+        Ok(SmallPlanPool::Small(pool))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_fixed_seed_filtered_plan_pool(
+    fixed_cards: &[u8],
+    base: &[u8],
+    hand_size: usize,
+    full_plan: &PlanNode,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+    limit: usize,
+    seen: &mut BTreeSet<u64>,
+    pool: &mut Vec<Vec<u8>>,
+    overflow: &mut bool,
+) {
+    if fixed_cards.len() > hand_size || *overflow {
+        return;
+    }
+    let fixed_mask = cards_mask(fixed_cards);
+    if fixed_mask.count_ones() as usize != fixed_cards.len() {
+        return;
+    }
+    let mut hand = fixed_cards.to_vec();
+    collect_seed_fill_filtered_plan_pool(
+        0,
+        base,
+        hand_size,
+        full_plan,
+        choose,
+        board,
+        is_holdem,
+        limit.max(1),
+        &mut hand,
+        seen,
+        pool,
+        overflow,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_pair_seed_filtered_plan_pool(
+    pair_rank: usize,
+    base: &[u8],
+    hand_size: usize,
+    full_plan: &PlanNode,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+    limit: usize,
+    seen: &mut BTreeSet<u64>,
+    pool: &mut Vec<Vec<u8>>,
+    overflow: &mut bool,
+) {
+    if hand_size < 2 || *overflow {
+        return;
+    }
+    let pair_cards: Vec<u8> = base
+        .iter()
+        .copied()
+        .filter(|card| rank_index_for_card(*card) == pair_rank)
+        .collect();
+    if pair_cards.len() < 2 {
+        return;
+    }
+    for i in 0..pair_cards.len() {
+        for j in (i + 1)..pair_cards.len() {
+            let mut hand = vec![pair_cards[i], pair_cards[j]];
+            collect_seed_fill_filtered_plan_pool(
+                0,
+                base,
+                hand_size,
+                full_plan,
+                choose,
+                board,
+                is_holdem,
+                limit.max(1),
+                &mut hand,
+                seen,
+                pool,
+                overflow,
+            );
+            if *overflow {
+                return;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_rank_combo_seed_filtered_plan_pool(
+    ranks: &[usize],
+    base: &[u8],
+    hand_size: usize,
+    full_plan: &PlanNode,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+    limit: usize,
+    seen: &mut BTreeSet<u64>,
+    pool: &mut Vec<Vec<u8>>,
+    overflow: &mut bool,
+) {
+    if ranks.is_empty() || ranks.len() > hand_size || *overflow {
+        return;
+    }
+    let mut unique = ranks.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.len() != ranks.len() {
+        return;
+    }
+    let rank_cards = ranks
+        .iter()
+        .map(|rank| {
+            base.iter()
+                .copied()
+                .filter(|card| rank_index_for_card(*card) == *rank)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    if rank_cards.iter().any(Vec::is_empty) {
+        return;
+    }
+    let mut hand = Vec::<u8>::with_capacity(hand_size);
+    collect_rank_combo_choices_filtered_plan_pool(
+        0,
+        &rank_cards,
+        base,
+        hand_size,
+        full_plan,
+        choose,
+        board,
+        is_holdem,
+        limit.max(1),
+        &mut hand,
+        seen,
+        pool,
+        overflow,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_rank_combo_choices_filtered_plan_pool(
+    rank_idx: usize,
+    rank_cards: &[Vec<u8>],
+    base: &[u8],
+    hand_size: usize,
+    full_plan: &PlanNode,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+    limit: usize,
+    hand: &mut Vec<u8>,
+    seen: &mut BTreeSet<u64>,
+    pool: &mut Vec<Vec<u8>>,
+    overflow: &mut bool,
+) {
+    if *overflow {
+        return;
+    }
+    if rank_idx == rank_cards.len() {
+        collect_seed_fill_filtered_plan_pool(
+            0, base, hand_size, full_plan, choose, board, is_holdem, limit, hand, seen, pool,
+            overflow,
+        );
+        return;
+    }
+    for &card in &rank_cards[rank_idx] {
+        if hand.contains(&card) {
+            continue;
+        }
+        hand.push(card);
+        collect_rank_combo_choices_filtered_plan_pool(
+            rank_idx + 1,
+            rank_cards,
+            base,
+            hand_size,
+            full_plan,
+            choose,
+            board,
+            is_holdem,
+            limit,
+            hand,
+            seen,
+            pool,
+            overflow,
+        );
+        hand.pop();
+        if *overflow {
+            return;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_seed_fill_filtered_plan_pool(
+    start: usize,
+    base: &[u8],
+    hand_size: usize,
+    full_plan: &PlanNode,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+    limit: usize,
+    hand: &mut Vec<u8>,
+    seen: &mut BTreeSet<u64>,
+    pool: &mut Vec<Vec<u8>>,
+    overflow: &mut bool,
+) {
+    if *overflow {
+        return;
+    }
+    if hand.len() == hand_size {
+        let mut sorted = hand.clone();
+        sorted.sort_unstable();
+        if eval_plan(full_plan, &sorted, choose, board, is_holdem) {
+            let mask = cards_mask(&sorted);
+            if seen.insert(mask) {
+                if pool.len() >= limit {
+                    *overflow = true;
+                    return;
+                }
+                pool.push(sorted);
+            }
+        }
+        return;
+    }
+
+    let need = hand_size - hand.len();
+    if base.len() < need || start > base.len() - need {
+        return;
+    }
+    let used = cards_mask(hand);
+    for i in start..=base.len() - need {
+        let card = base[i];
+        if (used & (1u64 << card)) != 0 {
+            continue;
+        }
+        hand.push(card);
+        collect_seed_fill_filtered_plan_pool(
+            i + 1,
+            base,
+            hand_size,
+            full_plan,
+            choose,
+            board,
+            is_holdem,
+            limit,
+            hand,
+            seen,
+            pool,
+            overflow,
+        );
+        hand.pop();
+        if *overflow {
+            return;
+        }
+    }
+}
+
+fn count_seeded_filtered_plan_matches(
+    req: &Request,
+    hand_size: usize,
+    seeds: &[CandidateSeed],
+    full_plan: &PlanNode,
+    choose: &ChooseTable,
+    is_holdem: bool,
+    limit: usize,
+) -> Option<usize> {
+    if seeds.is_empty() || hand_size == 0 {
+        return Some(0);
+    }
+    let blocked_mask = cards_mask(&req.board) | cards_mask(&req.dead);
+    let mut base = Vec::<u8>::with_capacity(52 - req.board.len() - req.dead.len());
+    for card in 0u8..52u8 {
+        if (blocked_mask & (1u64 << card)) == 0 {
+            base.push(card);
+        }
+    }
+    if base.len() < hand_size {
+        return Some(0);
+    }
+
+    let mut seen = BTreeSet::<u64>::new();
+    let mut overflow = false;
+    for seed in seeds {
+        match seed {
+            CandidateSeed::FixedCards(cards) => {
+                count_fixed_seed_filtered_plan_matches(
+                    cards,
+                    &base,
+                    hand_size,
+                    full_plan,
+                    choose,
+                    &req.board,
+                    is_holdem,
+                    limit,
+                    &mut seen,
+                    &mut overflow,
+                );
+            }
+            CandidateSeed::PairRank(pair_rank) => {
+                count_pair_seed_filtered_plan_matches(
+                    *pair_rank,
+                    &base,
+                    hand_size,
+                    full_plan,
+                    choose,
+                    &req.board,
+                    is_holdem,
+                    limit,
+                    &mut seen,
+                    &mut overflow,
+                );
+            }
+            CandidateSeed::RankCombo(ranks) => {
+                count_rank_combo_seed_filtered_plan_matches(
+                    ranks,
+                    &base,
+                    hand_size,
+                    full_plan,
+                    choose,
+                    &req.board,
+                    is_holdem,
+                    limit,
+                    &mut seen,
+                    &mut overflow,
+                );
+            }
+        }
+        if overflow {
+            return None;
+        }
+    }
+    Some(seen.len())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn count_fixed_seed_filtered_plan_matches(
+    fixed_cards: &[u8],
+    base: &[u8],
+    hand_size: usize,
+    full_plan: &PlanNode,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+    limit: usize,
+    seen: &mut BTreeSet<u64>,
+    overflow: &mut bool,
+) {
+    if fixed_cards.len() > hand_size || *overflow {
+        return;
+    }
+    let mut hand = fixed_cards.to_vec();
+    count_seed_fill_filtered_plan_matches(
+        0,
+        base,
+        hand_size,
+        full_plan,
+        choose,
+        board,
+        is_holdem,
+        limit.max(1),
+        &mut hand,
+        seen,
+        overflow,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn count_pair_seed_filtered_plan_matches(
+    pair_rank: usize,
+    base: &[u8],
+    hand_size: usize,
+    full_plan: &PlanNode,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+    limit: usize,
+    seen: &mut BTreeSet<u64>,
+    overflow: &mut bool,
+) {
+    if hand_size < 2 || *overflow {
+        return;
+    }
+    let pair_cards: Vec<u8> = base
+        .iter()
+        .copied()
+        .filter(|card| rank_index_for_card(*card) == pair_rank)
+        .collect();
+    for i in 0..pair_cards.len() {
+        for j in (i + 1)..pair_cards.len() {
+            let mut hand = vec![pair_cards[i], pair_cards[j]];
+            count_seed_fill_filtered_plan_matches(
+                0,
+                base,
+                hand_size,
+                full_plan,
+                choose,
+                board,
+                is_holdem,
+                limit.max(1),
+                &mut hand,
+                seen,
+                overflow,
+            );
+            if *overflow {
+                return;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn count_rank_combo_seed_filtered_plan_matches(
+    ranks: &[usize],
+    base: &[u8],
+    hand_size: usize,
+    full_plan: &PlanNode,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+    limit: usize,
+    seen: &mut BTreeSet<u64>,
+    overflow: &mut bool,
+) {
+    if ranks.is_empty() || ranks.len() > hand_size || *overflow {
+        return;
+    }
+    let mut unique = ranks.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.len() != ranks.len() {
+        return;
+    }
+    let rank_cards = ranks
+        .iter()
+        .map(|rank| {
+            base.iter()
+                .copied()
+                .filter(|card| rank_index_for_card(*card) == *rank)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    if rank_cards.iter().any(Vec::is_empty) {
+        return;
+    }
+    let mut hand = Vec::<u8>::with_capacity(hand_size);
+    count_rank_combo_choices_filtered_plan_matches(
+        0,
+        &rank_cards,
+        base,
+        hand_size,
+        full_plan,
+        choose,
+        board,
+        is_holdem,
+        limit.max(1),
+        &mut hand,
+        seen,
+        overflow,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn count_rank_combo_choices_filtered_plan_matches(
+    rank_idx: usize,
+    rank_cards: &[Vec<u8>],
+    base: &[u8],
+    hand_size: usize,
+    full_plan: &PlanNode,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+    limit: usize,
+    hand: &mut Vec<u8>,
+    seen: &mut BTreeSet<u64>,
+    overflow: &mut bool,
+) {
+    if *overflow {
+        return;
+    }
+    if rank_idx == rank_cards.len() {
+        count_seed_fill_filtered_plan_matches(
+            0, base, hand_size, full_plan, choose, board, is_holdem, limit, hand, seen, overflow,
+        );
+        return;
+    }
+    for &card in &rank_cards[rank_idx] {
+        if hand.contains(&card) {
+            continue;
+        }
+        hand.push(card);
+        count_rank_combo_choices_filtered_plan_matches(
+            rank_idx + 1,
+            rank_cards,
+            base,
+            hand_size,
+            full_plan,
+            choose,
+            board,
+            is_holdem,
+            limit,
+            hand,
+            seen,
+            overflow,
+        );
+        hand.pop();
+        if *overflow {
+            return;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn count_seed_fill_filtered_plan_matches(
+    start: usize,
+    base: &[u8],
+    hand_size: usize,
+    full_plan: &PlanNode,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+    limit: usize,
+    hand: &mut Vec<u8>,
+    seen: &mut BTreeSet<u64>,
+    overflow: &mut bool,
+) {
+    if *overflow {
+        return;
+    }
+    if hand.len() == hand_size {
+        let mut sorted = hand.clone();
+        sorted.sort_unstable();
+        if eval_plan(full_plan, &sorted, choose, board, is_holdem) {
+            let mask = cards_mask(&sorted);
+            if seen.insert(mask) && seen.len() > limit {
+                *overflow = true;
+            }
+        }
+        return;
+    }
+
+    let need = hand_size - hand.len();
+    if base.len() < need || start > base.len() - need {
+        return;
+    }
+    let used = cards_mask(hand);
+    for i in start..=base.len() - need {
+        let card = base[i];
+        if (used & (1u64 << card)) != 0 {
+            continue;
+        }
+        hand.push(card);
+        count_seed_fill_filtered_plan_matches(
+            i + 1,
+            base,
+            hand_size,
+            full_plan,
+            choose,
+            board,
+            is_holdem,
+            limit,
+            hand,
+            seen,
+            overflow,
+        );
+        hand.pop();
+        if *overflow {
+            return;
+        }
+    }
+}
+
+fn rank_index_for_card(card: u8) -> usize {
+    (card / 4) as usize
 }
 
 fn collect_small_plan_pool(
@@ -3149,6 +4351,23 @@ fn simulate_partition(
                     &req.board,
                     is_holdem,
                 ),
+                Sampler::SeededPlan {
+                    hand_size,
+                    seed,
+                    plan,
+                    weight_pct,
+                } => sample_from_seeded_plan(
+                    *hand_size,
+                    seed,
+                    plan,
+                    *weight_pct,
+                    &blocked,
+                    &mut rng,
+                    hand,
+                    choose,
+                    &req.board,
+                    is_holdem,
+                ),
             };
             if !ok {
                 failed = true;
@@ -3296,10 +4515,12 @@ fn sampler_hand_size(s: &Sampler) -> usize {
         Sampler::All { hand_size, .. } => *hand_size,
         Sampler::Pool { hand_size, .. } => *hand_size,
         Sampler::Plan { hand_size, .. } => *hand_size,
+        Sampler::SeededPlan { hand_size, .. } => *hand_size,
     }
 }
 
 const PLAN_RANDOM_TRIES: usize = 384;
+const PLAN_EXHAUSTIVE_COMBO_LIMIT: usize = 250_000;
 
 fn accept_weight(weight_pct: u8, rng: &mut SmallRng) -> bool {
     weight_pct >= 100 || rng.gen_range(0u8..100u8) < weight_pct
@@ -3379,9 +4600,178 @@ fn sample_from_plan(
             return true;
         }
     }
+    if n_choose_k(avail.len(), hand_size) > PLAN_EXHAUSTIVE_COMBO_LIMIT {
+        return false;
+    }
     sample_from_plan_exhaustive_from_avail(
         &avail, hand_size, plan, weight_pct, rng, out, choose, board, is_holdem,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sample_from_seeded_plan(
+    hand_size: usize,
+    seed: &CandidateSeed,
+    plan: &PlanNode,
+    weight_pct: u8,
+    used: &[bool; 52],
+    rng: &mut SmallRng,
+    out: &mut Vec<u8>,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+) -> bool {
+    match seed {
+        CandidateSeed::FixedCards(cards) => sample_from_fixed_seeded_plan(
+            hand_size, cards, plan, weight_pct, used, rng, out, choose, board, is_holdem,
+        ),
+        CandidateSeed::PairRank(pair_rank) => sample_from_pair_seeded_plan(
+            hand_size, *pair_rank, plan, weight_pct, used, rng, out, choose, board, is_holdem,
+        ),
+        CandidateSeed::RankCombo(ranks) => sample_from_rank_combo_seeded_plan(
+            hand_size, ranks, plan, weight_pct, used, rng, out, choose, board, is_holdem,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sample_from_fixed_seeded_plan(
+    hand_size: usize,
+    fixed_cards: &[u8],
+    plan: &PlanNode,
+    weight_pct: u8,
+    used: &[bool; 52],
+    rng: &mut SmallRng,
+    out: &mut Vec<u8>,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+) -> bool {
+    if fixed_cards.len() > hand_size {
+        return false;
+    }
+    for &card in fixed_cards {
+        if used[card as usize] {
+            return false;
+        }
+    }
+    let tries = PLAN_RANDOM_TRIES.saturating_mul(weight_try_budget(weight_pct).max(1));
+    for _ in 0..tries {
+        out.clear();
+        out.extend_from_slice(fixed_cards);
+        if !sample_remaining_cards(hand_size, used, rng, out) {
+            return false;
+        }
+        out.sort_unstable();
+        if eval_plan(plan, out, choose, board, is_holdem) && accept_weight(weight_pct, rng) {
+            return true;
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sample_from_pair_seeded_plan(
+    hand_size: usize,
+    pair_rank: usize,
+    plan: &PlanNode,
+    weight_pct: u8,
+    used: &[bool; 52],
+    rng: &mut SmallRng,
+    out: &mut Vec<u8>,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+) -> bool {
+    if hand_size < 2 {
+        return false;
+    }
+    let tries = PLAN_RANDOM_TRIES.saturating_mul(weight_try_budget(weight_pct).max(1));
+    for _ in 0..tries {
+        if !sample_random_hand(hand_size, used, rng, out) {
+            return false;
+        }
+        let rank_count = out
+            .iter()
+            .filter(|card| rank_index_for_card(**card) == pair_rank)
+            .count();
+        if rank_count >= 2
+            && eval_plan(plan, out, choose, board, is_holdem)
+            && accept_weight(weight_pct, rng)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sample_from_rank_combo_seeded_plan(
+    hand_size: usize,
+    ranks: &[usize],
+    plan: &PlanNode,
+    weight_pct: u8,
+    used: &[bool; 52],
+    rng: &mut SmallRng,
+    out: &mut Vec<u8>,
+    choose: &ChooseTable,
+    board: &[u8],
+    is_holdem: bool,
+) -> bool {
+    if ranks.is_empty() || ranks.len() > hand_size {
+        return false;
+    }
+    let tries = PLAN_RANDOM_TRIES.saturating_mul(weight_try_budget(weight_pct).max(1));
+    for _ in 0..tries {
+        if !sample_random_hand(hand_size, used, rng, out) {
+            return false;
+        }
+        let has_all_ranks = ranks
+            .iter()
+            .all(|rank| out.iter().any(|card| rank_index_for_card(*card) == *rank));
+        if has_all_ranks
+            && eval_plan(plan, out, choose, board, is_holdem)
+            && accept_weight(weight_pct, rng)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn sample_remaining_cards(
+    hand_size: usize,
+    used: &[bool; 52],
+    rng: &mut SmallRng,
+    out: &mut Vec<u8>,
+) -> bool {
+    if out.len() > hand_size {
+        return false;
+    }
+    let mut local_used = *used;
+    for &card in out.iter() {
+        if local_used[card as usize] {
+            return false;
+        }
+        local_used[card as usize] = true;
+    }
+    while out.len() < hand_size {
+        let mut avail = [0u8; 52];
+        let mut n = 0usize;
+        for card in 0u8..52u8 {
+            if !local_used[card as usize] {
+                avail[n] = card;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return false;
+        }
+        let card = avail[rng.gen_range(0..n)];
+        local_used[card as usize] = true;
+        out.push(card);
+    }
+    true
 }
 
 fn sample_from_plan_exhaustive_from_avail(
@@ -4335,6 +5725,146 @@ mod tests {
         assert!(combos.iter().any(|v| v.as_str() == Some("46")));
         assert!(combos.iter().any(|v| v.as_str() == Some("47")));
         assert!(combos.iter().any(|v| v.as_str() == Some("67")));
+    }
+
+    #[test]
+    fn exact_plo4_text_builds_single_pool_without_range_enumeration() {
+        let out = run_request_value(json!({
+            "mode": "build-pool",
+            "variant": "plo4",
+            "hand_size": 4,
+            "board": [],
+            "dead": [],
+            "range_text": "askdjh5h",
+            "pool_cap": 10
+        }));
+
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["pool_build"]["matched"], 1);
+        assert_eq!(out["pool_build"]["pool"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sim_mode_accepts_exact_plo6_text_fast_path() {
+        let out = run_request_value(json!({
+            "mode": "sim",
+            "variant": "plo6",
+            "iteration_cap": 128,
+            "board": [],
+            "dead": [],
+            "percentile_profile": "ours",
+            "players": [
+                { "mode": "range", "hand_size": 6, "range_text": "AsKdQhJc5s4d" },
+                { "mode": "range", "hand_size": 6, "range_text": "30%" }
+            ],
+            "seed": 12345
+        }));
+
+        assert_eq!(out["ok"], true);
+        assert!(out["raw"]["iterations"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(out["raw"]["combo_counts"][0], 1);
+    }
+
+    #[test]
+    fn sim_mode_accepts_percent_scoped_pair_fast_path() {
+        let out = run_request_value(json!({
+            "mode": "sim",
+            "variant": "plo6",
+            "iteration_cap": 128,
+            "board": [],
+            "dead": [],
+            "percentile_profile": "ours",
+            "players": [
+                { "mode": "range", "hand_size": 6, "range_text": "42%:(AA)" },
+                { "mode": "range", "hand_size": 6, "range_text": "30%" }
+            ],
+            "seed": 12345
+        }));
+
+        assert_eq!(out["ok"], true);
+        assert!(out["raw"]["iterations"].as_u64().unwrap_or(0) > 0);
+        assert!(out["raw"]["combo_counts"][0].as_u64().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn preview_range_counts_percent_scoped_pair_from_seeded_pool() {
+        let out = run_request_value(json!({
+            "mode": "preview-range",
+            "variant": "plo6",
+            "hand_size": 6,
+            "board": [],
+            "dead": [],
+            "percentile_profile": "ours",
+            "range_text": "42%:(AA)"
+        }));
+
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["coverage"]["approx"], false);
+        assert!(out["coverage"]["matched"].as_u64().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn preview_range_counts_percent_scoped_two_pair_tag_from_seeded_pool() {
+        let out = run_request_value(json!({
+            "mode": "preview-range",
+            "variant": "plo5",
+            "hand_size": 5,
+            "board": [2, 6, 34],
+            "dead": [],
+            "percentile_profile": "ours",
+            "range_text": "30%:(@2p)"
+        }));
+
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["coverage"]["approx"], false);
+        assert_eq!(out["coverage"]["matched"], 46_737);
+    }
+
+    #[test]
+    fn sim_mode_handles_percent_scoped_tag_vs_partial_cards_fast_path() {
+        let out = run_request_value(json!({
+            "mode": "sim",
+            "variant": "plo5",
+            "iteration_cap": 64_000,
+            "board": [2, 6, 34],
+            "dead": [],
+            "percentile_profile": "ours",
+            "confidence_target_pct": 0.2,
+            "confidence_min_iters": 4_000,
+            "confidence_level": 0.95,
+            "max_runtime_ms": 20_000,
+            "players": [
+                { "mode": "range", "hand_size": 5, "range_text": "30%:(@2p)" },
+                { "mode": "range", "hand_size": 5, "range_text": "100%:(5s4s6h7h)" }
+            ],
+            "seed": 12345
+        }));
+
+        assert_eq!(out["ok"], true);
+        assert!(out["raw"]["iterations"].as_u64().unwrap_or(0) > 0);
+        assert!(out["raw"]["combo_counts"][0].as_u64().unwrap_or(0) > 0);
+        assert!(out["raw"]["combo_counts"][1].as_u64().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn sim_mode_accepts_percent_scoped_partial_cards_fast_path() {
+        let out = run_request_value(json!({
+            "mode": "sim",
+            "variant": "plo6",
+            "iteration_cap": 128,
+            "board": [],
+            "dead": [],
+            "percentile_profile": "ours",
+            "players": [
+                { "mode": "range", "hand_size": 6, "range_text": "42%:(AsKs)" },
+                { "mode": "range", "hand_size": 6, "range_text": "30%" }
+            ],
+            "seed": 12345
+        }));
+
+        assert_eq!(out["ok"], true);
+        assert!(out["raw"]["iterations"].as_u64().unwrap_or(0) > 0);
+        assert!(out["raw"]["combo_counts"][0].as_u64().unwrap_or(0) > 0);
     }
 
     #[test]
