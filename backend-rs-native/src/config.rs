@@ -12,6 +12,7 @@ const BOMBPOT_ITERATION_CAP_MAX_DEFAULT: usize = 2_000_000;
 const BOMBPOT_MAX_RUNTIME_CAP_MS: u64 = 3_600_000;
 const BOMBPOT_PROGRESS_TOKEN_MAX_LEN_DEFAULT: usize = 128;
 const PREVIEW_MAX_RUNTIME_MS_DEFAULT: u64 = 45_000;
+const SAMPLER_CACHE_BUDGET_BYTES_DEFAULT: usize = 12 * 1024 * 1024;
 
 pub(crate) fn env_flag(name: &str, default: bool) -> bool {
     std::env::var(name)
@@ -138,6 +139,15 @@ pub(crate) fn bombpot_max_runtime_ms_env() -> Option<u64> {
         env_u64("BOMBPOT_MAX_RUNTIME_MS")
             .map(|v| v.min(bombpot_runtime_cap_ms()))
             .filter(|v| *v > 0)
+    })
+}
+
+pub(crate) fn sampler_cache_budget_bytes() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env_usize("SAMPLER_CACHE_BUDGET_BYTES")
+            .unwrap_or(SAMPLER_CACHE_BUDGET_BYTES_DEFAULT)
+            .clamp(64 * 1024, 256 * 1024 * 1024)
     })
 }
 

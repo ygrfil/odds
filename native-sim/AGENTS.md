@@ -9,6 +9,7 @@
 - `build.rs` owns generated or embedded build-time simulation data behavior.
 - `src/lib.rs` owns the public simulation API and JSON request runner.
 - `src/main.rs` owns the stdin/stdout CLI wrapper around `run_request_json`.
+- `benches/` owns Criterion microbenchmarks for hot simulation, preview, and tag shortcut paths.
 
 ## Local Contracts
 - Preserve JSON compatibility for `backend-rs-native`, `ios/native-sim-ffi`, and any CLI consumers.
@@ -24,6 +25,7 @@
 ## Verification
 - Run `cargo check -p native-sim`.
 - For engine behavior changes, run `cargo test --workspace` when feasible.
+- For benchmark changes, run `cargo bench -p native-sim --bench hot_paths -- --test`.
 - Use the CLI with representative JSON requests for focused simulation contract checks.
 
 ## Child DOX Index

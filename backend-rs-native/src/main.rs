@@ -1,3 +1,4 @@
+mod cache;
 mod config;
 mod static_assets;
 
@@ -6,6 +7,7 @@ use axum::http::StatusCode;
 use axum::middleware;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use cache::{sampler_cache_get, sampler_cache_put};
 use config::{
     bombpot_iteration_cap_max, bombpot_max_runtime_ms_env, bombpot_progress_token_max_len,
     bombpot_runtime_cap_ms, env_flag, preview_max_runtime_ms, range_expr_max_nesting,
@@ -2875,60 +2877,6 @@ fn format_cards_text(cards: &[u8]) -> String {
         .join("")
 }
 
-#[derive(Default)]
-struct SamplerCacheStore {
-    map: HashMap<String, NativePlayerReq>,
-    lru: VecDeque<String>,
-}
-
-impl SamplerCacheStore {
-    fn touch(&mut self, key: &str) {
-        if let Some(pos) = self.lru.iter().position(|k| k == key) {
-            self.lru.remove(pos);
-        }
-        self.lru.push_back(key.to_string());
-    }
-
-    fn get(&mut self, key: &str) -> Option<NativePlayerReq> {
-        let out = self.map.get(key).cloned();
-        if out.is_some() {
-            self.touch(key);
-        }
-        out
-    }
-
-    fn insert(&mut self, key: String, sampler: NativePlayerReq) {
-        if self.map.contains_key(&key) {
-            self.map.insert(key.clone(), sampler);
-            self.touch(&key);
-            return;
-        }
-        while self.map.len() >= SAMPLER_CACHE_MAX {
-            let Some(oldest) = self.lru.pop_front() else {
-                break;
-            };
-            self.map.remove(&oldest);
-        }
-        self.touch(&key);
-        self.map.insert(key, sampler);
-    }
-}
-
-fn sampler_cache_get(key: &str) -> Option<NativePlayerReq> {
-    let cache = SAMPLER_CACHE.get_or_init(|| Mutex::new(SamplerCacheStore::default()));
-    let mut guard = cache.lock().ok()?;
-    guard.get(key)
-}
-
-fn sampler_cache_put(key: String, sampler: &NativePlayerReq) {
-    let cache = SAMPLER_CACHE.get_or_init(|| Mutex::new(SamplerCacheStore::default()));
-    let mut guard = match cache.lock() {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    guard.insert(key, sampler.clone());
-}
-
 fn tag_coverage_cache_key(variant: &str, board: &[u8]) -> String {
     let mut board_sorted = board.to_vec();
     board_sorted.sort_unstable();
@@ -3617,11 +3565,9 @@ fn percentile_seed(variant: &str) -> u64 {
 }
 
 static PERCENTILE_CACHE: OnceLock<Mutex<HashMap<String, Vec<f64>>>> = OnceLock::new();
-static SAMPLER_CACHE: OnceLock<Mutex<SamplerCacheStore>> = OnceLock::new();
 static TAG_COVERAGE_CACHE: OnceLock<Mutex<TagCoverageCacheStore>> = OnceLock::new();
 static TAG_EXPR_COVERAGE_CACHE: OnceLock<Mutex<TagExprCoverageCacheStore>> = OnceLock::new();
 static PLAN_POOL_TOO_LARGE_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-const SAMPLER_CACHE_MAX: usize = 96;
 
 #[derive(Clone)]
 struct TagCoverageBundle {

@@ -7,6 +7,7 @@
 ## Ownership
 - `Cargo.toml` owns backend dependencies and package metadata.
 - `src/main.rs` owns Axum routes, request/response structs, range parsing, percentile prewarm behavior, progress state, and native simulation orchestration.
+- `src/cache.rs` owns reusable in-process cache primitives, including byte-budgeted eviction used by prepared sampler caches.
 - `src/config.rs` owns environment-driven limits, runtime caps, heavy-request concurrency permits, and static-root resolution.
 - `src/static_assets.rs` owns static asset cache headers for `index.html`, `src/` assets, and precompressed/versioned percentile table files.
 

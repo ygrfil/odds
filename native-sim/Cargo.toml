@@ -17,3 +17,10 @@ base64 = "0.22.1"
 [build-dependencies]
 json5 = "0.4.1"
 serde = { version = "1.0.228", features = ["derive"] }
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "hot_paths"
+harness = false
