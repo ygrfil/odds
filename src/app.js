@@ -2,6 +2,12 @@ import { runSimulation } from "./engine.js";
 import { canUseNativeIosSim, previewNativeIosRangeCoverage, previewNativeIosTagShortcuts } from "./native-ios.js";
 import { extractNormalizedTags, splitTagToken } from "./tag-utils.js";
 import {
+  cacheSetBounded,
+  coverageCounts,
+  coverageText,
+  extractPercentAtoms
+} from "./live-info-utils.js";
+import {
   normalizePercentileProfile,
   percentileProfileOptionsForVariant,
   percentileProfileLabel,
@@ -925,11 +931,6 @@ function canUseBackendPreview() {
   return proto.startsWith("http");
 }
 
-function cacheSetBounded(map, key, value, maxSize = 2000) {
-  map.set(key, value);
-  if (map.size > maxSize) map.clear();
-}
-
 async function fetchTagShortcutPayload(tagToken, boardText, variant) {
   const normalizedTag = String(tagToken || "").trim().toLowerCase();
   const boardKey = String(boardText || "").trim();
@@ -1168,41 +1169,6 @@ function renderLiveInfo(node, parts) {
     node.appendChild(span);
   }
   node.style.display = "";
-}
-
-function extractPercentAtoms(rangeText) {
-  const src = String(rangeText || "").replace(/\s+/g, "");
-  const raw = src.match(/\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)?%/g) || [];
-  const out = [];
-  for (const tok of raw) {
-    const nums = tok.slice(0, -1).split("-").map(Number);
-    if (!nums.every((n) => Number.isFinite(n) && n >= 0 && n <= 100)) continue;
-    if (nums.length === 2 && nums[0] > nums[1]) continue;
-    if (!out.includes(tok)) out.push(tok);
-  }
-  return out;
-}
-
-function coverageCounts(cov) {
-  if (!cov) return { matched: 0, total: 0, approx: false };
-  if (cov.approx) {
-    const matched = Number.isFinite(cov.estimatedMatched) ? cov.estimatedMatched : cov.matched;
-    const total = Number.isFinite(cov.population) ? cov.population : cov.total;
-    return { matched, total, approx: true };
-  }
-  return { matched: cov.matched, total: cov.total, approx: false };
-}
-
-function coverageText(cov) {
-  if (!cov || cov.total <= 0) return "";
-  if (cov.approx) {
-    const pct = `~${cov.pct.toFixed(1)}%`;
-    if (Number.isFinite(cov.estimatedMatched) && Number.isFinite(cov.population) && cov.population > 0) {
-      return `${pct}, ~${cov.estimatedMatched.toLocaleString()}/${cov.population.toLocaleString()} combos`;
-    }
-    return `${pct}, ${cov.matched.toLocaleString()}/${cov.total.toLocaleString()} samples`;
-  }
-  return `${cov.pct.toFixed(1)}%, ${cov.matched.toLocaleString()}/${cov.total.toLocaleString()} combos`;
 }
 
 async function computeNativeIosLiveInfo(ctx) {

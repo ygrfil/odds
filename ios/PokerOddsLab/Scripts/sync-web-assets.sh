@@ -12,4 +12,5 @@ mkdir -p "$WEBAPP_DIR"
 cp "$REPO_ROOT/index.html" "$WEBAPP_DIR/index.html"
 cp -R "$REPO_ROOT/src" "$WEBAPP_DIR/src"
 
+find "$WEBAPP_DIR" -name "AGENTS.md" -delete
 find "$WEBAPP_DIR" -name ".DS_Store" -delete
